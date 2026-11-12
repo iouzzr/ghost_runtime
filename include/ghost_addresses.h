@@ -10,9 +10,13 @@
 static constexpr uintptr_t kMinValidXboxAddress                = 0x00400000u;
 static constexpr uint32_t  kXboxPeImageBase                    = 0x00400000u;
 static constexpr uint32_t  kXboxReservedSize                   = 0x00550000u;
+static constexpr uint32_t  kXboxReservedEndVa                  = 0x00951000u;
 static constexpr uint32_t  kXboxCodeScanStartVa                = 0x00400740u;
 static constexpr uint32_t  kXboxCodeScanEndVa                  = 0x0074FE80u;
 static constexpr uint32_t  kXboxZeroImageSize                  = 0x005228C0u;
+static constexpr uint32_t  kOrigXbeBaseVa                      = 0x00010000u;
+static constexpr uint32_t  kXbeHeaderBaseVa                    = 0x0094E000u;
+static constexpr uint32_t  kXbeHeaderMaxSize                   = 0x00002000u;
 static constexpr uint32_t  kAddrMuStaticCtorSlot               = 0x007C2D9Cu;
 
 // --- Xbox D3D8 Device & State Tables ---

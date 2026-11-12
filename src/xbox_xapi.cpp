@@ -1,31 +1,86 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
+#include <atomic>
+#include <vector>
 
 // ============================================================================
 // XAPILIB Win32 / File / Directory / SaveGame / Section / Heap / Thread Bridges
 // ============================================================================
 
-// Track FindFirstFileA handles so Xbox CloseHandle (which is aliased to FindClose) closes them properly
-static HANDLE g_findHandles[256] = { 0 };
-static CRITICAL_SECTION g_findCs;
+// Track FindFirstFileA handles and SaveFindContext* handles so Xbox CloseHandle / XFindClose validate safely
+static std::vector<HANDLE>           g_findHandles;
+struct SaveFindContext;
+static std::vector<SaveFindContext*> g_saveFindContexts;
+static CRITICAL_SECTION              g_findCs;
+static CRITICAL_SECTION              g_fileIoLocks[64];
+static CRITICAL_SECTION              g_heapTrackCs;
+static constexpr uint32_t            kFastHeapSlots = 64u;
+static std::atomic<HANDLE>           g_fastValidHeaps[kFastHeapSlots] = {};
+static std::atomic<uint32_t>         g_fastValidHeapCount{0u};
+static std::vector<HANDLE>           g_overflowValidHeaps;
+static std::atomic<HANDLE>           g_cachedProcessHeap{nullptr};
+static volatile LONG                 g_xapiLocksInitState = 0; // 0=uninit, 1=initing, 2=ready
+
+static inline HANDLE GetCachedProcessHeap() {
+    HANDLE h = g_cachedProcessHeap.load(std::memory_order_relaxed);
+    if (!h) {
+        h = GetProcessHeap();
+        g_cachedProcessHeap.store(h, std::memory_order_relaxed);
+    }
+    return h;
+}
+
+static void EnsureXapiLocksInitialized() {
+    LONG state = g_xapiLocksInitState;
+    if (state == 2) return;
+    if (InterlockedCompareExchange(&g_xapiLocksInitState, 1, 0) == 0) {
+        InitializeCriticalSection(&g_findCs);
+        InitializeCriticalSection(&g_heapTrackCs);
+        for (int i = 0; i < 64; ++i) {
+            InitializeCriticalSection(&g_fileIoLocks[i]);
+        }
+        g_findHandles.reserve(256);
+        g_saveFindContexts.reserve(128);
+        g_overflowValidHeaps.reserve(16);
+        g_fastValidHeaps[0].store(GetCachedProcessHeap(), std::memory_order_relaxed);
+        g_fastValidHeapCount.store(1u, std::memory_order_release);
+        InterlockedExchange(&g_xapiLocksInitState, 2);
+    } else {
+        while (g_xapiLocksInitState != 2) {
+            SwitchToThread();
+        }
+    }
+}
+
+static inline CRITICAL_SECTION* GetFileIoLock(HANDLE hFile) {
+    EnsureXapiLocksInitialized();
+    return &g_fileIoLocks[(reinterpret_cast<uintptr_t>(hFile) >> 2) & 63u];
+}
 
 static void RegisterFindHandle(HANDLE h) {
     if (h == INVALID_HANDLE_VALUE || !h) return;
+    EnsureXapiLocksInitialized();
     EnterCriticalSection(&g_findCs);
-    for (int i = 0; i < 256; ++i) {
+    bool stored = false;
+    for (size_t i = 0; i < g_findHandles.size(); ++i) {
         if (!g_findHandles[i]) {
             g_findHandles[i] = h;
+            stored = true;
             break;
         }
+    }
+    if (!stored) {
+        g_findHandles.push_back(h);
     }
     LeaveCriticalSection(&g_findCs);
 }
 
 static bool TryCloseFindHandle(HANDLE h) {
     if (h == INVALID_HANDLE_VALUE || !h) return false;
+    EnsureXapiLocksInitialized();
     bool found = false;
     EnterCriticalSection(&g_findCs);
-    for (int i = 0; i < 256; ++i) {
+    for (size_t i = 0; i < g_findHandles.size(); ++i) {
         if (g_findHandles[i] == h) {
             g_findHandles[i] = nullptr;
             found = true;
@@ -40,12 +95,14 @@ static bool TryCloseFindHandle(HANDLE h) {
     return false;
 }
 
+static bool TryCloseSaveFindContext(HANDLE h);
+
 static HANDLE __stdcall Bridge_CreateFileA(
     const char* lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
     LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
     DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
 {
-    char winPath[MAX_PATH];
+    char winPath[kMaxHostPath];
     TranslateXboxPath(lpFileName, winPath, sizeof(winPath));
 
     // Strip FILE_FLAG_NO_BUFFERING and FILE_FLAG_OVERLAPPED so both synchronous and overlapped Xbox reads succeed deterministically
@@ -54,22 +111,28 @@ static HANDLE __stdcall Bridge_CreateFileA(
         dwShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
     }
 
-    HANDLE h = CreateFileA(
-        winPath, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+    wchar_t winPathW[kMaxHostPath];
+    if (!Utf8ToWide(winPath, winPathW, kMaxHostPath) || !winPathW[0]) {
+        SetLastError(ERROR_PATH_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE h = CreateFileW(
+        winPathW, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
         dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 
     if (h == INVALID_HANDLE_VALUE) {
         // Also check parent directory creation if writing a file in Saves\...
         if (dwCreationDisposition == CREATE_ALWAYS || dwCreationDisposition == OPEN_ALWAYS || dwCreationDisposition == CREATE_NEW) {
-            char dirBuf[MAX_PATH];
+            char dirBuf[kMaxHostPath];
             strncpy(dirBuf, winPath, sizeof(dirBuf) - 1);
             dirBuf[sizeof(dirBuf) - 1] = '\0';
             char* lastSlash = strrchr(dirBuf, '\\');
             if (lastSlash) {
                 *lastSlash = '\0';
                 EnsureDirExists(dirBuf);
-                h = CreateFileA(
-                    winPath, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+                h = CreateFileW(
+                    winPathW, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                     dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
             }
         }
@@ -78,8 +141,12 @@ static HANDLE __stdcall Bridge_CreateFileA(
 }
 
 BOOL __stdcall Bridge_CloseHandle(HANDLE hObject) {
-    if (!hObject || hObject == INVALID_HANDLE_VALUE) return TRUE;
+    if (!hObject || hObject == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     if (TryCloseFindHandle(hObject)) return TRUE;
+    if (TryCloseSaveFindContext(hObject)) return TRUE;
     return CloseHandle(hObject);
 }
 
@@ -87,60 +154,126 @@ static BOOL __stdcall Bridge_ReadFile(
     HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
     LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped)
 {
+    CRITICAL_SECTION* lock = GetFileIoLock(hFile);
     if (lpOverlapped) {
+        HANDLE ev = (lpOverlapped->hEvent && ((reinterpret_cast<uintptr_t>(lpOverlapped->hEvent) & 1u) == 0))
+            ? lpOverlapped->hEvent
+            : nullptr;
+        if (ev) {
+            ResetEvent(ev);
+        }
+        EnterCriticalSection(lock);
         LARGE_INTEGER pos;
-        pos.LowPart = lpOverlapped->Offset;
-        pos.HighPart = (LONG)lpOverlapped->OffsetHigh;
-        SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN);
+        pos.LowPart  = lpOverlapped->Offset;
+        pos.HighPart = static_cast<LONG>(lpOverlapped->OffsetHigh);
+        BOOL seekOk = SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN);
         DWORD bytesDone = 0;
-        BOOL ok = ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, &bytesDone, nullptr);
-        lpOverlapped->Internal = 0; // STATUS_SUCCESS
+        BOOL ok = seekOk ? ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, &bytesDone, nullptr) : FALSE;
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        LeaveCriticalSection(lock);
+
+        if (!ok) {
+            lpOverlapped->Internal     = (err == ERROR_HANDLE_EOF) ? 0xC0000011u : 0xC0000001u;
+            lpOverlapped->InternalHigh = 0;
+            if (lpNumberOfBytesRead) *lpNumberOfBytesRead = 0;
+            if (ev) SetEvent(ev);
+            SetLastError(err);
+            return FALSE;
+        }
+        if (bytesDone == 0 && nNumberOfBytesToRead > 0) {
+            // Matching Xbox _ReadFile@20 (0x005A0AAF): overlapped read at EOF sets STATUS_END_OF_FILE (0xC0000011)
+            lpOverlapped->Internal     = 0xC0000011u;
+            lpOverlapped->InternalHigh = 0;
+            if (lpNumberOfBytesRead) *lpNumberOfBytesRead = 0;
+            if (ev) SetEvent(ev);
+            SetLastError(ERROR_HANDLE_EOF);
+            return FALSE;
+        }
+        lpOverlapped->Internal     = 0; // STATUS_SUCCESS
         lpOverlapped->InternalHigh = bytesDone;
         if (lpNumberOfBytesRead) *lpNumberOfBytesRead = bytesDone;
-        if (lpOverlapped->hEvent && ((uintptr_t)lpOverlapped->hEvent & 1u) == 0) {
-            SetEvent(lpOverlapped->hEvent);
-        }
-        return ok;
+        if (ev) SetEvent(ev);
+        return TRUE;
     }
-    return ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, nullptr);
+
+    EnterCriticalSection(lock);
+    BOOL ok = ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, nullptr);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    LeaveCriticalSection(lock);
+    if (!ok) SetLastError(err);
+    return ok;
 }
 
 static BOOL __stdcall Bridge_WriteFile(
     HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
     LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
 {
+    CRITICAL_SECTION* lock = GetFileIoLock(hFile);
     if (lpOverlapped) {
-        LARGE_INTEGER pos;
-        pos.LowPart = lpOverlapped->Offset;
-        pos.HighPart = (LONG)lpOverlapped->OffsetHigh;
-        SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN);
-        DWORD bytesDone = 0;
-        BOOL ok = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, &bytesDone, nullptr);
-        lpOverlapped->Internal = 0;
-        lpOverlapped->InternalHigh = bytesDone;
-        if (lpNumberOfBytesWritten) *lpNumberOfBytesWritten = bytesDone;
-        if (lpOverlapped->hEvent && ((uintptr_t)lpOverlapped->hEvent & 1u) == 0) {
-            SetEvent(lpOverlapped->hEvent);
+        HANDLE ev = (lpOverlapped->hEvent && ((reinterpret_cast<uintptr_t>(lpOverlapped->hEvent) & 1u) == 0))
+            ? lpOverlapped->hEvent
+            : nullptr;
+        if (ev) {
+            ResetEvent(ev);
         }
+        EnterCriticalSection(lock);
+        LARGE_INTEGER pos;
+        pos.LowPart  = lpOverlapped->Offset;
+        pos.HighPart = static_cast<LONG>(lpOverlapped->OffsetHigh);
+        BOOL seekOk = SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN);
+        DWORD bytesDone = 0;
+        BOOL ok = seekOk ? WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, &bytesDone, nullptr) : FALSE;
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        LeaveCriticalSection(lock);
+
+        lpOverlapped->Internal     = ok ? 0u : 0xC0000001u;
+        lpOverlapped->InternalHigh = ok ? bytesDone : 0u;
+        if (lpNumberOfBytesWritten) *lpNumberOfBytesWritten = ok ? bytesDone : 0u;
+        if (ev) SetEvent(ev);
+        if (!ok) SetLastError(err);
         return ok;
     }
-    return WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, nullptr);
+
+    EnterCriticalSection(lock);
+    BOOL ok = WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, nullptr);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    LeaveCriticalSection(lock);
+    if (!ok) SetLastError(err);
+    return ok;
 }
 
 static BOOL __stdcall Bridge_SetEndOfFile(HANDLE hFile) {
-    return SetEndOfFile(hFile);
+    CRITICAL_SECTION* lock = GetFileIoLock(hFile);
+    EnterCriticalSection(lock);
+    BOOL ok = SetEndOfFile(hFile);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    LeaveCriticalSection(lock);
+    if (!ok) SetLastError(err);
+    return ok;
 }
 
 static DWORD __stdcall Bridge_SetFilePointer(
     HANDLE hFile, LONG lDistanceToMove, PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod)
 {
-    return SetFilePointer(hFile, lDistanceToMove, lpDistanceToMoveHigh, dwMoveMethod);
+    CRITICAL_SECTION* lock = GetFileIoLock(hFile);
+    EnterCriticalSection(lock);
+    DWORD res = SetFilePointer(hFile, lDistanceToMove, lpDistanceToMoveHigh, dwMoveMethod);
+    DWORD err = GetLastError();
+    LeaveCriticalSection(lock);
+    SetLastError(err);
+    return res;
 }
 
 static BOOL __stdcall Bridge_SetFilePointerEx(
     HANDLE hFile, LARGE_INTEGER liDistanceToMove, PLARGE_INTEGER lpNewFilePointer, DWORD dwMoveMethod)
 {
-    return SetFilePointerEx(hFile, liDistanceToMove, lpNewFilePointer, dwMoveMethod);
+    CRITICAL_SECTION* lock = GetFileIoLock(hFile);
+    EnterCriticalSection(lock);
+    BOOL ok = SetFilePointerEx(hFile, liDistanceToMove, lpNewFilePointer, dwMoveMethod);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    LeaveCriticalSection(lock);
+    if (!ok) SetLastError(err);
+    return ok;
 }
 
 static BOOL __stdcall Bridge_FlushFileBuffers(HANDLE hFile) {
@@ -158,14 +291,30 @@ static DWORD __stdcall Bridge_GetFileSize(HANDLE hFile, LPDWORD lpFileSizeHigh) 
 static BOOL __stdcall Bridge_GetOverlappedResult(
     HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait)
 {
-    (void)hFile; (void)bWait;
-    if (lpOverlapped) {
-        if (lpNumberOfBytesTransferred) {
-            *lpNumberOfBytesTransferred = (DWORD)lpOverlapped->InternalHigh;
-        }
-        return TRUE;
+    (void)hFile;
+    if (!lpOverlapped) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
-    return FALSE;
+    uint32_t status = static_cast<uint32_t>(lpOverlapped->Internal);
+    if (status == 0x00000103u) { // STATUS_PENDING
+        if (!bWait) {
+            SetLastError(ERROR_IO_INCOMPLETE);
+            return FALSE;
+        }
+        if (lpOverlapped->hEvent && ((reinterpret_cast<uintptr_t>(lpOverlapped->hEvent) & 1u) == 0)) {
+            WaitForSingleObject(lpOverlapped->hEvent, INFINITE);
+        }
+        status = static_cast<uint32_t>(lpOverlapped->Internal);
+    }
+    if (lpNumberOfBytesTransferred) {
+        *lpNumberOfBytesTransferred = static_cast<DWORD>(lpOverlapped->InternalHigh);
+    }
+    if (static_cast<int32_t>(status) < 0) {
+        SetLastError(status == 0xC0000011u ? ERROR_HANDLE_EOF : ERROR_GEN_FAILURE);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static BOOL __stdcall Bridge_CancelIo(HANDLE hFile) {
@@ -174,30 +323,90 @@ static BOOL __stdcall Bridge_CancelIo(HANDLE hFile) {
 
 static BOOL __stdcall Bridge_CreateDirectoryA(const char* lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes) {
     (void)lpSecurityAttributes;
-    char winPath[MAX_PATH];
+    char winPath[kMaxHostPath];
     TranslateXboxPath(lpPathName, winPath, sizeof(winPath));
     EnsureDirExists(winPath);
     return TRUE;
 }
 
 static BOOL __stdcall Bridge_RemoveDirectoryA(const char* lpPathName) {
-    char winPath[MAX_PATH];
+    char winPath[kMaxHostPath];
     TranslateXboxPath(lpPathName, winPath, sizeof(winPath));
-    return RemoveDirectoryA(winPath);
+    return RemoveDirectoryUtf8(winPath);
+}
+
+static bool IsDotOrDotDotW(const wchar_t* name) {
+    if (!name) return false;
+    return (name[0] == L'.' && name[1] == L'\0') ||
+           (name[0] == L'.' && name[1] == L'.' && name[2] == L'\0');
+}
+
+static void ConvertFindDataWToA(const WIN32_FIND_DATAW& srcW, LPWIN32_FIND_DATAA dstA) {
+    if (!dstA) return;
+    memset(dstA, 0, sizeof(*dstA));
+    dstA->dwFileAttributes = srcW.dwFileAttributes;
+    dstA->ftCreationTime   = srcW.ftCreationTime;
+    dstA->ftLastAccessTime = srcW.ftLastAccessTime;
+    dstA->ftLastWriteTime  = srcW.ftLastWriteTime;
+    dstA->nFileSizeHigh    = srcW.nFileSizeHigh;
+    dstA->nFileSizeLow     = srcW.nFileSizeLow;
+    dstA->dwReserved0      = srcW.dwReserved0;
+    dstA->dwReserved1      = srcW.dwReserved1;
+
+    BOOL usedDef = FALSE;
+    WideCharToMultiByte(CP_ACP, 0, srcW.cFileName, -1, dstA->cFileName, MAX_PATH, nullptr, &usedDef);
+    if (usedDef && srcW.cAlternateFileName[0] != L'\0') {
+        WideCharToMultiByte(CP_ACP, 0, srcW.cAlternateFileName, -1, dstA->cFileName, MAX_PATH, nullptr, nullptr);
+    }
+    dstA->cFileName[MAX_PATH - 1] = '\0';
+    WideCharToMultiByte(CP_ACP, 0, srcW.cAlternateFileName, -1, dstA->cAlternateFileName, 14, nullptr, nullptr);
+    dstA->cAlternateFileName[13] = '\0';
 }
 
 static HANDLE __stdcall Bridge_FindFirstFileA(const char* lpFileName, LPWIN32_FIND_DATAA lpFindFileData) {
-    char winPath[MAX_PATH];
-    TranslateXboxPath(lpFileName, winPath, sizeof(winPath));
-    HANDLE h = FindFirstFileA(winPath, lpFindFileData);
-    if (h != INVALID_HANDLE_VALUE) {
-        RegisterFindHandle(h);
+    if (!lpFileName || !lpFindFileData) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
     }
+    char winPath[kMaxHostPath];
+    TranslateXboxPath(lpFileName, winPath, sizeof(winPath));
+    wchar_t winPathW[kMaxHostPath];
+    if (!Utf8ToWide(winPath, winPathW, kMaxHostPath) || !winPathW[0]) {
+        SetLastError(ERROR_PATH_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    WIN32_FIND_DATAW wfdW = {};
+    HANDLE h = FindFirstFileW(winPathW, &wfdW);
+    if (h == INVALID_HANDLE_VALUE) {
+        return INVALID_HANDLE_VALUE;
+    }
+    // Xbox FATX filesystems never expose "." or ".." directory entries
+    while (IsDotOrDotDotW(wfdW.cFileName)) {
+        if (!FindNextFileW(h, &wfdW)) {
+            FindClose(h);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    ConvertFindDataWToA(wfdW, lpFindFileData);
+    RegisterFindHandle(h);
     return h;
 }
 
 static BOOL __stdcall Bridge_FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData) {
-    return FindNextFileA(hFindFile, lpFindFileData);
+    if (!hFindFile || hFindFile == INVALID_HANDLE_VALUE || !lpFindFileData) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    WIN32_FIND_DATAW wfdW = {};
+    while (FindNextFileW(hFindFile, &wfdW)) {
+        if (!IsDotOrDotDotW(wfdW.cFileName)) {
+            ConvertFindDataWToA(wfdW, lpFindFileData);
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 static DWORD __stdcall Bridge_XGetDiskSectorSizeA(const char* lpRootPathName) {
@@ -217,7 +426,7 @@ static BOOL __stdcall Bridge_GetDiskFreeSpaceExA(
 }
 
 static BOOL __stdcall Bridge_XMountUtilityDrive(BOOL fFormatClean) {
-    char zPath[MAX_PATH];
+    char zPath[kMaxHostPath];
     TranslateXboxPath("Z:\\", zPath, sizeof(zPath));
     EnsureDirExists(zPath);
     (void)fFormatClean;
@@ -249,8 +458,68 @@ struct SaveFindContext {
     uint32_t magic;
     HANDLE   hFind;
     char     rootDrive[8];
-    char     baseWinDir[MAX_PATH];
+    char     baseWinDir[kMaxHostPath];
 };
+
+static void RegisterSaveFindContext(SaveFindContext* ctx) {
+    if (!ctx) return;
+    EnsureXapiLocksInitialized();
+    EnterCriticalSection(&g_findCs);
+    bool stored = false;
+    for (size_t i = 0; i < g_saveFindContexts.size(); ++i) {
+        if (!g_saveFindContexts[i]) {
+            g_saveFindContexts[i] = ctx;
+            stored = true;
+            break;
+        }
+    }
+    if (!stored) {
+        g_saveFindContexts.push_back(ctx);
+    }
+    LeaveCriticalSection(&g_findCs);
+}
+
+static SaveFindContext* LookupSaveFindContext(HANDLE h) {
+    if (!h || h == INVALID_HANDLE_VALUE) return nullptr;
+    EnsureXapiLocksInitialized();
+    SaveFindContext* found = nullptr;
+    EnterCriticalSection(&g_findCs);
+    for (size_t i = 0; i < g_saveFindContexts.size(); ++i) {
+        if (reinterpret_cast<HANDLE>(g_saveFindContexts[i]) == h) {
+            found = g_saveFindContexts[i];
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_findCs);
+    if (found && found->magic == kSaveFindContextMagic) {
+        return found;
+    }
+    return nullptr;
+}
+
+static bool TryCloseSaveFindContext(HANDLE h) {
+    if (!h || h == INVALID_HANDLE_VALUE) return false;
+    EnsureXapiLocksInitialized();
+    SaveFindContext* found = nullptr;
+    EnterCriticalSection(&g_findCs);
+    for (size_t i = 0; i < g_saveFindContexts.size(); ++i) {
+        if (reinterpret_cast<HANDLE>(g_saveFindContexts[i]) == h) {
+            found = g_saveFindContexts[i];
+            g_saveFindContexts[i] = nullptr;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_findCs);
+    if (found) {
+        found->magic = 0;
+        if (found->hFind && found->hFind != INVALID_HANDLE_VALUE) {
+            FindClose(found->hFind);
+        }
+        free(found);
+        return true;
+    }
+    return false;
+}
 
 static void NormalizeXboxRootDrive(const char* lpRootPathName, char* outRoot, size_t outSize) {
     const char* src = (lpRootPathName && lpRootPathName[0]) ? lpRootPathName : "U:\\";
@@ -278,7 +547,7 @@ static void XapiSaveGameHashEncode(const wchar_t* lpSaveGameName, char outHashDi
 static bool ParseSaveMetaFile(const char* metaPath, wchar_t* outName, size_t maxChars) {
     if (!outName || maxChars == 0) return false;
     outName[0] = L'\0';
-    FILE* f = fopen(metaPath, "rb");
+    FILE* f = OpenFileUtf8(metaPath, L"rb");
     if (!f) return false;
     wchar_t buf[256] = { 0 };
     size_t readWChars = fread(buf, sizeof(wchar_t), 255, f);
@@ -313,10 +582,10 @@ static DWORD __stdcall Bridge_XCreateSaveGame(
 
     char xboxSaveDir[MAX_PATH];
     snprintf(xboxSaveDir, sizeof(xboxSaveDir), "%s%s\\", root, hashName);
-    char winSaveDir[MAX_PATH];
+    char winSaveDir[kMaxHostPath];
     TranslateXboxPath(xboxSaveDir, winSaveDir, sizeof(winSaveDir));
 
-    DWORD existingAttrs = GetFileAttributesA(winSaveDir);
+    DWORD existingAttrs = GetFileAttributesUtf8(winSaveDir);
     bool dirExists = (existingAttrs != INVALID_FILE_ATTRIBUTES && (existingAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0);
 
     if (dwCreationDisposition == OPEN_EXISTING) {
@@ -330,9 +599,9 @@ static DWORD __stdcall Bridge_XCreateSaveGame(
     } else {
         EnsureDirExists(winSaveDir);
         // Write exact Xbox SaveMeta.xbx format (0x005A0225): UTF-16LE BOM (0xFEFF) + "Name=<SaveGameName>\r\n" [+ "NoCopy=1\r\n"]
-        char metaPath[MAX_PATH];
+        char metaPath[kMaxHostPath];
         snprintf(metaPath, sizeof(metaPath), "%s\\SaveMeta.xbx", winSaveDir);
-        FILE* f = fopen(metaPath, "wb");
+        FILE* f = OpenFileUtf8(metaPath, L"wb");
         if (f) {
             wchar_t metaBuf[256];
             const wchar_t* safeName = lpSaveGameName ? lpSaveGameName : L"";
@@ -357,21 +626,23 @@ static DWORD __stdcall Bridge_XCreateSaveGame(
 }
 
 static void DeleteDirectoryContentsAndRemove(const char* winSaveDir) {
-    char searchPattern[MAX_PATH];
-    snprintf(searchPattern, sizeof(searchPattern), "%s\\*", winSaveDir);
-    WIN32_FIND_DATAA wfd = {};
-    HANDLE hFind = FindFirstFileA(searchPattern, &wfd);
+    wchar_t dirW[kMaxHostPath];
+    if (!Utf8ToWide(winSaveDir, dirW, kMaxHostPath) || !dirW[0]) return;
+    wchar_t searchPatternW[kMaxHostPath];
+    swprintf(searchPatternW, kMaxHostPath, L"%ls\\*", dirW);
+    WIN32_FIND_DATAW wfd = {};
+    HANDLE hFind = FindFirstFileW(searchPatternW, &wfd);
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
-            if (strcmp(wfd.cFileName, ".") != 0 && strcmp(wfd.cFileName, "..") != 0) {
-                char filePath[MAX_PATH];
-                snprintf(filePath, sizeof(filePath), "%s\\%s", winSaveDir, wfd.cFileName);
-                DeleteFileA(filePath);
+            if (!IsDotOrDotDotW(wfd.cFileName)) {
+                wchar_t filePathW[kMaxHostPath];
+                swprintf(filePathW, kMaxHostPath, L"%ls\\%ls", dirW, wfd.cFileName);
+                DeleteFileW(filePathW);
             }
-        } while (FindNextFileA(hFind, &wfd));
+        } while (FindNextFileW(hFind, &wfd));
         FindClose(hFind);
     }
-    RemoveDirectoryA(winSaveDir);
+    RemoveDirectoryW(dirW);
 }
 
 static DWORD __stdcall Bridge_XDeleteSaveGame(const char* lpRootPathName, const wchar_t* lpSaveGameName) {
@@ -382,28 +653,31 @@ static DWORD __stdcall Bridge_XDeleteSaveGame(const char* lpRootPathName, const 
 
     char xboxSaveDir[MAX_PATH];
     snprintf(xboxSaveDir, sizeof(xboxSaveDir), "%s%s\\", root, hashName);
-    char winSaveDir[MAX_PATH];
+    char winSaveDir[kMaxHostPath];
     TranslateXboxPath(xboxSaveDir, winSaveDir, sizeof(winSaveDir));
     DeleteDirectoryContentsAndRemove(winSaveDir);
     return ERROR_SUCCESS;
 }
 
-static bool FillSaveGameFindData(SaveFindContext* ctx, WIN32_FIND_DATAA* wfd, XBOX_SAVEGAME_FIND_DATA* outData) {
+static bool FillSaveGameFindData(SaveFindContext* ctx, WIN32_FIND_DATAW* wfdW, XBOX_SAVEGAME_FIND_DATA* outData) {
     while (true) {
-        if ((wfd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-            strcmp(wfd->cFileName, ".") != 0 && strcmp(wfd->cFileName, "..") != 0)
-        {
-            char metaPath[MAX_PATH];
-            snprintf(metaPath, sizeof(metaPath), "%s\\%s\\SaveMeta.xbx", ctx->baseWinDir, wfd->cFileName);
+        if ((wfdW->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !IsDotOrDotDotW(wfdW->cFileName)) {
+            char dirNameUtf8[MAX_PATH];
+            WideToUtf8(wfdW->cFileName, dirNameUtf8, sizeof(dirNameUtf8));
+
+            char metaPath[kMaxHostPath];
+            snprintf(metaPath, sizeof(metaPath), "%s\\%s\\SaveMeta.xbx", ctx->baseWinDir, dirNameUtf8);
+
             memset(outData, 0, sizeof(*outData));
-            outData->wfd = *wfd;
-            snprintf(outData->szSaveGameDirectory, sizeof(outData->szSaveGameDirectory), "%s%s\\", ctx->rootDrive, wfd->cFileName);
+            ConvertFindDataWToA(*wfdW, &outData->wfd);
+            snprintf(outData->szSaveGameDirectory, sizeof(outData->szSaveGameDirectory), "%s%s\\", ctx->rootDrive, outData->wfd.cFileName);
             if (!ParseSaveMetaFile(metaPath, outData->szSaveGameName, kMaxXboxSaveGameNameChars)) {
-                MultiByteToWideChar(CP_ACP, 0, wfd->cFileName, -1, outData->szSaveGameName, (int)(kMaxXboxSaveGameNameChars - 1));
+                wcsncpy(outData->szSaveGameName, wfdW->cFileName, kMaxXboxSaveGameNameChars - 1);
+                outData->szSaveGameName[kMaxXboxSaveGameNameChars - 1] = L'\0';
             }
             return true;
         }
-        if (!FindNextFileA(ctx->hFind, wfd)) {
+        if (!FindNextFileW(ctx->hFind, wfdW)) {
             return false;
         }
     }
@@ -413,46 +687,57 @@ static HANDLE __stdcall Bridge_XFindFirstSaveGame(const char* lpRootPathName, XB
     if (!lpFindGameData) return INVALID_HANDLE_VALUE;
     char root[8];
     NormalizeXboxRootDrive(lpRootPathName, root, sizeof(root));
-    char winDir[MAX_PATH];
+    char winDir[kMaxHostPath];
     TranslateXboxPath(root, winDir, sizeof(winDir));
     EnsureDirExists(winDir);
 
-    char searchPattern[MAX_PATH];
-    snprintf(searchPattern, sizeof(searchPattern), "%s\\*", winDir);
-    WIN32_FIND_DATAA wfd;
-    HANDLE hFind = FindFirstFileA(searchPattern, &wfd);
+    wchar_t winDirW[kMaxHostPath];
+    if (!Utf8ToWide(winDir, winDirW, kMaxHostPath) || !winDirW[0]) return INVALID_HANDLE_VALUE;
+    wchar_t searchPatternW[kMaxHostPath];
+    swprintf(searchPatternW, kMaxHostPath, L"%ls\\*", winDirW);
+
+    WIN32_FIND_DATAW wfdW = {};
+    HANDLE hFind = FindFirstFileW(searchPatternW, &wfdW);
     if (hFind == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
 
     SaveFindContext* ctx = (SaveFindContext*)calloc(1, sizeof(SaveFindContext));
+    if (!ctx) {
+        FindClose(hFind);
+        return INVALID_HANDLE_VALUE;
+    }
     ctx->magic = kSaveFindContextMagic;
     ctx->hFind = hFind;
     strncpy(ctx->rootDrive, root, sizeof(ctx->rootDrive) - 1);
     strncpy(ctx->baseWinDir, winDir, sizeof(ctx->baseWinDir) - 1);
 
-    if (!FillSaveGameFindData(ctx, &wfd, lpFindGameData)) {
+    if (!FillSaveGameFindData(ctx, &wfdW, lpFindGameData)) {
         FindClose(hFind);
         free(ctx);
+        SetLastError(ERROR_NO_MORE_FILES);
         return INVALID_HANDLE_VALUE;
     }
+    RegisterSaveFindContext(ctx);
     return (HANDLE)ctx;
 }
 
 static BOOL __stdcall Bridge_XFindNextSaveGame(HANDLE hFindGame, XBOX_SAVEGAME_FIND_DATA* lpFindGameData) {
-    if (!hFindGame || hFindGame == INVALID_HANDLE_VALUE || !lpFindGameData) return FALSE;
-    SaveFindContext* ctx = reinterpret_cast<SaveFindContext*>(hFindGame);
-    if (ctx->magic != kSaveFindContextMagic) return FALSE;
-    WIN32_FIND_DATAA wfd;
-    if (!FindNextFileA(ctx->hFind, &wfd)) return FALSE;
-    return FillSaveGameFindData(ctx, &wfd, lpFindGameData) ? TRUE : FALSE;
+    if (!lpFindGameData) return FALSE;
+    SaveFindContext* ctx = LookupSaveFindContext(hFindGame);
+    if (!ctx) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    WIN32_FIND_DATAW wfdW = {};
+    if (!FindNextFileW(ctx->hFind, &wfdW)) return FALSE;
+    return FillSaveGameFindData(ctx, &wfdW, lpFindGameData) ? TRUE : FALSE;
 }
 
 static BOOL __stdcall Bridge_XFindClose(HANDLE hFindGame) {
-    if (!hFindGame || hFindGame == INVALID_HANDLE_VALUE) return FALSE;
-    SaveFindContext* ctx = reinterpret_cast<SaveFindContext*>(hFindGame);
-    if (ctx->magic == kSaveFindContextMagic) {
-        ctx->magic = 0;
-        FindClose(ctx->hFind);
-        free(ctx);
+    if (!hFindGame || hFindGame == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (TryCloseSaveFindContext(hFindGame)) {
         return TRUE;
     }
     return Bridge_CloseHandle(hFindGame);
@@ -559,27 +844,9 @@ static void __stdcall Bridge_XPhysicalFree(void* lpAddress) {
     FreeAlignedTracked(lpAddress);
 }
 
-static void* __stdcall Bridge_XMemAlloc(SIZE_T dwSize, DWORD dwAllocAttributes) {
-    (void)dwAllocAttributes;
-    // Check if physical memory alignment is requested in attributes
-    return AllocAlignedTracked((uint32_t)dwSize, 4096);
-}
-
-static void __stdcall Bridge_XMemFree(void* pAddress, DWORD dwAllocAttributes) {
-    (void)dwAllocAttributes;
-    FreeAlignedTracked(pAddress);
-}
-
-// Xbox Heap APIs (redirect directly to Win32 Process Heap!)
-static HANDLE __stdcall Bridge_GetProcessHeap() {
-    return GetProcessHeap();
-}
-
-static HANDLE __stdcall Bridge_RtlCreateHeap(ULONG Flags, PVOID HeapBase, SIZE_T ReserveSize, SIZE_T CommitSize, PVOID Lock, PVOID Parameters) {
-    (void)Flags; (void)HeapBase; (void)ReserveSize; (void)CommitSize; (void)Lock; (void)Parameters;
-    HANDLE h = HeapCreate(0, 0, 0);
-    return h ? h : GetProcessHeap();
-}
+// Forward declaration for Bridge_XMemAlloc / Bridge_XMemFree heap routing
+static PVOID __stdcall Bridge_RtlAllocateHeap(HANDLE HeapHandle, ULONG Flags, SIZE_T Size);
+static BOOL  __stdcall Bridge_RtlFreeHeap(HANDLE HeapHandle, ULONG Flags, PVOID BaseAddress);
 
 static const uint32_t XBOX_HEAP_MAGIC = 0x58485031u; // 'XHP1'
 struct XboxHeapHdr {
@@ -589,10 +856,86 @@ struct XboxHeapHdr {
     HANDLE   hHeap;
 };
 
-static PVOID __stdcall Bridge_RtlAllocateHeap(HANDLE HeapHandle, ULONG Flags, SIZE_T Size) {
-    if (!HeapHandle || (uintptr_t)HeapHandle < 0x00960000) {
-        HeapHandle = GetProcessHeap();
+void* __stdcall Bridge_XMemAlloc(SIZE_T dwSize, DWORD dwAllocAttributes) {
+    // Bit 31 == 0: XALLOC_MEMTYPE_HEAP (allocate directly on Win32 heap without 4KB page padding).
+    if ((dwAllocAttributes & 0x80000000u) == 0u) {
+        ULONG heapFlags = (dwAllocAttributes & 0x40000000u) ? HEAP_ZERO_MEMORY : 0u;
+        return Bridge_RtlAllocateHeap(GetCachedProcessHeap(), heapFlags, dwSize);
     }
+    // Bit 31 == 1: XALLOC_MEMTYPE_PHYSICAL; bits [27:24] encode alignment shift (0 = default 4096 page).
+    uint32_t alignShift = (dwAllocAttributes >> 24) & 0x0Fu;
+    uint32_t align = (alignShift == 0u) ? 4096u : (1u << alignShift);
+    if (align < 16u) align = 16u;
+    return AllocAlignedTracked(static_cast<uint32_t>(dwSize), align);
+}
+
+void __stdcall Bridge_XMemFree(void* pAddress, DWORD dwAllocAttributes) {
+    (void)dwAllocAttributes;
+    if (!pAddress || IsStaticXboxImageOrNullPtr(pAddress)) return;
+    if ((reinterpret_cast<uintptr_t>(pAddress) & 15u) == 0u) {
+        XboxHeapHdr* hHdr = reinterpret_cast<XboxHeapHdr*>(pAddress) - 1;
+        if (hHdr->magic == XBOX_HEAP_MAGIC) {
+            Bridge_RtlFreeHeap(GetCachedProcessHeap(), 0u, pAddress);
+            return;
+        }
+    }
+    FreeAlignedTracked(pAddress);
+}
+
+// Xbox Heap APIs (redirect directly to Win32 Process / Custom Heaps!)
+static HANDLE ResolveValidWin32Heap(HANDLE candidate) {
+    HANDLE procHeap = GetCachedProcessHeap();
+    if (!candidate || candidate == procHeap || IsStaticXboxImageOrNullPtr(candidate)) {
+        return procHeap;
+    }
+    // Lock-free fast scan across custom heaps created via RtlCreateHeap
+    uint32_t fastCount = g_fastValidHeapCount.load(std::memory_order_acquire);
+    uint32_t limit = (fastCount <= kFastHeapSlots) ? fastCount : kFastHeapSlots;
+    for (uint32_t i = 0; i < limit; ++i) {
+        if (g_fastValidHeaps[i].load(std::memory_order_relaxed) == candidate) {
+            return candidate;
+        }
+    }
+    if (fastCount > kFastHeapSlots) {
+        EnsureXapiLocksInitialized();
+        bool known = false;
+        EnterCriticalSection(&g_heapTrackCs);
+        for (size_t i = 0; i < g_overflowValidHeaps.size(); ++i) {
+            if (g_overflowValidHeaps[i] == candidate) {
+                known = true;
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_heapTrackCs);
+        if (known) return candidate;
+    }
+    return procHeap;
+}
+
+static HANDLE __stdcall Bridge_GetProcessHeap() {
+    return GetCachedProcessHeap();
+}
+
+static HANDLE __stdcall Bridge_RtlCreateHeap(ULONG Flags, PVOID HeapBase, SIZE_T ReserveSize, SIZE_T CommitSize, PVOID Lock, PVOID Parameters) {
+    (void)Flags; (void)HeapBase; (void)ReserveSize; (void)CommitSize; (void)Lock; (void)Parameters;
+    EnsureXapiLocksInitialized();
+    HANDLE h = HeapCreate(0, 0, 0);
+    if (!h) return GetCachedProcessHeap();
+    EnterCriticalSection(&g_heapTrackCs);
+    uint32_t curCount = g_fastValidHeapCount.load(std::memory_order_relaxed);
+    if (curCount < kFastHeapSlots) {
+        g_fastValidHeaps[curCount].store(h, std::memory_order_relaxed);
+        g_fastValidHeapCount.store(curCount + 1u, std::memory_order_release);
+    } else {
+        g_overflowValidHeaps.push_back(h);
+        g_fastValidHeapCount.store(curCount + 1u, std::memory_order_release);
+    }
+    LeaveCriticalSection(&g_heapTrackCs);
+    return h;
+}
+
+static PVOID __stdcall Bridge_RtlAllocateHeap(HANDLE HeapHandle, ULONG Flags, SIZE_T Size) {
+    HeapHandle = ResolveValidWin32Heap(HeapHandle);
     SIZE_T req = Size ? Size : 4;
     void* raw = HeapAlloc(HeapHandle, Flags & HEAP_ZERO_MEMORY, req + sizeof(XboxHeapHdr) + 16);
     if (!raw) return nullptr;
@@ -606,34 +949,36 @@ static PVOID __stdcall Bridge_RtlAllocateHeap(HANDLE HeapHandle, ULONG Flags, SI
 }
 
 static BOOL __stdcall Bridge_RtlFreeHeap(HANDLE HeapHandle, ULONG Flags, PVOID BaseAddress) {
-    if (!BaseAddress || (uintptr_t)BaseAddress < 0x00960000) return TRUE;
+    if (!BaseAddress || IsStaticXboxImageOrNullPtr(BaseAddress)) return TRUE;
     if (((uintptr_t)BaseAddress & 15u) == 0) {
         XboxHeapHdr* hdr = reinterpret_cast<XboxHeapHdr*>(BaseAddress) - 1;
         if (hdr->magic == XBOX_HEAP_MAGIC) {
-            HANDLE h = hdr->hHeap;
+            HANDLE h = ResolveValidWin32Heap(hdr->hHeap);
             void* raw = hdr->rawPtr;
+            SIZE_T reqSz = hdr->reqSize;
             hdr->magic = 0;
-            return HeapFree(h, Flags, raw);
+            NotifyXboxMemoryFreed(BaseAddress, reqSz);
+            return HeapFree(h, Flags & HEAP_NO_SERIALIZE, raw);
         }
     }
-    if (!HeapHandle || (uintptr_t)HeapHandle < 0x00960000) {
-        HeapHandle = GetProcessHeap();
+    HeapHandle = ResolveValidWin32Heap(HeapHandle);
+    SIZE_T rawSz = HeapSize(HeapHandle, Flags & HEAP_NO_SERIALIZE, BaseAddress);
+    if (rawSz != static_cast<SIZE_T>(-1) && rawSz > 0u) {
+        NotifyXboxMemoryFreed(BaseAddress, rawSz);
     }
-    return HeapFree(HeapHandle, Flags, BaseAddress);
+    return HeapFree(HeapHandle, Flags & HEAP_NO_SERIALIZE, BaseAddress);
 }
 
 static SIZE_T __stdcall Bridge_RtlSizeHeap(HANDLE HeapHandle, ULONG Flags, PVOID BaseAddress) {
-    if (!BaseAddress || (uintptr_t)BaseAddress < 0x00960000) return 0;
+    if (!BaseAddress || IsStaticXboxImageOrNullPtr(BaseAddress)) return 0;
     if (((uintptr_t)BaseAddress & 15u) == 0) {
         XboxHeapHdr* hdr = reinterpret_cast<XboxHeapHdr*>(BaseAddress) - 1;
         if (hdr->magic == XBOX_HEAP_MAGIC) {
             return hdr->reqSize;
         }
     }
-    if (!HeapHandle || (uintptr_t)HeapHandle < 0x00960000) {
-        HeapHandle = GetProcessHeap();
-    }
-    return HeapSize(HeapHandle, Flags, BaseAddress);
+    HeapHandle = ResolveValidWin32Heap(HeapHandle);
+    return HeapSize(HeapHandle, Flags & HEAP_NO_SERIALIZE, BaseAddress);
 }
 
 static PVOID __stdcall Bridge_RtlReAllocateHeap(HANDLE HeapHandle, ULONG Flags, PVOID BaseAddress, SIZE_T Size) {
@@ -657,21 +1002,32 @@ static HLOCAL __stdcall Bridge_LocalAlloc(UINT uFlags, SIZE_T uBytes) {
 }
 
 static HLOCAL __stdcall Bridge_LocalFree(HLOCAL hMem) {
+    if (hMem && !IsStaticXboxImageOrNullPtr(hMem)) {
+        SIZE_T sz = LocalSize(hMem);
+        if (sz > 0u) {
+            NotifyXboxMemoryFreed(hMem, sz);
+        }
+    }
     return LocalFree(hMem);
 }
 
 // Synchronization, Threads, Time, Performance Counter, Memory Status
 static BOOL __stdcall Bridge_QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount) {
-    return QueryPerformanceCounter(lpPerformanceCount);
+    if (!lpPerformanceCount) return FALSE;
+    lpPerformanceCount->QuadPart = static_cast<LONGLONG>(QueryXboxCpuPerformanceCounterTicks());
+    return TRUE;
 }
 
 static BOOL __stdcall Bridge_QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency) {
-    return QueryPerformanceFrequency(lpFrequency);
+    if (!lpFrequency) return FALSE;
+    lpFrequency->QuadPart = static_cast<LONGLONG>(QueryXboxCpuPerformanceFrequencyTicks());
+    return TRUE;
 }
 
 static DWORD __stdcall Bridge_GetTickCount() {
-    g_keTickCount = GetTickCount();
-    return g_keTickCount;
+    uint32_t tick = QueryXboxTickCountMs();
+    g_keTickCount = tick;
+    return tick;
 }
 
 static void __stdcall Bridge_GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
@@ -730,13 +1086,21 @@ static DWORD __stdcall Bridge_SleepEx(DWORD dwMilliseconds, BOOL bAlertable) {
     if (dwMilliseconds == 0) {
         return SleepEx(0, bAlertable);
     }
+    const DWORD curTid = GetCurrentThreadId();
+    const bool isMainThread = (g_mainGameThreadId != 0 && curTid == g_mainGameThreadId);
     DWORD remaining = dwMilliseconds;
     while (remaining > 0) {
         DWORD slice = (remaining > 10u) ? 10u : remaining;
         DWORD res = SleepEx(slice, bAlertable);
-        UpdateXboxKernelTick();
-        UpdateXboxInputTick();
-        UpdateXboxAudioTick();
+        if (!IsXboxKernelClockThreadRunning()) {
+            UpdateXboxKernelTick();
+        } else {
+            g_keTickCount = QueryXboxTickCountMs();
+        }
+        if (isMainThread) {
+            UpdateXboxInputTick();
+            UpdateXboxAudioTick();
+        }
         if (res != 0) {
             return res;
         }
@@ -751,15 +1115,37 @@ static void __stdcall Bridge_Sleep(DWORD dwMilliseconds) {
     Bridge_SleepEx(dwMilliseconds, FALSE);
 }
 
+static LONG __stdcall Bridge_UnhandledExceptionFilter(EXCEPTION_POINTERS* ExceptionInfo) {
+    typedef LONG (__stdcall *PFN_TopFilter)(EXCEPTION_POINTERS*);
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(0x008B3F04u), &mbi, sizeof(mbi)) != 0 &&
+        mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0u)
+    {
+        PFN_TopFilter topFilter = *reinterpret_cast<PFN_TopFilter*>(0x008B3F04u); // __TopLevelExceptionFilter
+        if (reinterpret_cast<uintptr_t>(topFilter) >= kMinValidHostAddress) {
+            LONG ret = topFilter(ExceptionInfo);
+            if (ret == EXCEPTION_CONTINUE_EXECUTION) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static HANDLE __stdcall Bridge_CreateThread(
     LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize,
     LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter,
     DWORD dwCreationFlags, LPDWORD lpThreadId)
 {
-    DWORD tid = 0;
-    HANDLE h = CreateThread(lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, &tid);
-    if (lpThreadId) *lpThreadId = tid;
-    return h;
+    return SpawnManagedXboxThread(
+        lpThreadAttributes,
+        dwStackSize,
+        lpStartAddress,
+        lpParameter,
+        dwCreationFlags,
+        lpThreadId,
+        nullptr,
+        true);
 }
 
 static DWORD __stdcall Bridge_ResumeThread(HANDLE hThread) {
@@ -901,7 +1287,7 @@ static int __stdcall Bridge_WSAFDIsSet(uint32_t fd, void* set) {
 }
 
 void InitXboxXapi() {
-    InitializeCriticalSection(&g_findCs);
+    EnsureXapiLocksInitialized();
 
     // 1. Bridge XAPILIB Functions
     InstallBridge(0x0059FB75, &Bridge_QueryPerformanceCounter);    // _QueryPerformanceCounter@4
@@ -963,9 +1349,10 @@ void InitXboxXapi() {
     InstallBridge(0x005A23EF, &Bridge_WaitForSingleObject);        // _WaitForSingleObject@8
     InstallBridge(0x005A2401, &Bridge_WaitForMultipleObjects);     // _WaitForMultipleObjects@16
     InstallBridge(0x005A241B, &Bridge_Sleep);                      // _Sleep@4
-    PatchRet(0x005A2429, 4, 0, false);                             // _XapiCallThreadNotifyRoutines@4
+    // Note: _XapiCallThreadNotifyRoutines@4 (0x005A2429) & _XRegisterThreadNotifyRoutine@8 (0x005A24EF)
+    // are 100% fs:-free and execute natively under _XapiProcessLock (0x007C7BBC).
     InstallBridge(0x005A2461, &Bridge_ResumeThread);               // _ResumeThread@4
-    PatchRet(0x005A24EF, 8, 0, false);                             // _XRegisterThreadNotifyRoutine@8
+    InstallBridge(0x005A2538, &Bridge_UnhandledExceptionFilter);   // _UnhandledExceptionFilter@4 (avoid fs:[0x20] DM_SYSTEM_DATA read)
     InstallBridge(0x005A260C, &Bridge_CreateThread);               // _CreateThread@24
     InstallBridge(0x005A267A, &Bridge_GetCurrentThreadId);         // _GetCurrentThreadId@0
     InstallBridge(0x005A276D, &Bridge_XGetGameRegion);             // _XGetGameRegion@0

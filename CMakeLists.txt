@@ -5,16 +5,16 @@ if(CMAKE_GENERATOR MATCHES "^Visual Studio" AND NOT CMAKE_GENERATOR_PLATFORM)
     set(CMAKE_GENERATOR_PLATFORM "Win32" CACHE STRING "Target architecture (must be 32-bit x86)" FORCE)
 endif()
 
-project(GhostWin11
+project(GhostXR
     VERSION 1.0.0
-    DESCRIPTION "Original Xbox -> Windows 11 Native Compatibility Runtime (GhostWin11 / win11_port)"
+    DESCRIPTION "An in-process Original Xbox HLE compatibility runtime for StarCraft: Ghost on Windows (D3D11 / WASAPI)."
     LANGUAGES CXX
 )
 
 # Enforce 32-bit x86 target (Ghost.exe is a 32-bit x86 Xbox image mapped at 0x00400000)
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR
-        "GhostWin11 MUST be built as a 32-bit (x86 / Win32) executable.\n"
+        "GhostXR MUST be built as a 32-bit (x86 / Win32) executable.\n"
         "Please configure with: cmake -B build -A Win32 (or use --preset x86-release)."
     )
 endif()
@@ -28,10 +28,10 @@ add_executable(post_build_pe
 )
 target_compile_definitions(post_build_pe PRIVATE _CRT_SECURE_NO_WARNINGS)
 
-# Define the GhostWin11 executable target
+# Define the GhostXR executable target
 # NOTE: src/xbox_space.cpp MUST be the first source file so the linker places '.xbox'
 # (0x00401000..0x00950FFF) as Section #1 before host '.text' (0x00951000+).
-add_executable(GhostWin11 WIN32
+add_executable(GhostXR WIN32
     src/xbox_space.cpp
     src/main.cpp
     src/config.cpp
@@ -54,11 +54,11 @@ add_executable(GhostWin11 WIN32
     include/xbox_d3d8_types.h
 )
 
-target_include_directories(GhostWin11 PRIVATE
+target_include_directories(GhostXR PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
-target_compile_definitions(GhostWin11 PRIVATE
+target_compile_definitions(GhostXR PRIVATE
     _CRT_SECURE_NO_WARNINGS
     WIN32_LEAN_AND_MEAN
     NOMINMAX
@@ -66,18 +66,19 @@ target_compile_definitions(GhostWin11 PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(GhostWin11 PRIVATE
+    target_compile_options(GhostXR PRIVATE
         /utf-8
         /Gy
         /Zi
         /EHsc
-        /W3
+        /W4
+        /WX
     )
 
-    set(GHOST_MAP_FILE "${CMAKE_CURRENT_BINARY_DIR}/GhostWin11.map")
-    set(GHOST_PDB_FILE "${CMAKE_CURRENT_BINARY_DIR}/GhostWin11.pdb")
+    set(GHOST_MAP_FILE "${CMAKE_CURRENT_BINARY_DIR}/GhostXR.map")
+    set(GHOST_PDB_FILE "${CMAKE_CURRENT_BINARY_DIR}/GhostXR.pdb")
 
-    target_link_options(GhostWin11 PRIVATE
+    target_link_options(GhostXR PRIVATE
         /SUBSYSTEM:WINDOWS
         /INCREMENTAL:NO
         /SAFESEH:NO
@@ -93,21 +94,21 @@ if(MSVC)
     )
 endif()
 
-target_link_libraries(GhostWin11 PRIVATE
+target_link_libraries(GhostXR PRIVATE
     user32
     gdi32
     ole32
     d3d11
     dxgi
     d3dcompiler
-    dsound
-    winmm
+    synchronization
+    avrt
 )
 
-# Output GhostWin11.exe into build/bin/GhostWin11.exe
+# Output GhostXR.exe into build/bin/GhostXR.exe
 set(GHOST_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/bin")
-set_target_properties(GhostWin11 PROPERTIES
-    OUTPUT_NAME "GhostWin11"
+set_target_properties(GhostXR PROPERTIES
+    OUTPUT_NAME "GhostXR"
     RUNTIME_OUTPUT_DIRECTORY "${GHOST_BIN_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${GHOST_BIN_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${GHOST_BIN_DIR}"
@@ -121,9 +122,9 @@ set_target_properties(GhostWin11 PROPERTIES
 )
 
 # Post-build verification & PE LoadConfig directory clearing
-add_dependencies(GhostWin11 post_build_pe)
-add_custom_command(TARGET GhostWin11 POST_BUILD
-    COMMAND "$<TARGET_FILE:post_build_pe>" "$<TARGET_FILE:GhostWin11>"
+add_dependencies(GhostXR post_build_pe)
+add_custom_command(TARGET GhostXR POST_BUILD
+    COMMAND "$<TARGET_FILE:post_build_pe>" "$<TARGET_FILE:GhostXR>"
     COMMENT "Verifying .xbox section layout and clearing PE LoadConfig directory"
     VERBATIM
 )

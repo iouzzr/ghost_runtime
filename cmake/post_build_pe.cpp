@@ -1,5 +1,5 @@
 // ============================================================================
-// Post-build PE verification and patching tool for GhostWin11.exe
+// Post-build PE verification and patching tool for GhostXR.exe
 // ============================================================================
 // Uses official Windows SDK PE structures (IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32,
 // IMAGE_SECTION_HEADER, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) with zero magic offsets:
@@ -20,7 +20,7 @@ static constexpr DWORD kExpectedXboxVSize = 0x00550000u;
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::fprintf(stderr, "Usage: post_build_pe <path_to_GhostWin11.exe>\n");
+        std::fprintf(stderr, "Usage: post_build_pe <path_to_GhostXR.exe>\n");
         return 1;
     }
 

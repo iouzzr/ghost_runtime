@@ -1,35 +1,37 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include <math.h>
-#include <vector>
+#include <float.h>
 
 // ============================================================================
 // 3D Positional Audio, I3DL2 Occlusion & Pitch Conversion Helpers
 // ============================================================================
 
-static constexpr uint32_t  kCSoundSourceVoiceDataOffset        = 0xE8u;
-static constexpr uint32_t  kCSoundSourcePositionOffset         = 0x4Cu;
-static constexpr uint32_t  kCSoundSourceModeOffset             = 0x84u;
-static constexpr uint32_t  kCSoundSourceI3DL2DirectOffset      = 0xC4u;
-static constexpr uint32_t  kCSoundSourceI3DL2ObstHfOffset      = 0xD8u;
-static constexpr uint32_t  kCSoundSourceI3DL2ObstLfRatioOffset = 0xDCu;
-static constexpr uint32_t  kCSoundSourceI3DL2OcclHfOffset      = 0xE0u;
-static constexpr uint32_t  kCSoundSourceI3DL2OcclLfRatioOffset = 0xE4u;
-static constexpr uint32_t  kCSoundSourceLinkedSourceOffset     = 0x150u;
+static constexpr uint32_t kCSoundSourceVoiceDataOffset        = 0xE8u;
+static constexpr uint32_t kCSoundSourcePositionOffset         = 0x4Cu;
+static constexpr uint32_t kCSoundSourceModeOffset             = 0x84u;
+static constexpr uint32_t kCSoundSourceI3DL2DirectOffset      = 0xC4u;
+static constexpr uint32_t kCSoundSourceI3DL2ObstHfOffset      = 0xD8u;
+static constexpr uint32_t kCSoundSourceI3DL2ObstLfRatioOffset = 0xDCu;
+static constexpr uint32_t kCSoundSourceI3DL2OcclHfOffset      = 0xE0u;
+static constexpr uint32_t kCSoundSourceI3DL2OcclLfRatioOffset = 0xE4u;
+static constexpr uint32_t kCSoundSourceLinkedSourceOffset     = 0x150u;
 
-static constexpr uint32_t  kVoiceDataDistanceVolOffset         = 0x04u;
-static constexpr uint32_t  kVoiceDataConeVolOffset             = 0x08u;
-static constexpr uint32_t  kVoiceDataI3DL2DirectVolOffset      = 0x1Cu;
-static constexpr uint32_t  kVoiceDataI3DL2RoomVolOffset        = 0x20u;
-static constexpr uint32_t  kVoiceDataDopplerPitchOffset        = 0x24u;
+static constexpr uint32_t kVoiceDataDistanceVolOffset         = 0x04u;
+static constexpr uint32_t kVoiceDataConeVolOffset             = 0x08u;
+static constexpr uint32_t kVoiceDataI3DL2DirectVolOffset      = 0x1Cu;
+static constexpr uint32_t kVoiceDataI3DL2RoomVolOffset        = 0x20u;
+static constexpr uint32_t kVoiceDataDopplerPitchOffset        = 0x24u;
 
-static constexpr uint32_t  kXboxDs3dModeHeadRelative           = 1u;
-static constexpr uint32_t  kXboxDs3dModeDisable                = 2u;
+static constexpr uint32_t kXboxDs3dModeHeadRelative           = 1u;
+static constexpr uint32_t kXboxDs3dModeDisable                = 2u;
+static constexpr uint32_t kXboxMixBinI3DL2                    = 10u;
 
-static constexpr float     kMaxStereoPanMillibels              = 3500.0f;
+static constexpr float    kMaxStereoPanMillibels              = 3500.0f;
+static constexpr float    kPiFloat                            = 3.14159265358979323846f;
 
-static constexpr double    kXboxPitchReferenceFreqHz           = 48000.0;
-static constexpr double    kXboxPitchUnitsPerOctave            = 4096.0;
+static constexpr double   kXboxPitchReferenceFreqHz           = 48000.0;
+static constexpr double   kXboxPitchUnitsPerOctave            = 4096.0;
 
 DWORD XboxPitchToFrequencyHz(LONG lPitch) {
     // Xbox DirectSound & XACT represent pitch in 1/4096ths of an octave relative to 48000 Hz
@@ -55,7 +57,7 @@ LONG FrequencyHzToXboxPitch(DWORD freqHz) {
 static int32_t GetSourceI3DL2DirectAttenMb(const uint8_t* srcCs) {
     // Extracts I3DL2 direct + obstruction/occlusion attenuation from a CSoundSource instance
     // (populated by cGameVoice::APISetOccluded at 0x00535180 -> CSoundSource::SetI3DL2Source at 0x00702C48).
-    if (!srcCs || reinterpret_cast<uintptr_t>(srcCs) < kMinValidXboxAddress) return 0;
+    if (!srcCs || reinterpret_cast<uintptr_t>(srcCs) < kMinValidHostAddress) return 0;
     int32_t lDirect     = *reinterpret_cast<const int32_t*>(srcCs + kCSoundSourceI3DL2DirectOffset);
     int32_t obstHfLevel = *reinterpret_cast<const int32_t*>(srcCs + kCSoundSourceI3DL2ObstHfOffset);
     float   obstLfRatio = *reinterpret_cast<const float*>(srcCs + kCSoundSourceI3DL2ObstLfRatioOffset);
@@ -80,8 +82,8 @@ struct XboxHrtfFilterPair {
     const uint8_t* pRight;
 };
 
-using PFN_CFullHRTFSource_GetFilterPair = void(__stdcall*)(float flAzimuth, float flElevation, int fRearAsFront, XboxHrtfFilterPair* pFilterPair);
-using PFN_CHRTFSource_SetFullHRTF5Channel = void(__stdcall*)();
+using PFN_CFullHRTFSource_GetFilterPair     = void(__stdcall*)(float flAzimuth, float flElevation, int fRearAsFront, XboxHrtfFilterPair* pFilterPair);
+using PFN_CHRTFSource_SetFullHRTF5Channel   = void(__stdcall*)();
 
 static inline int DecodeMcpSignMag8(uint8_t b) {
     int mag = static_cast<int>(b & 0x7Fu);
@@ -106,7 +108,7 @@ static void EvaluateHrtfFirResponse(const uint8_t* fir32, float* outRmsGain, flo
         eDiff  += static_cast<float>(d * d);
         prevTap = tap;
     }
-    // Reference bypass FIR at 0x006FDA2C / 0° front has RMS ~85..127 and DC sum ~200
+    // Reference bypass FIR at 0x006FDA2C / 0 deg front has RMS ~85..127 and DC sum ~200
     float dcGain  = fabsf(static_cast<float>(dcSum)) / 200.0f;
     float rmsGain = sqrtf(eTotal) / 110.0f;
     float gain    = 0.65f * rmsGain + 0.35f * dcGain;
@@ -121,34 +123,41 @@ static void EvaluateHrtfFirResponse(const uint8_t* fir32, float* outRmsGain, flo
     }
 }
 
+static volatile LONG g_hrtfPageCheckState = 0; // 0 = unchecked, 1 = MEM_COMMIT, -1 = unmapped
+
+static bool IsGhostHrtfCodeMapped() {
+    LONG st = g_hrtfPageCheckState;
+    if (st == 0) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        bool ok = (VirtualQuery(reinterpret_cast<LPCVOID>(0x006E3B11u), &mbi, sizeof(mbi)) != 0 &&
+                   mbi.State == MEM_COMMIT);
+        st = ok ? 1 : -1;
+        InterlockedExchange(&g_hrtfPageCheckState, st);
+    }
+    if (st < 0) {
+        return false;
+    }
+    const uint8_t* pInit = reinterpret_cast<const uint8_t*>(0x006E3C2Du);
+    const uint8_t* pPair = reinterpret_cast<const uint8_t*>(0x006E3B11u);
+    return (pInit[0] != 0x00u && pPair[0] != 0x00u);
+}
+
+static float DecodeMcpxFilterFreqCoeff(int16_t fcHw, uint32_t sampleRateHz);
+
 void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAttenDb, Xbox3DVoiceMetrics* outMetrics) {
     if (outMetrics) {
         memset(outMetrics, 0, sizeof(*outMetrics));
+        outMetrics->hrtfFilterCoeff = 1.0f;
     }
     if (!outPan || !outAttenDb) return;
-    if (!pVoiceData || reinterpret_cast<uintptr_t>(pVoiceData) < kMinValidXboxAddress) return;
+    if (!pVoiceData || reinterpret_cast<uintptr_t>(pVoiceData) < (kMinValidHostAddress + kCSoundSourceVoiceDataOffset)) return;
 
-    // Ensure CHRTFSource::m_vtable (0x006FE22C..0x006FE250) is initialized to CFullHRTFSource
-    if (*reinterpret_cast<const uint32_t*>(0x006FE250) == 0) {
-        reinterpret_cast<PFN_CHRTFSource_SetFullHRTF5Channel>(0x006E3C2D)();
+    bool hasNativeHrtf = IsGhostHrtfCodeMapped();
+    if (hasNativeHrtf && *reinterpret_cast<const uint32_t*>(0x006FE250u) == 0u) {
+        reinterpret_cast<PFN_CHRTFSource_SetFullHRTF5Channel>(0x006E3C2Du)();
     }
 
     // In CSoundSource::Update3DProperties (0x007022AA), pVoiceData == (uint8_t*)pSoundSource + 0xE8 (_DS3DCALCVOICEDATA).
-    // CDirectSound3DCalculator::GetVoiceData (0x006E0E00) populates:
-    //   +0x00: uint32_t dwValid
-    //   +0x04: int32_t  lDistanceVolume    (CFullHRTFSource::GetDistanceVolume at 0x006E3786)
-    //   +0x08: int32_t  lConeVolume        (CFullHRTFSource::GetConeVolume at 0x006E3897)
-    //   +0x0C: int32_t  lFrontVolume       (CFullHRTFSource::GetFrontRearVolume at 0x006E3927)
-    //   +0x10: int32_t  lRearVolume        (CFullHRTFSource::GetFrontRearVolume at 0x006E3927)
-    //   +0x14: int32_t  lCenterVolume      (CFullHRTFSource::GetCenterVolume at 0x006E39F6)
-    //   +0x18: int32_t  lLFEVolume         (CFullHRTFSource::GetCenterVolume at 0x006E39F6)
-    //   +0x1C: int32_t  lI3DL2DirectVolume (CI3DL2Source::CalculateI3DL2 at 0x006E107B)
-    //   +0x20: int32_t  lI3DL2RoomVolume   (CI3DL2Source::CalculateI3DL2 at 0x006E107B)
-    //   +0x24: int32_t  lDopplerPitch      (CFullHRTFSource::GetDopplerPitch at 0x006E3A98)
-    //   +0x28: float    flAzimuth          (CFullHRTFSource::CalcPolarCoords at 0x006E3542)
-    //   +0x2C: float    flElevation        (CFullHRTFSource::CalcPolarCoords at 0x006E3542)
-    //   +0x30: int32_t  nI3DL2DirectFilter (CI3DL2Source::CalculateI3DL2 at 0x006E107B)
-    //   +0x34: int32_t  nI3DL2RoomFilter   (CI3DL2Source::CalculateI3DL2 at 0x006E107B)
     const uint8_t* vd = reinterpret_cast<const uint8_t*>(pVoiceData);
     const uint8_t* cs = vd - kCSoundSourceVoiceDataOffset;
     uint32_t dwMode = *reinterpret_cast<const uint32_t*>(cs + kCSoundSourceModeOffset);
@@ -160,11 +169,11 @@ void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAt
 
     int32_t distVol      = *reinterpret_cast<const int32_t*>(vd + kVoiceDataDistanceVolOffset);
     int32_t coneVol      = *reinterpret_cast<const int32_t*>(vd + kVoiceDataConeVolOffset);
-    int32_t frontVol     = *reinterpret_cast<const int32_t*>(vd + 0x0C);
-    int32_t rearVol      = *reinterpret_cast<const int32_t*>(vd + 0x10);
+    int32_t frontVol     = *reinterpret_cast<const int32_t*>(vd + 0x0Cu);
+    int32_t rearVol      = *reinterpret_cast<const int32_t*>(vd + 0x10u);
     int32_t vdI3dl2Room  = *reinterpret_cast<const int32_t*>(vd + kVoiceDataI3DL2RoomVolOffset);
     int32_t dopplerPitch = *reinterpret_cast<const int32_t*>(vd + kVoiceDataDopplerPitchOffset);
-    int16_t vdDirectFc   = static_cast<int16_t>(*reinterpret_cast<const int32_t*>(vd + 0x30) & 0xFFFF);
+    int16_t vdDirectFc   = static_cast<int16_t>(*reinterpret_cast<const int32_t*>(vd + 0x30u) & 0xFFFF);
     if (distVol < kMinDirectSoundVolumeMb) distVol = kMinDirectSoundVolumeMb;
     if (distVol > kMaxDirectSoundVolumeMb) distVol = kMaxDirectSoundVolumeMb;
     if (coneVol < kMinDirectSoundVolumeMb) coneVol = kMinDirectSoundVolumeMb;
@@ -176,7 +185,7 @@ void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAt
     int32_t i3dl2Vol = GetSourceI3DL2DirectAttenMb(cs);
     if (i3dl2Vol == 0) {
         const uint8_t* linkedCs = *reinterpret_cast<const uint8_t* const*>(cs + kCSoundSourceLinkedSourceOffset);
-        if (linkedCs && reinterpret_cast<uintptr_t>(linkedCs) >= kMinValidXboxAddress) {
+        if (linkedCs && reinterpret_cast<uintptr_t>(linkedCs) >= kMinValidHostAddress) {
             i3dl2Vol = GetSourceI3DL2DirectAttenMb(linkedCs);
         }
     }
@@ -187,25 +196,29 @@ void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAt
         }
     }
 
-    // Extract or compute polar azimuth [-180..+180] and elevation [-90..+90] in degrees
-    float azimuthDeg   = *reinterpret_cast<const float*>(vd + 0x28);
-    float elevationDeg = *reinterpret_cast<const float*>(vd + 0x2C);
+    float azimuthDeg   = *reinterpret_cast<const float*>(vd + 0x28u);
+    float elevationDeg = *reinterpret_cast<const float*>(vd + 0x2Cu);
     bool  validPolar   = _finite(azimuthDeg) && _finite(elevationDeg) &&
                          (fabsf(azimuthDeg) > 0.001f || fabsf(elevationDeg) > 0.001f);
 
-    float sx = *reinterpret_cast<const float*>(cs + kCSoundSourcePositionOffset + 0);
-    float sy = *reinterpret_cast<const float*>(cs + kCSoundSourcePositionOffset + 4);
-    float sz = *reinterpret_cast<const float*>(cs + kCSoundSourcePositionOffset + 8);
+    float sx = *reinterpret_cast<const float*>(cs + kCSoundSourcePositionOffset + 0u);
+    float sy = *reinterpret_cast<const float*>(cs + kCSoundSourcePositionOffset + 4u);
+    float sz = *reinterpret_cast<const float*>(cs + kCSoundSourcePositionOffset + 8u);
     if (!validPolar && _finite(sx) && _finite(sy) && _finite(sz)) {
-        float lx = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x08);
-        float ly = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x0C);
-        float lz = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x10);
-        float fx = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x20);
-        float fy = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x24);
-        float fz = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x28);
-        float tx = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x2C);
-        float ty = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x30);
-        float tz = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x34);
+        float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+        float fx = 0.0f, fy = 0.0f, fz = 1.0f;
+        float tx = 0.0f, ty = 1.0f, tz = 0.0f;
+        if (hasNativeHrtf) {
+            lx = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x08u);
+            ly = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x0Cu);
+            lz = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x10u);
+            fx = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x20u);
+            fy = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x24u);
+            fz = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x28u);
+            tx = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x2Cu);
+            ty = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x30u);
+            tz = *reinterpret_cast<const float*>(ADDR_XACT_LISTENER + 0x34u);
+        }
 
         float dx = (dwMode == kXboxDs3dModeHeadRelative) ? sx : (sx - lx);
         float dy = (dwMode == kXboxDs3dModeHeadRelative) ? sy : (sy - ly);
@@ -230,64 +243,70 @@ void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAt
             float localZ = (dx * zx + dy * zy + dz * zz) / dist;
             if (localY < -1.0f) localY = -1.0f;
             if (localY >  1.0f) localY =  1.0f;
-            elevationDeg = asinf(localY) * (180.0f / 3.14159265f);
-            azimuthDeg   = atan2f(localX, localZ) * (180.0f / 3.14159265f);
+            elevationDeg = asinf(localY) * (180.0f / kPiFloat);
+            azimuthDeg   = atan2f(localX, localZ) * (180.0f / kPiFloat);
             validPolar   = true;
         }
     }
 
-    LONG computedPan = 0;
+    LONG    computedPan       = 0;
     int32_t hrtfShadowAttenMb = 0;
-    uint16_t hrtfFcCoeff = static_cast<uint16_t>(vdDirectFc);
+    int16_t hrtfFcHw          = vdDirectFc;
+    int32_t itdSamples        = 0;
 
     if (validPolar) {
-        if (azimuthDeg < -180.0f) azimuthDeg = -180.0f;
-        if (azimuthDeg >  180.0f) azimuthDeg =  180.0f;
+        if (azimuthDeg < -180.0f)  azimuthDeg = -180.0f;
+        if (azimuthDeg >  180.0f)  azimuthDeg =  180.0f;
         if (elevationDeg < -90.0f) elevationDeg = -90.0f;
         if (elevationDeg >  90.0f) elevationDeg =  90.0f;
 
-        // Query Ghost.exe's native CFullHRTFSource::GetFilterPair (0x006E3B11) for the 31-tap FIR pair & ITD
-        XboxHrtfFilterPair filterPair = { nullptr, nullptr };
-        reinterpret_cast<PFN_CFullHRTFSource_GetFilterPair>(0x006E3B11)(azimuthDeg, elevationDeg, 1, &filterPair);
+        float azRad = azimuthDeg * (kPiFloat / 180.0f);
+        float elRad = elevationDeg * (kPiFloat / 180.0f);
+        float sinAz = sinf(azRad) * cosf(elRad);
 
         float gainL = 1.0f, gainR = 1.0f;
         float hfL   = 1.0f, hfR   = 1.0f;
-        EvaluateHrtfFirResponse(filterPair.pLeft,  &gainL, &hfL);
-        EvaluateHrtfFirResponse(filterPair.pRight, &gainR, &hfR);
-
-        // Incorporate ITD psychoacoustic precedence effect (byte 31 is sample delay 0..63 at 48kHz)
-        int itdSamples = 0;
-        if (filterPair.pLeft && filterPair.pRight) {
-            itdSamples = (azimuthDeg >= 0.0f)
-                ? static_cast<int>(filterPair.pLeft[31])
-                : -static_cast<int>(filterPair.pRight[31]);
+        if (hasNativeHrtf) {
+            XboxHrtfFilterPair filterPair = { nullptr, nullptr };
+            reinterpret_cast<PFN_CFullHRTFSource_GetFilterPair>(0x006E3B11u)(azimuthDeg, elevationDeg, 1, &filterPair);
+            EvaluateHrtfFirResponse(filterPair.pLeft,  &gainL, &hfL);
+            EvaluateHrtfFirResponse(filterPair.pRight, &gainR, &hfR);
+            if (filterPair.pLeft && filterPair.pRight) {
+                itdSamples = (azimuthDeg >= 0.0f)
+                    ? static_cast<int32_t>(filterPair.pLeft[31] & 0x3Fu)
+                    : -static_cast<int32_t>(filterPair.pRight[31] & 0x3Fu);
+            }
+        } else {
+            // Analytical Woodworth spherical-head ITD (r = 0.0875m, c = 343 m/s @ 48 kHz) & head-shadow ILD
+            float latAngle = asinf(sinAz < -1.0f ? -1.0f : (sinAz > 1.0f ? 1.0f : sinAz));
+            float absLat   = fabsf(latAngle);
+            int32_t woodworthSamples = static_cast<int32_t>((0.0875f / 343.0f) * (absLat + sinf(absLat)) * 48000.0f + 0.5f);
+            if (woodworthSamples > 63) woodworthSamples = 63;
+            itdSamples = (azimuthDeg >= 0.0f) ? woodworthSamples : -woodworthSamples;
+            gainL = 1.0f - 0.35f * sinAz;
+            gainR = 1.0f + 0.35f * sinAz;
+            hfL   = (sinAz > 0.0f) ? (1.0f - 0.45f * sinAz) : 1.0f;
+            hfR   = (sinAz < 0.0f) ? (1.0f + 0.45f * sinAz) : 1.0f;
         }
-        float azRad = azimuthDeg * (3.14159265f / 180.0f);
-        float elRad = elevationDeg * (3.14159265f / 180.0f);
-        float sinAz = sinf(azRad) * cosf(elRad);
 
-        // Combine FIR Interaural Level Difference (ILD) with spherical head-shadow & ITD
-        float firIldDb = 20.0f * log10f((gainR + 0.01f) / (gainL + 0.01f));
-        float itdPanMb = static_cast<float>(itdSamples) * 28.0f;
-        float geomPanMb = sinAz * kMaxStereoPanMillibels;
+        float firIldDb    = 20.0f * log10f((gainR + 0.01f) / (gainL + 0.01f));
+        float itdPanMb    = static_cast<float>(itdSamples) * 28.0f;
+        float geomPanMb   = sinAz * kMaxStereoPanMillibels;
         float combinedPan = 0.45f * (firIldDb * 100.0f + itdPanMb) + 0.55f * geomPanMb;
         if (combinedPan < -kMaxStereoPanMillibels) combinedPan = -kMaxStereoPanMillibels;
         if (combinedPan >  kMaxStereoPanMillibels) combinedPan =  kMaxStereoPanMillibels;
         computedPan = static_cast<LONG>(combinedPan);
 
-        // Rear-hemisphere & elevation head-shadow attenuation (from CFullHRTFSource::GetFrontRearVolume + FIR energy)
         float absAz = fabsf(azimuthDeg);
         if (absAz > 90.0f) {
-            float rearFactor = (absAz - 90.0f) / 90.0f; // 0 at 90 deg, 1 at 180 deg
+            float rearFactor = (absAz - 90.0f) / 90.0f;
             hrtfShadowAttenMb -= static_cast<int32_t>(rearFactor * 450.0f);
-            // Rear-hemisphere pinna low-pass head shadow (reduces HF cutoff when sound is behind listener)
             int16_t rearFc = static_cast<int16_t>(-2200.0f * rearFactor * (1.1f - 0.3f * (hfL + hfR)));
-            if (rearFc < static_cast<int16_t>(hrtfFcCoeff)) {
-                hrtfFcCoeff = static_cast<uint16_t>(rearFc);
+            if (rearFc < hrtfFcHw) {
+                hrtfFcHw = rearFc;
             }
         }
         if (frontVol < 0 && rearVol < 0 && frontVol > kMinDirectSoundVolumeMb && rearVol > kMinDirectSoundVolumeMb) {
-            // Stereo downmix of 4-channel Front/Rear power law (-3 dB rear fold-down)
             float pFront = powf(10.0f, static_cast<float>(frontVol) / 1000.0f);
             float pRear  = powf(10.0f, static_cast<float>(rearVol)  / 1000.0f) * 0.5f;
             float pTotal = pFront + pRear;
@@ -296,6 +315,12 @@ void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAt
                 if (foldMb < hrtfShadowAttenMb) hrtfShadowAttenMb = foldMb;
             }
         }
+    }
+
+    float hrtfFilterCoeff = 1.0f;
+    if (hrtfFcHw < 0) {
+        hrtfFilterCoeff = DecodeMcpxFilterFreqCoeff(hrtfFcHw, 48000u);
+        if (hrtfFilterCoeff > 0.91f) hrtfFilterCoeff = 0.91f;
     }
 
     LONG totalAtten = static_cast<LONG>(distVol + coneVol + i3dl2Vol + hrtfShadowAttenMb);
@@ -312,67 +337,98 @@ void Compute3DAudioPanAndAtten(const void* pVoiceData, LONG* outPan, LONG* outAt
         outMetrics->dopplerPitch    = dopplerPitch;
         outMetrics->i3dl2DirectVol  = i3dl2Vol;
         outMetrics->i3dl2RoomVol    = vdI3dl2Room;
-        outMetrics->hrtfFilterCoeff = hrtfFcCoeff;
+        outMetrics->itdDelaySamples = itdSamples;
+        outMetrics->hrtfFilterCoeff = hrtfFilterCoeff;
         outMetrics->active3D        = true;
     }
 }
 
-void ComputeMixBinPairsPan(const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count, LONG* outPan) {
-    if (!outPan || !pairs || count == 0) return;
+void ComputeMixBinPairsPan(const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count, LONG* outPan, LONG* outAttenMb) {
+    if (!outPan || !pairs || count == 0u) return;
     if (count > 8u) count = 8u;
 
-    float leftGain  = 0.0f;
-    float rightGain = 0.0f;
-    bool  hasLR     = false;
+    float leftGain   = 0.0f;
+    float rightGain  = 0.0f;
+    bool  hasSpeaker = false;
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t bin = pairs[i].dwMixBin;
         int32_t  vol = pairs[i].lVolume;
-        if (vol < -10000) vol = -10000;
-        if (vol > 0)      vol = 0;
-        float g = powf(10.0f, static_cast<float>(vol) / 2000.0f);
-        if (bin == 0 || bin == 4) { // FRONT_LEFT or BACK_LEFT
+        if (vol < kMinDirectSoundVolumeMb) vol = kMinDirectSoundVolumeMb;
+        if (vol > 0)                       vol = 0;
+        float g = (vol <= kMinDirectSoundVolumeMb) ? 0.0f : powf(10.0f, static_cast<float>(vol) / 2000.0f);
+        if (bin == 0u || bin == 4u) { // FRONT_LEFT or BACK_LEFT
             leftGain += g;
-            hasLR = true;
-        } else if (bin == 1 || bin == 5) { // FRONT_RIGHT or BACK_RIGHT
+            hasSpeaker = true;
+        } else if (bin == 1u || bin == 5u) { // FRONT_RIGHT or BACK_RIGHT
             rightGain += g;
-            hasLR = true;
-        } else if (bin == 2) { // FRONT_CENTER
-            leftGain  += g * 0.707f;
-            rightGain += g * 0.707f;
+            hasSpeaker = true;
+        } else if (bin == 2u) { // FRONT_CENTER (-3 dB equal-power split)
+            leftGain  += g * 0.70710678f;
+            rightGain += g * 0.70710678f;
+            hasSpeaker = true;
+        } else if (bin == 3u) { // LFE (-6 dB stereo fold-down)
+            leftGain  += g * 0.5f;
+            rightGain += g * 0.5f;
+            hasSpeaker = true;
         }
     }
 
-    if (hasLR && (leftGain > 0.0001f || rightGain > 0.0001f)) {
-        float diff = (rightGain - leftGain) / (rightGain + leftGain);
-        LONG pan = static_cast<LONG>(diff * 3500.0f);
-        if (pan < -10000) pan = -10000;
-        if (pan >  10000) pan =  10000;
-        *outPan = pan;
+    if (!hasSpeaker) {
+        return;
     }
+
+    if (leftGain <= 0.00001f && rightGain <= 0.00001f) {
+        *outPan = 0;
+        if (outAttenMb) *outAttenMb = kMinDirectSoundVolumeMb;
+        return;
+    }
+
+    float peakGain = (leftGain > rightGain) ? leftGain : rightGain;
+    if (peakGain > 1.0f) peakGain = 1.0f;
+    if (outAttenMb) {
+        LONG attMb = (peakGain >= 0.9995f) ? 0 : static_cast<LONG>(2000.0f * log10f(peakGain));
+        if (attMb < kMinDirectSoundVolumeMb) attMb = kMinDirectSoundVolumeMb;
+        if (attMb > 0)                       attMb = 0;
+        *outAttenMb = attMb;
+    }
+
+    LONG pan = 0;
+    if (fabsf(rightGain - leftGain) > 0.0001f * peakGain) {
+        if (leftGain > rightGain) {
+            float ratio = (rightGain > 0.00001f) ? (rightGain / leftGain) : 0.00001f;
+            pan = static_cast<LONG>(2000.0f * log10f(ratio));
+        } else {
+            float ratio = (leftGain > 0.00001f) ? (leftGain / rightGain) : 0.00001f;
+            pan = static_cast<LONG>(-2000.0f * log10f(ratio));
+        }
+        if (pan < kMinDirectSoundPanMb) pan = kMinDirectSoundPanMb;
+        if (pan > kMaxDirectSoundPanMb) pan = kMaxDirectSoundPanMb;
+    }
+    *outPan = pan;
 }
 
-void ComputeMixBinsPan(const XBOX_DSMIXBINS* pMixBins, LONG* outPan) {
-    if (!outPan || !pMixBins || pMixBins->dwMixBinCount == 0 || pMixBins->dwMixBinCount > 32 || !pMixBins->lpMixBinVolumePairs) return;
-    if ((uintptr_t)pMixBins->lpMixBinVolumePairs < 0x00010000) return;
+void ComputeMixBinsPan(const XBOX_DSMIXBINS* pMixBins, LONG* outPan, LONG* outAttenMb) {
+    if (!outPan || !pMixBins || pMixBins->dwMixBinCount == 0u || pMixBins->dwMixBinCount > 32u || !pMixBins->lpMixBinVolumePairs) return;
+    if (reinterpret_cast<uintptr_t>(pMixBins->lpMixBinVolumePairs) < kMinValidHostAddress) return;
 
     XBOX_DSMIXBINVOLUMEPAIR tempPairs[8] = {};
     uint32_t count = (pMixBins->dwMixBinCount > 8u) ? 8u : pMixBins->dwMixBinCount;
     for (uint32_t i = 0; i < count; ++i) {
         tempPairs[i] = pMixBins->lpMixBinVolumePairs[i];
     }
-    ComputeMixBinPairsPan(tempPairs, count, outPan);
+    ComputeMixBinPairsPan(tempPairs, count, outPan, outAttenMb);
 }
 
 void InitVoiceDefaultMixBins(uint32_t dwFlags, XBOX_DSMIXBINVOLUMEPAIR outPairs[8], uint32_t* outCount) {
     if (!outPairs || !outCount) return;
-    memset(outPairs, 0, sizeof(XBOX_DSMIXBINVOLUMEPAIR) * 8);
+    memset(outPairs, 0, sizeof(XBOX_DSMIXBINVOLUMEPAIR) * 8u);
     // Matches CDirectSoundVoiceSettings::SetMixBins (0x006E1A9C):
     //   If (dwFlags & 0x00200010) != 0 (3D voice), initializes with _DirectSoundDefaultMixBins_3D (0x006FD8BC):
     //     5 bins: {6,0}, {8,0}, {7,0}, {9,0}, {10,0} (3D Front, Back, Center, LFE, I3DL2 Room).
     //   Otherwise initializes with _DirectSoundDefaultMixBins_Stereo (0x006FD8DC):
     //     2 bins: {0,0}, {1,0} (Front Left, Front Right).
-    if ((dwFlags & 0x00200010u) != 0) {
+    if ((dwFlags & 0x00200010u) != 0u) {
         static const uint32_t kDefault3DBins[5] = { 6u, 8u, 7u, 9u, 10u };
         for (uint32_t i = 0; i < 5u; ++i) {
             outPairs[i].dwMixBin = kDefault3DBins[i];
@@ -390,7 +446,7 @@ void InitVoiceDefaultMixBins(uint32_t dwFlags, XBOX_DSMIXBINVOLUMEPAIR outPairs[
 
 void AssignVoiceMixBins(const XBOX_DSMIXBINS* pMixBins, XBOX_DSMIXBINVOLUMEPAIR outPairs[8], uint32_t* outCount) {
     if (!outPairs || !outCount || !pMixBins || !pMixBins->lpMixBinVolumePairs) return;
-    if (reinterpret_cast<uintptr_t>(pMixBins->lpMixBinVolumePairs) < 0x00010000u) return;
+    if (reinterpret_cast<uintptr_t>(pMixBins->lpMixBinVolumePairs) < kMinValidHostAddress) return;
     uint32_t count = pMixBins->dwMixBinCount;
     if (count > 8u) count = 8u;
     for (uint32_t i = 0; i < count; ++i) {
@@ -409,8 +465,8 @@ void AssignVoiceMixBins(const XBOX_DSMIXBINS* pMixBins, XBOX_DSMIXBINVOLUMEPAIR 
 
 void UpdateVoiceMixBinVolumes(const XBOX_DSMIXBINS* pMixBins, XBOX_DSMIXBINVOLUMEPAIR ioPairs[8], uint32_t* ioCount) {
     if (!ioPairs || !ioCount || !pMixBins || !pMixBins->lpMixBinVolumePairs) return;
-    if (reinterpret_cast<uintptr_t>(pMixBins->lpMixBinVolumePairs) < 0x00010000u) return;
-    uint32_t inCount = pMixBins->dwMixBinCount;
+    if (reinterpret_cast<uintptr_t>(pMixBins->lpMixBinVolumePairs) < kMinValidHostAddress) return;
+    uint32_t inCount  = pMixBins->dwMixBinCount;
     if (inCount > 32u) inCount = 32u;
     uint32_t curCount = (*ioCount > 8u) ? 8u : *ioCount;
 
@@ -451,28 +507,93 @@ void FillVoicePropsMixBins(const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t coun
     }
 }
 
+void ExtractXboxMixBinI3DL2Send(
+    const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count, bool* outHasSend, int32_t* outSendMb)
+{
+    if (!outHasSend || !outSendMb || !pairs) return;
+    *outHasSend = false;
+    *outSendMb  = kMinDirectSoundVolumeMb;
+    if (count > 8u) count = 8u;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (pairs[i].dwMixBin == kXboxMixBinI3DL2) {
+            int32_t v = pairs[i].lVolume;
+            if (v > -9000) {
+                *outHasSend = true;
+                *outSendMb  = (v > 0) ? 0 : v;
+            }
+            return;
+        }
+    }
+}
+
+// ============================================================================
+// Float32 Chamberlin State-Variable Filter, HRTF Head-Shadow & Binaural ITD
+// ============================================================================
+
+static void ClampChamberlinSvfCoeffs(float& fCoeff, float& dCoeff) {
+    if (!_finite(dCoeff)) dCoeff = 1.0f;
+    if (dCoeff < 0.075f)  dCoeff = 0.075f;
+    if (dCoeff > 2.0f)    dCoeff = 2.0f;
+
+    if (!_finite(fCoeff)) fCoeff = 0.5f;
+    if (fCoeff < 0.004f)  fCoeff = 0.004f;
+    // Exact Jury stability bound for Chamberlin 2-integrator SVF: f^2 + 2*f*d < 4 <=> f < sqrt(d^2 + 4) - d.
+    // Multiply by 0.92f so discrete poles stay strictly inside the unit circle with headroom against ringing.
+    float fMax = 0.92f * (sqrtf(dCoeff * dCoeff + 4.0f) - dCoeff);
+    if (fMax > 1.35f) fMax = 1.35f;
+    if (fCoeff > fMax) fCoeff = fMax;
+}
+
+static inline void SanitizeFloatDspState(float& s) {
+    if (!_finite(s) || fabsf(s) < 1e-20f) {
+        s = 0.0f;
+    } else if (s > 8.0f) {
+        s = 8.0f;
+    } else if (s < -8.0f) {
+        s = -8.0f;
+    }
+}
+
 static float DecodeMcpxFilterFreqCoeff(int16_t fcHw, uint32_t sampleRateHz) {
     float f48k = 1.0f;
     if (fcHw == -32768) {
-        // Cutoff <= 30 Hz floor (0x00708D77: mov eax, 0x8000)
-        f48k = 2.0f * sinf(3.14159265f * 30.0f / 48000.0f);
+        // Cutoff <= 30 Hz floor (0x00708D73: mov eax, 0x8000)
+        f48k = 2.0f * sinf(kPiFloat * 30.0f / 48000.0f);
     } else if (fcHw < 0) {
         f48k = powf(2.0f, static_cast<float>(fcHw) / 4096.0f);
     } else {
-        f48k = 2.0f * sinf(3.14159265f * 8000.0f / 48000.0f);
+        f48k = 2.0f * sinf(kPiFloat * 8000.0f / 48000.0f);
     }
-    if (sampleRateHz < 8000u) sampleRateHz = 22050u;
+    if (sampleRateHz < 8000u) sampleRateHz = 48000u;
     float fScaled = f48k * (48000.0f / static_cast<float>(sampleRateHz));
     if (fScaled < 0.004f) fScaled = 0.004f;
-    if (fScaled > 1.40f)  fScaled = 1.40f;
+    if (fScaled > 1.35f)  fScaled = 1.35f;
     return fScaled;
 }
 
-static float DecodeMcpxFilterQCoeff(uint16_t qHw) {
-    float dVal = (qHw == 0u) ? 1.0f : (static_cast<float>(qHw) / 32768.0f);
-    if (dVal < 0.075f) dVal = 0.075f;
-    if (dVal > 2.0f)   dVal = 2.0f;
-    return dVal;
+static float DecodeMcpxFilterQCoeff(uint16_t qHw, uint32_t dwQCoefficient) {
+    if (qHw != 0u && qHw != 0x8000u) {
+        float dVal = static_cast<float>(qHw) / 32768.0f;
+        if (dVal < 0.075f) dVal = 0.075f;
+        if (dVal > 2.0f)   dVal = 2.0f;
+        return dVal;
+    }
+    if (dwQCoefficient != 0u) {
+        if (dwQCoefficient <= 7u) {
+            // 3-bit hardware Q index (verified in CMcpxVoiceClient::SetFilter at 0x006E7069: and eax, 7,
+            // and XACT::CSoundCue::UpdateTrackFilter at 0x0070644F): ~3.21 dB resonance steps up to +22.5 dB.
+            float resDb = static_cast<float>(dwQCoefficient) * (22.5f / 7.0f);
+            float dVal  = powf(10.0f, -resDb / 20.0f);
+            if (dVal < 0.075f) dVal = 0.075f;
+            if (dVal > 2.0f)   dVal = 2.0f;
+            return dVal;
+        }
+        float dVal = static_cast<float>(dwQCoefficient & 0xFFFFu) / 32768.0f;
+        if (dVal < 0.075f) dVal = 0.075f;
+        if (dVal > 2.0f)   dVal = 2.0f;
+        return dVal;
+    }
+    return 1.0f;
 }
 
 bool ComputeDls2FilterCoeffs(
@@ -486,253 +607,578 @@ bool ComputeDls2FilterCoeffs(
     if (outMode) *outMode = 0u;
     if (outF2)   *outF2   = 1.0f;
     if (outD2)   *outD2   = 1.0f;
-    if (!pFilter || reinterpret_cast<uintptr_t>(pFilter) < 0x00010000u) return false;
+    if (!pFilter || reinterpret_cast<uintptr_t>(pFilter) < kMinValidHostAddress) return false;
 
-    // Verified against CMcpxVoiceClient::SetFilter (0x006E6FF1):
+    // Verified against CMcpxVoiceClient::SetFilter (0x006E6FF1) and XACT::CSoundCue::UpdateTrackFilter (0x007063E9):
     //   dwMode == 0: DSFILTERMODE_BYPASS
-    //   dwMode == 1: DSFILTERMODE_DLS2    (2-pole resonant low-pass + 2-pole parametric EQ)
-    //   dwMode == 2: DSFILTERMODE_PARAMEQ (two cascaded 2-pole parametric EQ stages)
+    //   dwMode == 1: DSFILTERMODE_DLS2    (2-pole resonant low-pass + optional 2-pole parametric EQ)
+    //   dwMode == 2: DSFILTERMODE_PARAMEQ (cascaded 2-pole parametric EQ)
     //   dwMode == 3: DSFILTERMODE_MULTI   (cascaded 2-pole state-variable stages)
     uint32_t mode = pFilter->dwMode & 3u;
     if (mode == 0u) return false;
 
+    uint32_t qOverride = pFilter->dwQCoefficient;
     int16_t  fc0 = static_cast<int16_t>(pFilter->adwCoefficients[0] & 0xFFFFu);
     uint16_t q0  = static_cast<uint16_t>(pFilter->adwCoefficients[1] & 0xFFFFu);
     int16_t  fc1 = static_cast<int16_t>(pFilter->adwCoefficients[2] & 0xFFFFu);
     uint16_t q1  = static_cast<uint16_t>(pFilter->adwCoefficients[3] & 0xFFFFu);
 
-    bool s0Active = !(fc0 == 0 && (q0 == 0u || q0 == 0x8000u));
-    bool s1Active = !(fc1 == 0 && (q1 == 0u || q1 == 0x8000u));
+    bool s0Active = !(fc0 == 0 && (q0 == 0u || q0 == 0x8000u) && qOverride == 0u);
+    bool s1Active = !(fc1 == 0 && (q1 == 0u || q1 == 0x8000u) && qOverride == 0u);
+    // In XACT::CSoundCue::UpdateTrackFilter (0x0070649E..0x007064CB), DLS2 mode (mode == 1)
+    // duplicates {fc0, q0} into adwCoefficients[2..3] for stereo voice pairs with dwQCoefficient == 0.
+    if ((mode == 1u || mode == 2u) && fc0 == fc1 && q0 == q1 && qOverride == 0u) {
+        s1Active = false;
+    }
     if (!s0Active && !s1Active) {
         return false;
     }
 
     if (outMode) *outMode = mode;
     if (s0Active) {
-        *outF = DecodeMcpxFilterFreqCoeff(fc0, sampleRateHz);
-        *outD = DecodeMcpxFilterQCoeff(q0);
+        float f0 = DecodeMcpxFilterFreqCoeff(fc0, sampleRateHz);
+        float d0 = DecodeMcpxFilterQCoeff(q0, qOverride);
+        ClampChamberlinSvfCoeffs(f0, d0);
+        *outF = f0;
+        *outD = d0;
     }
     if (s1Active && outF2 && outD2) {
-        *outF2 = DecodeMcpxFilterFreqCoeff(fc1, sampleRateHz);
-        *outD2 = DecodeMcpxFilterQCoeff(q1);
+        float f1 = DecodeMcpxFilterFreqCoeff(fc1, sampleRateHz);
+        float d1 = DecodeMcpxFilterQCoeff(q1, (mode == 2u) ? qOverride : 0u);
+        ClampChamberlinSvfCoeffs(f1, d1);
+        *outF2 = f1;
+        *outD2 = d1;
     }
     return true;
 }
 
-void ApplyDls2FilterToPcm16(
-    int16_t* pcm, size_t numFrames, uint32_t channels,
-    float fCoeff, float dCoeff, float ioLow[2], float ioBand[2],
-    uint32_t filterMode, float fCoeff2, float dCoeff2, XboxVoiceFilterState* ioState2)
+void ApplyVoiceSvfAndHrtfFloatStereo(
+    float* ioLeft, float* ioRight, uint32_t numFrames,
+    const XBOX_DSFILTERDESC* pFilter, bool hasActiveFilter, float lfoEgCutoffRatio,
+    bool active3D, float hrtfFilterCoeff, int32_t itdDelaySamples,
+    XboxVoiceFilterState* ioState)
 {
-    if (!pcm || numFrames == 0 || channels == 0 || channels > 2) return;
-    float low[2]  = { ioLow  ? ioLow[0]  : 0.0f, (ioLow  && channels > 1) ? ioLow[1]  : 0.0f };
-    float band[2] = { ioBand ? ioBand[0] : 0.0f, (ioBand && channels > 1) ? ioBand[1] : 0.0f };
-    float low2[2]  = { ioState2 ? ioState2->low2[0]  : 0.0f, (ioState2 && channels > 1) ? ioState2->low2[1]  : 0.0f };
-    float band2[2] = { ioState2 ? ioState2->band2[0] : 0.0f, (ioState2 && channels > 1) ? ioState2->band2[1] : 0.0f };
+    if (!ioLeft || !ioRight || numFrames == 0u || !ioState) return;
 
-    bool hasStage1 = !(fCoeff >= 0.999f && fabsf(dCoeff - 1.0f) < 0.001f);
-    bool hasStage2 = !(fCoeff2 >= 0.999f && fabsf(dCoeff2 - 1.0f) < 0.001f);
+    float fCoeff = 1.0f, dCoeff = 1.0f, fCoeff2 = 1.0f, dCoeff2 = 1.0f;
+    uint32_t filterMode = 0u;
+    bool runSvf = hasActiveFilter &&
+                  ComputeDls2FilterCoeffs(pFilter, kDefaultSampleRateHz, &fCoeff, &dCoeff, &filterMode, &fCoeff2, &dCoeff2);
+    if (runSvf && lfoEgCutoffRatio > 0.01f && fabsf(lfoEgCutoffRatio - 1.0f) > 0.005f) {
+        fCoeff *= lfoEgCutoffRatio;
+        ClampChamberlinSvfCoeffs(fCoeff, dCoeff);
+    }
 
-    for (size_t f = 0; f < numFrames; ++f) {
-        for (uint32_t ch = 0; ch < channels; ++ch) {
-            float x = static_cast<float>(pcm[f * channels + ch]);
-            float y = x;
+    bool hasStage1 = runSvf && !(fCoeff >= 0.999f && fabsf(dCoeff - 1.0f) < 0.001f);
+    bool hasStage2 = runSvf && !(fCoeff2 >= 0.999f && fabsf(dCoeff2 - 1.0f) < 0.001f);
+    if (hasStage1) ClampChamberlinSvfCoeffs(fCoeff, dCoeff);
+    if (hasStage2) ClampChamberlinSvfCoeffs(fCoeff2, dCoeff2);
 
-            if (hasStage1) {
-                low[ch]   += fCoeff * band[ch];
-                float high = y - low[ch] - dCoeff * band[ch];
-                band[ch]  += fCoeff * high;
-                if (filterMode == 2u) {
-                    // DSFILTERMODE_PARAMEQ: parametric peaking/notch response around center frequency
-                    float peakGain = (1.0f / dCoeff) - 1.0f;
-                    y = y + peakGain * dCoeff * band[ch];
-                } else {
-                    // DSFILTERMODE_DLS2 (1) / DSFILTERMODE_MULTI (3): 2-pole resonant low-pass
-                    y = low[ch];
-                }
-            }
+    bool runHrtfLp = active3D && (hrtfFilterCoeff > 0.0f && hrtfFilterCoeff < 0.94f);
+    float hrtfAlpha = hrtfFilterCoeff;
+    if (hrtfAlpha < 0.02f) hrtfAlpha = 0.02f;
+    if (hrtfAlpha > 0.94f) hrtfAlpha = 0.94f;
 
-            if (hasStage2) {
-                low2[ch]   += fCoeff2 * band2[ch];
-                float high2 = y - low2[ch] - dCoeff2 * band2[ch];
-                band2[ch]  += fCoeff2 * high2;
-                if (filterMode == 1u || filterMode == 2u) {
-                    // Stage 2 in DLS2 and PARAMEQ is a parametric EQ stage
-                    float peakGain2 = (1.0f / dCoeff2) - 1.0f;
-                    y = y + peakGain2 * dCoeff2 * band2[ch];
-                } else {
-                    // Stage 2 in DSFILTERMODE_MULTI is a cascaded 2-pole low-pass (4-pole total)
-                    y = low2[ch];
-                }
-            }
-
-            int32_t outSample = static_cast<int32_t>(y);
-            if (outSample >  32767) outSample =  32767;
-            if (outSample < -32768) outSample = -32768;
-            pcm[f * channels + ch] = static_cast<int16_t>(outSample);
+    uint32_t delayL = 0u;
+    uint32_t delayR = 0u;
+    if (active3D && itdDelaySamples != 0) {
+        if (itdDelaySamples > 0) {
+            delayL = (itdDelaySamples > 63) ? 63u : static_cast<uint32_t>(itdDelaySamples);
+        } else {
+            int32_t neg = -itdDelaySamples;
+            delayR = (neg > 63) ? 63u : static_cast<uint32_t>(neg);
         }
     }
 
-    if (ioLow) {
-        ioLow[0] = low[0];
-        if (channels > 1) ioLow[1] = low[1];
-    }
-    if (ioBand) {
-        ioBand[0] = band[0];
-        if (channels > 1) ioBand[1] = band[1];
-    }
-    if (ioState2) {
-        ioState2->low[0]   = low[0];
-        ioState2->band[0]  = band[0];
-        ioState2->low2[0]  = low2[0];
-        ioState2->band2[0] = band2[0];
-        if (channels > 1) {
-            ioState2->low[1]   = low[1];
-            ioState2->band[1]  = band[1];
-            ioState2->low2[1]  = low2[1];
-            ioState2->band2[1] = band2[1];
-        }
-    }
-}
-
-void ApplyStatefulI3DL2ReverbToPcm16(
-    XboxI3DL2ReverbState* state,
-    int16_t* pcm, size_t numFrames, uint32_t channels, uint32_t sampleRateHz,
-    int32_t roomMb, int32_t roomHfMb)
-{
-    if (!state || !pcm || numFrames == 0 || channels == 0 || channels > 2) return;
-    if (sampleRateHz < 8000u) sampleRateHz = 22050u;
-
-    const XBOX_DSI3DL2LISTENER& rev = GetXboxI3DL2ListenerState();
-    int32_t totalRoomMb = rev.lRoom + roomMb;
-    if (totalRoomMb <= -9000 || (rev.lReverb <= -9000 && rev.lReflections <= -9000)) {
+    if (!hasStage1 && !hasStage2 && !runHrtfLp && !active3D) {
         return;
     }
 
-    float roomLin = powf(10.0f, static_cast<float>(totalRoomMb) / 2000.0f);
-    float reflLin = roomLin * powf(10.0f, static_cast<float>(rev.lReflections) / 2000.0f);
-    float revLin  = roomLin * powf(10.0f, static_cast<float>(rev.lReverb) / 2000.0f);
-    if (reflLin > 0.55f) reflLin = 0.55f;
-    if (revLin  > 0.45f) revLin  = 0.45f;
-    if (reflLin < 0.002f && revLin < 0.002f) return;
+    float low[2]     = { ioState->low[0],     ioState->low[1] };
+    float band[2]    = { ioState->band[0],    ioState->band[1] };
+    float low2[2]    = { ioState->low2[0],    ioState->low2[1] };
+    float band2[2]   = { ioState->band2[0],   ioState->band2[1] };
+    float hrtfLow[2] = { ioState->hrtfLow[0], ioState->hrtfLow[1] };
+    uint8_t wrPos    = ioState->itdWritePos & 63u;
 
-    float decayTime = rev.flDecayTime;
-    if (decayTime < 0.1f)  decayTime = 0.1f;
-    if (decayTime > 10.0f) decayTime = 10.0f;
-
-    int32_t totalHfMb = rev.lRoomHF + roomHfMb;
-    float hfRatio = rev.flDecayHFRatio;
-    if (hfRatio < 0.1f) hfRatio = 0.1f;
-    if (hfRatio > 2.0f) hfRatio = 2.0f;
-    float damp = 0.25f + 0.45f * (1.0f - (hfRatio * 0.5f));
-    if (totalHfMb < -600) damp += 0.15f;
-    if (damp < 0.10f) damp = 0.10f;
-    if (damp > 0.80f) damp = 0.80f;
-
-    static const float kCombMs[4] = { 29.7f, 37.1f, 41.1f, 43.7f };
-    size_t combDelay[4];
-    float  combGain[4];
-    for (int c = 0; c < 4; ++c) {
-        size_t d = static_cast<size_t>((kCombMs[c] * 0.001f) * static_cast<float>(sampleRateHz));
-        if (d < 16u) d = 16u;
-        if (d >= XboxI3DL2ReverbState::kMaxCombSamples) d = XboxI3DL2ReverbState::kMaxCombSamples - 1u;
-        combDelay[c] = d;
-        float g = powf(10.0f, (-3.0f * (kCombMs[c] * 0.001f)) / decayTime);
-        if (g > 0.88f) g = 0.88f;
-        combGain[c] = g;
+    for (int ch = 0; ch < 2; ++ch) {
+        SanitizeFloatDspState(low[ch]);
+        SanitizeFloatDspState(band[ch]);
+        SanitizeFloatDspState(low2[ch]);
+        SanitizeFloatDspState(band2[ch]);
+        SanitizeFloatDspState(hrtfLow[ch]);
     }
 
-    float reflDelaySec = rev.flReflectionsDelay;
-    if (reflDelaySec < 0.002f) reflDelaySec = 0.007f;
-    if (reflDelaySec > 0.080f) reflDelaySec = 0.080f;
-    size_t earlyDelay = static_cast<size_t>(reflDelaySec * static_cast<float>(sampleRateHz));
-    if (earlyDelay < 8u) earlyDelay = 8u;
-    if (earlyDelay >= XboxI3DL2ReverbState::kMaxEarlySamples) earlyDelay = XboxI3DL2ReverbState::kMaxEarlySamples - 1u;
+    for (uint32_t f = 0u; f < numFrames; ++f) {
+        float chSample[2] = { ioLeft[f], ioRight[f] };
 
-    for (size_t f = 0; f < numFrames; ++f) {
-        float monoIn = 0.0f;
-        for (uint32_t ch = 0; ch < channels; ++ch) {
-            monoIn += static_cast<float>(pcm[f * channels + ch]);
+        if (hasStage1 || hasStage2) {
+            for (int ch = 0; ch < 2; ++ch) {
+                float y = chSample[ch];
+                if (hasStage1) {
+                    low[ch]   += fCoeff * band[ch];
+                    float high = y - low[ch] - dCoeff * band[ch];
+                    band[ch]  += fCoeff * high;
+                    SanitizeFloatDspState(low[ch]);
+                    SanitizeFloatDspState(band[ch]);
+                    if (filterMode == 2u) {
+                        float peakGain = (1.0f / dCoeff) - 1.0f;
+                        y = y + peakGain * dCoeff * band[ch];
+                    } else {
+                        y = low[ch];
+                    }
+                }
+                if (hasStage2) {
+                    low2[ch]   += fCoeff2 * band2[ch];
+                    float high2 = y - low2[ch] - dCoeff2 * band2[ch];
+                    band2[ch]  += fCoeff2 * high2;
+                    SanitizeFloatDspState(low2[ch]);
+                    SanitizeFloatDspState(band2[ch]);
+                    if (filterMode == 1u || filterMode == 2u) {
+                        float peakGain2 = (1.0f / dCoeff2) - 1.0f;
+                        y = y + peakGain2 * dCoeff2 * band2[ch];
+                    } else {
+                        y = low2[ch];
+                    }
+                }
+                if (!_finite(y)) y = 0.0f;
+                chSample[ch] = y;
+            }
         }
-        monoIn /= static_cast<float>(channels);
 
-        float earlyOut = state->earlyBuf[state->earlyIdx];
-        state->earlyBuf[state->earlyIdx] = monoIn;
-        if (++state->earlyIdx >= earlyDelay) state->earlyIdx = 0;
+        if (runHrtfLp) {
+            hrtfLow[0] += hrtfAlpha * (chSample[0] - hrtfLow[0]);
+            hrtfLow[1] += hrtfAlpha * (chSample[1] - hrtfLow[1]);
+            SanitizeFloatDspState(hrtfLow[0]);
+            SanitizeFloatDspState(hrtfLow[1]);
+            chSample[0] = hrtfLow[0];
+            chSample[1] = hrtfLow[1];
+        }
+
+        if (active3D) {
+            ioState->itdRingL[wrPos] = chSample[0];
+            ioState->itdRingR[wrPos] = chSample[1];
+            uint32_t rdL = (static_cast<uint32_t>(wrPos) + 64u - delayL) & 63u;
+            uint32_t rdR = (static_cast<uint32_t>(wrPos) + 64u - delayR) & 63u;
+            chSample[0] = ioState->itdRingL[rdL];
+            chSample[1] = ioState->itdRingR[rdR];
+            wrPos = static_cast<uint8_t>((wrPos + 1u) & 63u);
+        }
+
+        ioLeft[f]  = chSample[0];
+        ioRight[f] = chSample[1];
+    }
+
+    ioState->low[0]      = low[0];     ioState->low[1]      = low[1];
+    ioState->band[0]     = band[0];    ioState->band[1]     = band[1];
+    ioState->low2[0]     = low2[0];    ioState->low2[1]     = low2[1];
+    ioState->band2[0]    = band2[0];   ioState->band2[1]    = band2[1];
+    ioState->hrtfLow[0]  = hrtfLow[0]; ioState->hrtfLow[1]  = hrtfLow[1];
+    ioState->itdWritePos = wrPos;
+}
+
+// ============================================================================
+// Global Real-Time 48,000 Hz Stereo I3DL2 Environmental Reverb Bus
+// ============================================================================
+
+struct XboxGlobalI3DL2ReverbTank {
+    static constexpr size_t kPreDelayRingSize = 19200u; // 400 ms at 48,000 Hz (covers max 300ms ReflDelay + 100ms ReverbDelay)
+    static constexpr size_t kNumCombsPerCh    = 4u;
+    static constexpr size_t kMaxCombLen       = 2400u;  // 50 ms at 48,000 Hz
+    static constexpr size_t kNumAllpassPerCh  = 2u;
+    static constexpr size_t kMaxAllpassLen    = 768u;
+
+    float    preDelayL[kPreDelayRingSize];
+    float    preDelayR[kPreDelayRingSize];
+    uint32_t preDelayIdx;
+
+    float    inputHfStateL;
+    float    inputHfStateR;
+
+    float    combBufL[kNumCombsPerCh][kMaxCombLen];
+    float    combBufR[kNumCombsPerCh][kMaxCombLen];
+    uint32_t combIdxL[kNumCombsPerCh];
+    uint32_t combIdxR[kNumCombsPerCh];
+    float    combLpL[kNumCombsPerCh];
+    float    combLpR[kNumCombsPerCh];
+
+    float    allpassBufL[kNumAllpassPerCh][kMaxAllpassLen];
+    float    allpassBufR[kNumAllpassPerCh][kMaxAllpassLen];
+    uint32_t allpassIdxL[kNumAllpassPerCh];
+    uint32_t allpassIdxR[kNumAllpassPerCh];
+
+    float    smoothedEarlyGain;
+    float    smoothedLateGain;
+    uint32_t silentFramesCount;
+    uint32_t quietTankFramesCount;
+    bool     gainInitialized;
+};
+
+static XboxGlobalI3DL2ReverbTank g_globalReverbTank = {};
+static SRWLOCK                   g_reverbTankLock   = SRWLOCK_INIT;
+
+namespace {
+struct ReverbTankLockGuard {
+    SRWLOCK* lock;
+    explicit ReverbTankLockGuard(SRWLOCK* l) : lock(l) { AcquireSRWLockExclusive(lock); }
+    ~ReverbTankLockGuard() { ReleaseSRWLockExclusive(lock); }
+    ReverbTankLockGuard(const ReverbTankLockGuard&) = delete;
+    ReverbTankLockGuard& operator=(const ReverbTankLockGuard&) = delete;
+};
+}
+
+void ResetGlobalI3DL2Reverb48kLocked() {
+    ReverbTankLockGuard guard(&g_reverbTankLock);
+    memset(&g_globalReverbTank, 0, sizeof(g_globalReverbTank));
+}
+
+void ProcessGlobalI3DL2Reverb48k(
+    const float* wetSendL, const float* wetSendR,
+    float* ioMasterDryL, float* ioMasterDryR, uint32_t numFrames,
+    const XBOX_DSI3DL2LISTENER* listenerSnapshot)
+{
+    if (!wetSendL || !wetSendR || !ioMasterDryL || !ioMasterDryR || numFrames == 0u) return;
+
+    XBOX_DSI3DL2LISTENER fallbackListener;
+    if (!listenerSnapshot) {
+        fallbackListener = GetXboxI3DL2ListenerState();
+        listenerSnapshot = &fallbackListener;
+    }
+
+    ReverbTankLockGuard guard(&g_reverbTankLock);
+    XboxGlobalI3DL2ReverbTank& tank = g_globalReverbTank;
+    const XBOX_DSI3DL2LISTENER& rev = *listenerSnapshot;
+
+    // Compute target early-reflection and late-reverb linear gains from I3DL2 millibel parameters
+    float targetEarlyGain = 0.0f;
+    float targetLateGain  = 0.0f;
+    if (rev.lRoom > -9500) {
+        int32_t earlyMb = rev.lRoom + rev.lReflections;
+        int32_t lateMb  = rev.lRoom + rev.lReverb;
+        if (earlyMb > -9500) {
+            if (earlyMb > 600) earlyMb = 600;
+            targetEarlyGain = powf(10.0f, static_cast<float>(earlyMb) / 2000.0f);
+            if (targetEarlyGain > 0.70f) targetEarlyGain = 0.70f;
+        }
+        if (lateMb > -9500) {
+            if (lateMb > 600) lateMb = 600;
+            targetLateGain = powf(10.0f, static_cast<float>(lateMb) / 2000.0f);
+            if (targetLateGain > 0.65f) targetLateGain = 0.65f;
+        }
+    }
+
+    if (!tank.gainInitialized) {
+        tank.smoothedEarlyGain = targetEarlyGain;
+        tank.smoothedLateGain  = targetLateGain;
+        tank.gainInitialized   = true;
+    }
+
+    // Check if there is any wet send input energy in this quantum
+    float inputPeak = 0.0f;
+    for (uint32_t i = 0u; i < numFrames; ++i) {
+        float aL = fabsf(wetSendL[i]);
+        float aR = fabsf(wetSendR[i]);
+        if (aL > inputPeak) inputPeak = aL;
+        if (aR > inputPeak) inputPeak = aR;
+    }
+
+    float decaySec = rev.flDecayTime;
+    if (!_finite(decaySec) || decaySec < 0.10f) decaySec = 0.10f;
+    if (decaySec > 20.0f) decaySec = 20.0f;
+
+    // Pre-delay tap offsets at 48,000 Hz (computed prior to silent-bypass check so pre-delayed impulses are never cut off)
+    float reflDelaySec = rev.flReflectionsDelay;
+    if (!_finite(reflDelaySec) || reflDelaySec < 0.0f) reflDelaySec = 0.007f;
+    if (reflDelaySec > 0.300f) reflDelaySec = 0.300f;
+
+    float revDelaySec = rev.flReverbDelay;
+    if (!_finite(revDelaySec) || revDelaySec < 0.0f) revDelaySec = 0.011f;
+    if (revDelaySec > 0.100f) revDelaySec = 0.100f;
+
+    uint32_t reflDelaySamples = static_cast<uint32_t>(reflDelaySec * 48000.0f + 0.5f);
+    if (reflDelaySamples < 1u) reflDelaySamples = 1u;
+    if (reflDelaySamples >= XboxGlobalI3DL2ReverbTank::kPreDelayRingSize - 1600u) {
+        reflDelaySamples = static_cast<uint32_t>(XboxGlobalI3DL2ReverbTank::kPreDelayRingSize - 1600u);
+    }
+
+    uint32_t lateDelaySamples = reflDelaySamples + static_cast<uint32_t>(revDelaySec * 48000.0f + 0.5f);
+    if (lateDelaySamples < 1u) lateDelaySamples = 1u;
+    if (lateDelaySamples >= XboxGlobalI3DL2ReverbTank::kPreDelayRingSize - 1u) {
+        lateDelaySamples = static_cast<uint32_t>(XboxGlobalI3DL2ReverbTank::kPreDelayRingSize - 1u);
+    }
+
+    uint32_t maxTailFrames          = static_cast<uint32_t>((decaySec * 1.5f + 0.5f) * 48000.0f);
+    uint32_t minSilenceForPreDelay  = lateDelaySamples + 2500u;
+    if (inputPeak > 1e-6f) {
+        tank.silentFramesCount    = 0u;
+        tank.quietTankFramesCount = 0u;
+    } else {
+        if (tank.silentFramesCount > maxTailFrames) {
+            return;
+        }
+        if (tank.silentFramesCount > minSilenceForPreDelay && tank.quietTankFramesCount >= 2500u) {
+            return;
+        }
+        if (tank.silentFramesCount > minSilenceForPreDelay &&
+            targetEarlyGain < 1e-4f && targetLateGain < 1e-4f &&
+            tank.smoothedEarlyGain < 1e-4f && tank.smoothedLateGain < 1e-4f)
+        {
+            return;
+        }
+    }
+
+    // Input 1-pole HF attenuation shelf/LPF (lRoomHF at flHFReference)
+    float hfRefHz = rev.flHFReference;
+    if (!_finite(hfRefHz) || hfRefHz < 200.0f) hfRefHz = 5000.0f;
+    if (hfRefHz > 18000.0f) hfRefHz = 18000.0f;
+    float roomHfLin = (rev.lRoomHF <= -9500) ? 0.02f : powf(10.0f, static_cast<float>(rev.lRoomHF) / 2000.0f);
+    if (roomHfLin < 0.02f) roomHfLin = 0.02f;
+    if (roomHfLin > 1.00f) roomHfLin = 1.00f;
+    float baseOmega = 2.0f * kPiFloat * hfRefHz / 48000.0f;
+    if (baseOmega > 1.2f) baseOmega = 1.2f;
+    float inputLpAlpha = (roomHfLin >= 0.99f) ? 1.0f : (baseOmega * roomHfLin + 0.05f);
+    if (inputLpAlpha < 0.04f) inputLpAlpha = 0.04f;
+    if (inputLpAlpha > 1.00f) inputLpAlpha = 1.00f;
+
+    // Stereo decorrelated prime comb delays at 48,000 Hz scaled by flDensity [0..100%]
+    float density = rev.flDensity;
+    if (!_finite(density) || density < 0.0f) density = 100.0f;
+    if (density > 100.0f) density = 100.0f;
+    float densityScale = 0.65f + 0.35f * (density / 100.0f);
+
+    static const uint32_t kPrimeCombBaseL[4] = { 1489u, 1693u, 1901u, 2099u };
+    static const uint32_t kPrimeCombBaseR[4] = { 1513u, 1721u, 1931u, 2131u };
+
+    float hfRatio = rev.flDecayHFRatio;
+    if (!_finite(hfRatio) || hfRatio < 0.10f) hfRatio = 0.10f;
+    if (hfRatio > 2.00f) hfRatio = 2.00f;
+
+    uint32_t combLenL[4], combLenR[4];
+    float    combFbL[4],  combFbR[4];
+    float    combDamp[4];
+
+    for (uint32_t c = 0u; c < 4u; ++c) {
+        uint32_t dL = static_cast<uint32_t>(static_cast<float>(kPrimeCombBaseL[c]) * densityScale + 0.5f);
+        uint32_t dR = static_cast<uint32_t>(static_cast<float>(kPrimeCombBaseR[c]) * densityScale + 0.5f);
+        if (dL < 128u) dL = 128u;
+        if (dR < 128u) dR = 128u;
+        if (dL >= XboxGlobalI3DL2ReverbTank::kMaxCombLen) dL = static_cast<uint32_t>(XboxGlobalI3DL2ReverbTank::kMaxCombLen - 1u);
+        if (dR >= XboxGlobalI3DL2ReverbTank::kMaxCombLen) dR = static_cast<uint32_t>(XboxGlobalI3DL2ReverbTank::kMaxCombLen - 1u);
+        combLenL[c] = dL;
+        combLenR[c] = dR;
+
+        float fbL = powf(10.0f, (-3.0f * static_cast<float>(dL)) / (48000.0f * decaySec));
+        float fbR = powf(10.0f, (-3.0f * static_cast<float>(dR)) / (48000.0f * decaySec));
+        if (fbL > 0.965f) fbL = 0.965f;
+        if (fbR > 0.965f) fbR = 0.965f;
+        combFbL[c] = fbL;
+        combFbR[c] = fbR;
+
+        float hfDecaySec = decaySec * hfRatio;
+        if (hfDecaySec < 0.05f) hfDecaySec = 0.05f;
+        float fbHf = powf(10.0f, (-3.0f * static_cast<float>(dL)) / (48000.0f * hfDecaySec));
+        float ratio = (fbL > 0.001f) ? (fbHf / fbL) : 1.0f;
+        float damp  = (ratio < 1.0f) ? ((1.0f - ratio) * 3.2f) : 0.06f;
+        if (damp < 0.05f) damp = 0.05f;
+        if (damp > 0.82f) damp = 0.82f;
+        combDamp[c] = damp;
+    }
+
+    // Schroeder series all-pass diffusers scaled by flDiffusion [0..100%]
+    float diffusion = rev.flDiffusion;
+    if (!_finite(diffusion) || diffusion < 0.0f) diffusion = 100.0f;
+    if (diffusion > 100.0f) diffusion = 100.0f;
+    float apGain = 0.50f * (diffusion / 100.0f);
+
+    static const uint32_t kAllpassLenL[2] = { 269u, 593u };
+    static const uint32_t kAllpassLenR[2] = { 293u, 617u };
+    static const uint32_t kEarlyTapOffsets[6] = { 0u, 206u, 466u, 725u, 1051u, 1358u }; // 0..28.3 ms @ 48 kHz
+    static const float    kEarlyTapWeightsL[6] = { 0.42f, 0.28f, 0.22f, 0.16f, 0.12f, 0.09f };
+    static const float    kEarlyTapWeightsR[6] = { 0.40f, 0.30f, 0.20f, 0.18f, 0.11f, 0.10f };
+
+    constexpr uint32_t kRingSize   = static_cast<uint32_t>(XboxGlobalI3DL2ReverbTank::kPreDelayRingSize);
+    constexpr float    kGainSmooth = 0.006f; // ~3.5 ms time constant at 48 kHz
+    float wetOutPeak    = 0.0f;
+    float tankStatePeak = 0.0f;
+
+    for (uint32_t f = 0u; f < numFrames; ++f) {
+        tank.smoothedEarlyGain += kGainSmooth * (targetEarlyGain - tank.smoothedEarlyGain);
+        tank.smoothedLateGain  += kGainSmooth * (targetLateGain  - tank.smoothedLateGain);
+
+        // 1. Input HF attenuation filter into stereo pre-delay ring buffer
+        float inL = wetSendL[f];
+        float inR = wetSendR[f];
+        if (!_finite(inL)) inL = 0.0f;
+        if (!_finite(inR)) inR = 0.0f;
+
+        tank.inputHfStateL += inputLpAlpha * (inL - tank.inputHfStateL);
+        tank.inputHfStateR += inputLpAlpha * (inR - tank.inputHfStateR);
+        SanitizeFloatDspState(tank.inputHfStateL);
+        SanitizeFloatDspState(tank.inputHfStateR);
+
+        uint32_t wr = tank.preDelayIdx;
+        tank.preDelayL[wr] = tank.inputHfStateL;
+        tank.preDelayR[wr] = tank.inputHfStateR;
+
+        // 2. Multi-tap decorrelated stereo Early Reflections
+        float earlyL = 0.0f;
+        float earlyR = 0.0f;
+        for (uint32_t t = 0u; t < 6u; ++t) {
+            uint32_t tapDist = reflDelaySamples + kEarlyTapOffsets[t];
+            uint32_t rdIdx   = (wr + kRingSize - tapDist) % kRingSize;
+            float tapL = tank.preDelayL[rdIdx];
+            float tapR = tank.preDelayR[rdIdx];
+            if ((t & 1u) == 0u) {
+                earlyL += tapL * kEarlyTapWeightsL[t];
+                earlyR += tapR * kEarlyTapWeightsR[t];
+            } else {
+                // Cross-lateral wall bounce
+                earlyL += tapR * kEarlyTapWeightsL[t];
+                earlyR += tapL * kEarlyTapWeightsR[t];
+            }
+        }
+
+        // 3. Late Reverb FDN / Parallel Damped Comb Tank
+        uint32_t lateRd = (wr + kRingSize - lateDelaySamples) % kRingSize;
+        float lateInL   = (0.75f * tank.preDelayL[lateRd] + 0.25f * tank.preDelayR[lateRd]) * 0.25f;
+        float lateInR   = (0.75f * tank.preDelayR[lateRd] + 0.25f * tank.preDelayL[lateRd]) * 0.25f;
+
+        if (++wr >= kRingSize) wr = 0u;
+        tank.preDelayIdx = wr;
 
         float combSumL = 0.0f;
         float combSumR = 0.0f;
-        for (int c = 0; c < 4; ++c) {
-            size_t idx = state->combIdx[c];
-            float delayed = state->combBuf[c][idx];
-            state->combLp[c] = delayed * (1.0f - damp) + state->combLp[c] * damp;
-            state->combBuf[c][idx] = monoIn + state->combLp[c] * combGain[c];
-            if (++idx >= combDelay[c]) idx = 0;
-            state->combIdx[c] = idx;
-            if ((c & 1) == 0) combSumL += delayed;
-            else              combSumR += delayed;
-        }
-        float wetL = earlyOut * reflLin + (combSumL * 0.5f) * revLin;
-        float wetR = earlyOut * reflLin + (combSumR * 0.5f) * revLin;
+        for (uint32_t c = 0u; c < 4u; ++c) {
+            uint32_t idxL = tank.combIdxL[c];
+            if (idxL >= combLenL[c]) idxL = 0u;
+            float outL = tank.combBufL[c][idxL];
+            float lpL  = outL * (1.0f - combDamp[c]) + tank.combLpL[c] * combDamp[c];
+            SanitizeFloatDspState(lpL);
+            tank.combLpL[c] = lpL;
+            float nextL = lateInL + lpL * combFbL[c];
+            SanitizeFloatDspState(nextL);
+            tank.combBufL[c][idxL] = nextL;
+            if (++idxL >= combLenL[c]) idxL = 0u;
+            tank.combIdxL[c] = idxL;
+            combSumL += outL;
 
-        if (channels == 1u) {
-            int32_t y = static_cast<int32_t>(pcm[f] + (wetL + wetR) * 0.5f);
-            if (y >  32767) y =  32767;
-            if (y < -32768) y = -32768;
-            pcm[f] = static_cast<int16_t>(y);
+            uint32_t idxR = tank.combIdxR[c];
+            if (idxR >= combLenR[c]) idxR = 0u;
+            float outR = tank.combBufR[c][idxR];
+            float lpR  = outR * (1.0f - combDamp[c]) + tank.combLpR[c] * combDamp[c];
+            SanitizeFloatDspState(lpR);
+            tank.combLpR[c] = lpR;
+            float nextR = lateInR + lpR * combFbR[c];
+            SanitizeFloatDspState(nextR);
+            tank.combBufR[c][idxR] = nextR;
+            if (++idxR >= combLenR[c]) idxR = 0u;
+            tank.combIdxR[c] = idxR;
+            combSumR += outR;
+        }
+
+        // 4. Cascaded Schroeder All-Pass Diffusers
+        float diffL = combSumL;
+        float diffR = combSumR;
+        for (uint32_t a = 0u; a < 2u; ++a) {
+            uint32_t aIdxL = tank.allpassIdxL[a];
+            if (aIdxL >= kAllpassLenL[a]) aIdxL = 0u;
+            float bufOutL = tank.allpassBufL[a][aIdxL];
+            float newBufL = diffL + bufOutL * apGain;
+            SanitizeFloatDspState(newBufL);
+            tank.allpassBufL[a][aIdxL] = newBufL;
+            diffL = bufOutL - diffL * apGain;
+            if (++aIdxL >= kAllpassLenL[a]) aIdxL = 0u;
+            tank.allpassIdxL[a] = aIdxL;
+
+            uint32_t aIdxR = tank.allpassIdxR[a];
+            if (aIdxR >= kAllpassLenR[a]) aIdxR = 0u;
+            float bufOutR = tank.allpassBufR[a][aIdxR];
+            float newBufR = diffR + bufOutR * apGain;
+            SanitizeFloatDspState(newBufR);
+            tank.allpassBufR[a][aIdxR] = newBufR;
+            diffR = bufOutR - diffR * apGain;
+            if (++aIdxR >= kAllpassLenR[a]) aIdxR = 0u;
+            tank.allpassIdxR[a] = aIdxR;
+        }
+
+        float wetL = earlyL * tank.smoothedEarlyGain + diffL * tank.smoothedLateGain;
+        float wetR = earlyR * tank.smoothedEarlyGain + diffR * tank.smoothedLateGain;
+        ioMasterDryL[f] += wetL;
+        ioMasterDryR[f] += wetR;
+
+        float absWet = (fabsf(wetL) > fabsf(wetR)) ? fabsf(wetL) : fabsf(wetR);
+        if (absWet > wetOutPeak) wetOutPeak = absWet;
+
+        float absComb = (fabsf(combSumL) > fabsf(combSumR)) ? fabsf(combSumL) : fabsf(combSumR);
+        float absDiff = (fabsf(diffL)    > fabsf(diffR))    ? fabsf(diffL)    : fabsf(diffR);
+        float absInternal = (absComb > absDiff) ? absComb : absDiff;
+        if (absInternal > tankStatePeak) tankStatePeak = absInternal;
+    }
+
+    if (inputPeak <= 1e-6f) {
+        tank.silentFramesCount += numFrames;
+        if (wetOutPeak <= 1e-6f && tankStatePeak <= 1e-6f) {
+            tank.quietTankFramesCount += numFrames;
         } else {
-            int32_t yL = static_cast<int32_t>(pcm[f * 2u + 0u] + wetL);
-            int32_t yR = static_cast<int32_t>(pcm[f * 2u + 1u] + wetR);
-            if (yL >  32767) yL =  32767;
-            if (yL < -32768) yL = -32768;
-            if (yR >  32767) yR =  32767;
-            if (yR < -32768) yR = -32768;
-            pcm[f * 2u + 0u] = static_cast<int16_t>(yL);
-            pcm[f * 2u + 1u] = static_cast<int16_t>(yR);
+            tank.quietTankFramesCount = 0u;
         }
     }
 }
 
-void EvaluateXboxVoiceLfoAndEg(
+void ProcessGlobalI3DL2Reverb48kLocked(
+    const float* wetSendL, const float* wetSendR,
+    float* ioMasterDryL, float* ioMasterDryR, uint32_t numFrames)
+{
+    XBOX_DSI3DL2LISTENER snap = GetXboxI3DL2ListenerState();
+    ProcessGlobalI3DL2Reverb48k(wetSendL, wetSendR, ioMasterDryL, ioMasterDryR, numFrames, &snap);
+}
+
+// ============================================================================
+// Sample-Accurate MCPX LFO (1500 Hz) & Envelope Generator (93.75 Hz)
+// ============================================================================
+
+void EvaluateXboxVoiceLfoAndEgSamples(
     const XBOX_DSLFODESC lfo[2], const bool lfoActive[2],
     const XBOX_DSENVELOPEDESC eg[2], const bool egActive[2],
-    uint32_t elapsedMs, bool isReleasing, uint32_t releaseElapsedMs,
-    int32_t* outVolModMb, float* outPitchRatio, float* outFilterCutoffRatio)
+    uint64_t activeSamples48k, bool isReleasing, uint64_t releaseSamples48k,
+    int32_t* outVolModMb, float* outPitchRatio, float* outFilterCutoffRatio,
+    bool* outAmpReleaseDone)
 {
     if (outVolModMb)          *outVolModMb          = 0;
     if (outPitchRatio)        *outPitchRatio        = 1.0f;
     if (outFilterCutoffRatio) *outFilterCutoffRatio = 1.0f;
+    if (outAmpReleaseDone)    *outAmpReleaseDone    = false;
 
-    // Xbox MCPX APU hardware envelope/LFO step clock is 48000 Hz / 512 = 93.75 Hz (~10.667 ms per step).
-    // Verified against CMcpxVoiceClient::SetLFO (0x006E6BF0) and CMcpxVoiceClient::SetEG (0x006E6CA8).
-    float stepCount = static_cast<float>(elapsedMs) * (93.75f / 1000.0f);
-    float pitchOctaves = 0.0f;
-    float cutoffOctaves = 0.0f;
-    int32_t volModMb = 0;
+    // Xbox MCPX APU hardware clocks at 48,000 Hz output rate:
+    //   - LFO steps every 32 samples: 48000 Hz / 32 = 1500.0 Hz.
+    //   - EG steps every 512 samples: 48000 Hz / 512 = 93.75 Hz.
+    float   lfoFrameCount = static_cast<float>(static_cast<double>(activeSamples48k) / 32.0);
+    float   egStepCount   = static_cast<float>(static_cast<double>(activeSamples48k) / 512.0);
+    float   relStepCount  = static_cast<float>(static_cast<double>(releaseSamples48k) / 512.0);
+    float   pitchOctaves  = 0.0f;
+    float   cutoffOctaves = 0.0f;
+    int32_t volModMb      = 0;
 
     if (lfo && lfoActive) {
         for (int i = 0; i < 2; ++i) {
             if (!lfoActive[i]) continue;
             const XBOX_DSLFODESC& d = lfo[i];
-            float delaySteps = static_cast<float>(d.dwDelay);
-            if (stepCount < delaySteps) continue;
-            float activeSteps = stepCount - delaySteps;
-            // dwDelta is 24-bit phase increment per 93.75 Hz step (full cycle = 32768 units in hardware)
-            float phase = fmodf(activeSteps * (static_cast<float>(d.dwDelta) / 32768.0f), 1.0f);
-            // Triangle LFO in [-1.0, +1.0]
-            float tri = (phase < 0.5f) ? (phase * 4.0f - 1.0f) : (3.0f - phase * 4.0f);
+            float delayFrames = static_cast<float>(d.dwDelay & 0x7FFFu);
+            if (lfoFrameCount < delayFrames) continue;
+            float activeFrames = lfoFrameCount - delayFrames;
+            uint32_t delta = d.dwDelta & 0x3FFu;
+            if (delta == 0u) continue;
+            float phase = fmodf(activeFrames * (static_cast<float>(delta) / 65536.0f), 1.0f);
+            float tri   = (phase < 0.5f) ? (phase * 4.0f - 1.0f) : (3.0f - phase * 4.0f);
 
-            if (d.lAmplitudeModulation != 0) {
-                // lAmplitudeModulation in [-128..127] -> up to +/- 12 dB (1200 mB)
+            if (i == 0 && d.lAmplitudeModulation != 0) {
                 float ampNorm = static_cast<float>(d.lAmplitudeModulation) / 128.0f;
                 volModMb += static_cast<int32_t>((tri - 1.0f) * 0.5f * fabsf(ampNorm) * 1200.0f);
             }
             if (d.lPitchModulation != 0) {
-                // lPitchModulation in [-128..127] -> +/- 1 octave at +/- 128
                 pitchOctaves += tri * (static_cast<float>(d.lPitchModulation) / 128.0f);
             }
-            if (d.lFilterCutOffRange != 0) {
-                // lFilterCutOffRange in [-128..127] -> +/- 2 octaves at +/- 128
+            if (i == 0 && d.lFilterCutOffRange != 0) {
                 cutoffOctaves += tri * (static_cast<float>(d.lFilterCutOffRange) / 64.0f);
             }
         }
@@ -744,24 +1190,29 @@ void EvaluateXboxVoiceLfoAndEg(
             const XBOX_DSENVELOPEDESC& e = eg[i];
             if (e.dwMode == 0u) continue; // DSEGMODE_DISABLE
 
-            float envLevel = 1.0f;
+            float envLevel    = 1.0f;
             float sustainNorm = static_cast<float>(e.dwSustain > 255u ? 255u : e.dwSustain) / 255.0f;
+            uint32_t relStepsMax = e.dwRelease & 0xFFFu;
 
-            if (isReleasing && e.dwRelease > 0u) {
-                float relSteps = static_cast<float>(releaseElapsedMs) * (93.75f / 1000.0f);
-                float relFrac = 1.0f - (relSteps / static_cast<float>(e.dwRelease));
-                if (relFrac < 0.0f) relFrac = 0.0f;
+            if (isReleasing && relStepsMax > 0u) {
+                float relFrac = 1.0f - (relStepCount / static_cast<float>(relStepsMax));
+                if (relFrac <= 0.0f) {
+                    relFrac = 0.0f;
+                    if (i == 1 && outAmpReleaseDone) {
+                        *outAmpReleaseDone = true;
+                    }
+                }
                 envLevel = sustainNorm * relFrac;
             } else {
-                float delaySteps  = static_cast<float>(e.dwDelay);
-                float attackSteps = static_cast<float>(e.dwAttack);
-                float holdSteps   = static_cast<float>(e.dwHold);
-                float decaySteps  = static_cast<float>(e.dwDecay);
+                float delaySteps  = static_cast<float>(e.dwDelay & 0xFFFu);
+                float attackSteps = static_cast<float>(e.dwAttack & 0xFFFu);
+                float holdSteps   = static_cast<float>(e.dwHold & 0xFFFu);
+                float decaySteps  = static_cast<float>(e.dwDecay & 0xFFFu);
 
-                if (stepCount < delaySteps) {
+                if (egStepCount < delaySteps) {
                     envLevel = 0.0f;
                 } else {
-                    float t = stepCount - delaySteps;
+                    float t = egStepCount - delaySteps;
                     if (attackSteps > 0.0f && t < attackSteps) {
                         envLevel = t / attackSteps;
                     } else {
@@ -781,9 +1232,9 @@ void EvaluateXboxVoiceLfoAndEg(
                 }
             }
 
-            if (i == 0 || e.dwMode == 1u) {
-                // EG0 (Amplitude Envelope): modulates voice attenuation when dwMode != 0 and amplitude envelope is active
-                if (e.dwAttack > 0u || e.dwDecay > 0u || e.dwSustain < 255u || isReleasing) {
+            if (i == 1) {
+                // dwEG == 1 (DSEG_AMPLITUDE): modulates voice amplitude ONLY
+                if (e.dwDelay > 0u || e.dwAttack > 0u || e.dwDecay > 0u || e.dwSustain < 255u || isReleasing) {
                     if (envLevel <= 0.0001f) {
                         volModMb -= 10000;
                     } else {
@@ -791,12 +1242,14 @@ void EvaluateXboxVoiceLfoAndEg(
                         volModMb += envMb;
                     }
                 }
-            }
-            if (e.lPitchScale != 0) {
-                pitchOctaves += (envLevel - 1.0f) * (static_cast<float>(e.lPitchScale) / 128.0f);
-            }
-            if (e.lFilterCutOff != 0) {
-                cutoffOctaves += (envLevel - 1.0f) * (static_cast<float>(e.lFilterCutOff) / 64.0f);
+            } else {
+                // dwEG == 0 (DSEG_MULTI): modulates pitch & filter cutoff ONLY
+                if (e.lPitchScale != 0) {
+                    pitchOctaves += (envLevel - 1.0f) * (static_cast<float>(e.lPitchScale) / 128.0f);
+                }
+                if (e.lFilterCutOff != 0) {
+                    cutoffOctaves += (envLevel - 1.0f) * (static_cast<float>(e.lFilterCutOff) / 64.0f);
+                }
             }
         }
     }
@@ -818,36 +1271,22 @@ void EvaluateXboxVoiceLfoAndEg(
     }
 }
 
-void DecimatePcm16By2(
-    const int16_t* srcPcm, size_t srcFrames, uint32_t channels, std::vector<int16_t>& outPcm)
+void EvaluateXboxVoiceLfoAndEg(
+    const XBOX_DSLFODESC lfo[2], const bool lfoActive[2],
+    const XBOX_DSENVELOPEDESC eg[2], const bool egActive[2],
+    uint32_t elapsedMs, bool isReleasing, uint32_t releaseElapsedMs,
+    int32_t* outVolModMb, float* outPitchRatio, float* outFilterCutoffRatio)
 {
-    if (!srcPcm || srcFrames == 0 || channels == 0 || channels > 2) {
-        outPcm.clear();
-        return;
-    }
-    size_t dstFrames = (srcFrames >= 2u) ? (srcFrames / 2u) : 1u;
-    outPcm.resize(dstFrames * channels);
-    if (srcFrames < 2u) {
-        for (uint32_t ch = 0; ch < channels; ++ch) {
-            outPcm[ch] = srcPcm[ch];
-        }
-        return;
-    }
-    // 2-tap anti-aliased boxcar low-pass filter + 2:1 decimation:
-    // Halves the sample count so Windows DirectSound8 can play >100,000 Hz Xbox voices (up to 192,000 Hz)
-    // at (effectiveFreq + 1) / 2 <= 96,000 Hz with the exact target pitch and zero fallback.
-    for (size_t f = 0; f < dstFrames; ++f) {
-        size_t s0 = (f * 2u) * channels;
-        size_t s1 = (f * 2u + 1u) * channels;
-        for (uint32_t ch = 0; ch < channels; ++ch) {
-            int32_t avg = (static_cast<int32_t>(srcPcm[s0 + ch]) + static_cast<int32_t>(srcPcm[s1 + ch])) >> 1;
-            outPcm[f * channels + ch] = static_cast<int16_t>(avg);
-        }
-    }
+    uint64_t activeSamples48k  = static_cast<uint64_t>(elapsedMs) * 48ULL;
+    uint64_t releaseSamples48k = static_cast<uint64_t>(releaseElapsedMs) * 48ULL;
+    EvaluateXboxVoiceLfoAndEgSamples(
+        lfo, lfoActive, eg, egActive,
+        activeSamples48k, isReleasing, releaseSamples48k,
+        outVolModMb, outPitchRatio, outFilterCutoffRatio, nullptr);
 }
 
 // ============================================================================
-// Xbox IMA ADPCM Decoder (36 bytes/channel block -> 65 PCM16 samples)
+// Xbox IMA ADPCM & N-Channel PCM Stereo Folddown Decoders
 // ============================================================================
 
 static const int kImaIndexTable[16] = {
@@ -870,54 +1309,179 @@ static const int kImaStepTable[89] = {
 static inline int16_t DecodeImaNibble(uint8_t nibble, int& predictor, int& stepIndex) {
     int step = kImaStepTable[stepIndex];
     int diff = step >> 3;
-    if (nibble & 1) diff += step >> 2;
-    if (nibble & 2) diff += step >> 1;
-    if (nibble & 4) diff += step;
-    if (nibble & 8) predictor -= diff;
-    else            predictor += diff;
+    if (nibble & 1u) diff += step >> 2;
+    if (nibble & 2u) diff += step >> 1;
+    if (nibble & 4u) diff += step;
+    if (nibble & 8u) predictor -= diff;
+    else             predictor += diff;
     if (predictor > 32767)  predictor = 32767;
     if (predictor < -32768) predictor = -32768;
-    stepIndex += kImaIndexTable[nibble & 0x0F];
+    stepIndex += kImaIndexTable[nibble & 0x0Fu];
     if (stepIndex < 0)  stepIndex = 0;
     if (stepIndex > 88) stepIndex = 88;
-    return (int16_t)predictor;
+    return static_cast<int16_t>(predictor);
 }
 
-void DecodeXboxAdpcmToPcm16(
-    const uint8_t* src, uint32_t srcBytes, uint32_t channels, std::vector<int16_t>& outPcm)
+static inline void FoldMultichannelFloatToStereo(
+    const float* chSamples, uint32_t channels, float* outL, float* outR)
 {
-    if (channels == 0 || channels > 2) channels = 1;
-    uint32_t blockAlign = 36 * channels;
-    uint32_t numBlocks = srcBytes / blockAlign;
-    outPcm.resize(numBlocks * 65 * channels);
-    size_t outIdx = 0;
+    if (channels <= 1u) {
+        *outL = chSamples[0];
+        *outR = chSamples[0];
+    } else if (channels == 2u) {
+        *outL = chSamples[0];
+        *outR = chSamples[1];
+    } else if (channels == 3u) {
+        float c = chSamples[2] * 0.70710678f;
+        *outL = chSamples[0] + c;
+        *outR = chSamples[1] + c;
+    } else if (channels == 4u) {
+        *outL = chSamples[0] + chSamples[2] * 0.70710678f;
+        *outR = chSamples[1] + chSamples[3] * 0.70710678f;
+    } else if (channels == 5u) {
+        float c = chSamples[2] * 0.70710678f;
+        *outL = chSamples[0] + c + chSamples[3] * 0.70710678f;
+        *outR = chSamples[1] + c + chSamples[4] * 0.70710678f;
+    } else {
+        // 5.1 surround: FL, FR, FC, LFE, BL, BR
+        float c   = chSamples[2] * 0.70710678f;
+        float lfe = chSamples[3] * 0.50f;
+        *outL = chSamples[0] + c + lfe + chSamples[4] * 0.70710678f;
+        *outR = chSamples[1] + c + lfe + chSamples[5] * 0.70710678f;
+    }
+}
 
-    for (uint32_t b = 0; b < numBlocks; ++b) {
-        const uint8_t* block = src + b * blockAlign;
-        int pred[2] = { 0, 0 };
-        int stepIdx[2] = { 0, 0 };
-        for (uint32_t ch = 0; ch < channels; ++ch) {
-            pred[ch] = (int)*reinterpret_cast<const int16_t*>(block + ch * 4);
-            stepIdx[ch] = block[ch * 4 + 2];
-            if (stepIdx[ch] < 0)  stepIdx[ch] = 0;
-            if (stepIdx[ch] > 88) stepIdx[ch] = 88;
-            outPcm[outIdx + ch] = (int16_t)pred[ch];
-        }
-        outIdx += channels;
+void DecodeXboxAdpcmBlockToStereoFloat(
+    const uint8_t* blockPtr, uint32_t channels, float outLeft[64], float outRight[64])
+{
+    if (!blockPtr || !outLeft || !outRight) return;
+    if (channels == 0u) channels = 1u;
+    uint32_t decCh = (channels > 6u) ? 6u : channels;
 
-        const uint8_t* dataPtr = block + 4 * channels;
-        // 8 sub-blocks of 4 bytes per channel (8 samples per sub-block = 64 samples)
-        for (int sub = 0; sub < 8; ++sub) {
-            uint32_t words[2] = { 0, 0 };
-            for (uint32_t ch = 0; ch < channels; ++ch) {
-                words[ch] = *reinterpret_cast<const uint32_t*>(dataPtr + (sub * channels + ch) * 4);
+    int pred[6]    = {};
+    int stepIdx[6] = {};
+    float chNorm[6] = {};
+    constexpr float kInv32768 = 1.0f / 32768.0f;
+
+    for (uint32_t ch = 0u; ch < decCh; ++ch) {
+        pred[ch]    = static_cast<int>(*reinterpret_cast<const int16_t*>(blockPtr + ch * 4u));
+        stepIdx[ch] = static_cast<int>(blockPtr[ch * 4u + 2u]);
+        if (stepIdx[ch] < 0)  stepIdx[ch] = 0;
+        if (stepIdx[ch] > 88) stepIdx[ch] = 88;
+        chNorm[ch]  = static_cast<float>(pred[ch]) * kInv32768;
+    }
+    FoldMultichannelFloatToStereo(chNorm, decCh, &outLeft[0], &outRight[0]);
+
+    const uint8_t* dataPtr = blockPtr + 4u * channels;
+    uint32_t frameIdx = 1u;
+    for (uint32_t sub = 0u; sub < 8u; ++sub) {
+        uint32_t words[6] = {};
+        for (uint32_t ch = 0u; ch < decCh; ++ch) {
+            words[ch] = *reinterpret_cast<const uint32_t*>(dataPtr + (sub * channels + ch) * 4u);
+        }
+        uint32_t nibblesInSubBlock = (sub == 7u) ? 7u : 8u;
+        for (uint32_t s = 0u; s < nibblesInSubBlock; ++s) {
+            for (uint32_t ch = 0u; ch < decCh; ++ch) {
+                uint8_t nib = static_cast<uint8_t>((words[ch] >> (s * 4u)) & 0x0Fu);
+                int16_t smp = DecodeImaNibble(nib, pred[ch], stepIdx[ch]);
+                chNorm[ch]  = static_cast<float>(smp) * kInv32768;
             }
-            for (int s = 0; s < 8; ++s) {
-                for (uint32_t ch = 0; ch < channels; ++ch) {
-                    uint8_t nib = (uint8_t)((words[ch] >> (s * 4)) & 0x0F);
-                    outPcm[outIdx++] = DecodeImaNibble(nib, pred[ch], stepIdx[ch]);
-                }
+            FoldMultichannelFloatToStereo(chNorm, decCh, &outLeft[frameIdx], &outRight[frameIdx]);
+            ++frameIdx;
+        }
+    }
+}
+
+void SamplePcmFrameToStereoFloat(
+    const uint8_t* rawBase, uint32_t frameIdx, uint32_t channels, uint16_t bitsPerSample,
+    float* outLeft, float* outRight)
+{
+    if (!rawBase || !outLeft || !outRight || channels == 0u) {
+        if (outLeft)  *outLeft  = 0.0f;
+        if (outRight) *outRight = 0.0f;
+        return;
+    }
+    uint32_t decCh = (channels > 6u) ? 6u : channels;
+    float chNorm[6] = {};
+    constexpr float kInv32768 = 1.0f / 32768.0f;
+
+    if (bitsPerSample == 8u) {
+        const uint8_t* p = rawBase + static_cast<size_t>(frameIdx) * channels;
+        for (uint32_t ch = 0u; ch < decCh; ++ch) {
+            chNorm[ch] = (static_cast<float>(static_cast<int32_t>(p[ch]) - 128)) / 128.0f;
+        }
+    } else {
+        const int16_t* p = reinterpret_cast<const int16_t*>(rawBase) + static_cast<size_t>(frameIdx) * channels;
+        for (uint32_t ch = 0u; ch < decCh; ++ch) {
+            chNorm[ch] = static_cast<float>(p[ch]) * kInv32768;
+        }
+    }
+    FoldMultichannelFloatToStereo(chNorm, decCh, outLeft, outRight);
+}
+
+void UnpackXboxWaveToStereoPcm16(
+    const uint8_t* src, uint32_t srcBytes, uint32_t channels,
+    bool isAdpcm, uint16_t bitsPerSample, int16_t* dstStereo, uint32_t maxFrames, uint32_t* outFrames)
+{
+    if (outFrames) *outFrames = 0u;
+    if (!src || srcBytes == 0u || !dstStereo || maxFrames == 0u) return;
+    if (channels == 0u) channels = 1u;
+
+    if (isAdpcm) {
+        uint32_t blockAlign = 36u * channels;
+        uint32_t numBlocks  = srcBytes / blockAlign;
+        uint32_t totalFrames = numBlocks * 64u;
+        if (totalFrames > maxFrames) {
+            numBlocks   = maxFrames / 64u;
+            totalFrames = numBlocks * 64u;
+        }
+        float blockL[64];
+        float blockR[64];
+        for (uint32_t b = 0u; b < numBlocks; ++b) {
+            DecodeXboxAdpcmBlockToStereoFloat(src + b * blockAlign, channels, blockL, blockR);
+            int16_t* outPtr = dstStereo + static_cast<size_t>(b) * 128u;
+            for (uint32_t f = 0u; f < 64u; ++f) {
+                int32_t sL = static_cast<int32_t>(blockL[f] * 32768.0f);
+                int32_t sR = static_cast<int32_t>(blockR[f] * 32768.0f);
+                if (sL >  32767) sL =  32767;
+                if (sL < -32768) sL = -32768;
+                if (sR >  32767) sR =  32767;
+                if (sR < -32768) sR = -32768;
+                outPtr[f * 2u + 0u] = static_cast<int16_t>(sL);
+                outPtr[f * 2u + 1u] = static_cast<int16_t>(sR);
             }
         }
+        if (outFrames) *outFrames = totalFrames;
+    } else {
+        uint32_t bytesPerSample = (bitsPerSample == 8u) ? 1u : 2u;
+        uint32_t frameBytes     = channels * bytesPerSample;
+        if (frameBytes == 0u) return;
+        uint32_t totalFrames    = srcBytes / frameBytes;
+        if (totalFrames > maxFrames) totalFrames = maxFrames;
+
+        if (bitsPerSample == 16u && channels == 2u) {
+            memcpy(dstStereo, src, static_cast<size_t>(totalFrames) * 4u);
+        } else if (bitsPerSample == 16u && channels == 1u) {
+            const int16_t* in16 = reinterpret_cast<const int16_t*>(src);
+            for (uint32_t f = 0u; f < totalFrames; ++f) {
+                int16_t v = in16[f];
+                dstStereo[f * 2u + 0u] = v;
+                dstStereo[f * 2u + 1u] = v;
+            }
+        } else {
+            for (uint32_t f = 0u; f < totalFrames; ++f) {
+                float fL = 0.0f, fR = 0.0f;
+                SamplePcmFrameToStereoFloat(src, f, channels, bitsPerSample, &fL, &fR);
+                int32_t sL = static_cast<int32_t>(fL * 32768.0f);
+                int32_t sR = static_cast<int32_t>(fR * 32768.0f);
+                if (sL >  32767) sL =  32767;
+                if (sL < -32768) sL = -32768;
+                if (sR >  32767) sR =  32767;
+                if (sR < -32768) sR = -32768;
+                dstStereo[f * 2u + 0u] = static_cast<int16_t>(sL);
+                dstStereo[f * 2u + 1u] = static_cast<int16_t>(sR);
+            }
+        }
+        if (outFrames) *outFrames = totalFrames;
     }
 }

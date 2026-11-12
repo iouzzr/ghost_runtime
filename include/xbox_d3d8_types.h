@@ -406,15 +406,22 @@ struct XboxLight8 {
 };
 
 struct UnifiedVertex {
-    float x, y, z, w;
-    float nx, ny, nz;
-    float r, g, b, a;
-    float u0, v0;
-    float u1, v1;
-    float u2, v2;
-    float u3, v3;
-    float w0, w1, w2, w3; // 3rd texture coordinate (W / R) for 3D volume & cubemap textures
-    float sr, sg, sb, sa; // Specular color (oD1 / D3DFVF_SPECULAR / fixed-function specular)
+    float    x, y, z, w;
+    float    nx, ny, nz;
+    float    r, g, b, a;
+    float    u0, v0;
+    float    u1, v1;
+    float    u2, v2;
+    float    u3, v3;
+    float    w0, w1, w2, w3;   // 3rd texture coordinate (W / R) for 3D volume & cubemap textures
+    float    sr, sg, sb, sa;   // Specular color (oD1 / D3DFVF_SPECULAR / fixed-function specular)
+    float    bw0, bw1, bw2, bw3; // Bone blend weights (GPU hardware skinning)
+    uint32_t bi0, bi1, bi2, bi3; // Bone palette matrix indices (GPU hardware skinning)
+    float    q0, q1, q2, q3;   // 4th projective texture coordinate (Q) per stage
+};
+
+struct alignas(16) BonePaletteCBData {
+    float boneRows[256 * 3][4]; // Up to 256 3x4 transposed bone matrices (row0, row1, row2 per bone)
 };
 
 struct alignas(16) PerDrawCBData {
@@ -432,10 +439,11 @@ struct alignas(16) PerDrawCBData {
     uint32_t stage2Alpha[4];// alphaOp, alphaArg1, alphaArg2, alphaArg0
     uint32_t stage3Ops[4];  // colorOp, colorArg1, colorArg2, colorArg0
     uint32_t stage3Alpha[4];// alphaOp, alphaArg1, alphaArg2, alphaArg0
-    uint32_t flags[4];      // x=isRhw|(useGammaLut<<1)|(scissorExcl<<2)|(scissorCnt<<4), y=tex|cube|proj|vol|akill|resTemp, z=alphaTestEnable, w=psMode
+    uint32_t flags[4];      // x=isRhw|(useGammaLut<<1)|(scissorExcl<<2)|(spec<<3)|(scissorCnt<<4), y=tex|cube|proj|vol|akill|resTemp, z=alphaTestEnable, w=psMode
     float    alphaTest[4];  // x=alphaFunc (1..8), y=alphaRef (0..1), z=gamma, w=brightness
     float    uvScale01[4];  // x=uScale0, y=vScale0, z=uScale1, w=vScale1 (for linear textures)
     float    uvScale23[4];  // x=uScale2, y=vScale2, z=uScale3, w=vScale3 (for linear textures)
+    float    screenSpaceParams[4]; // x=screenSpaceOffsetX, y=screenSpaceOffsetY, z=zScale, w=0
     float    bumpParams[4]; // x=mat00, y=mat01, z=mat10, w=mat11
     float    fogParams[4];  // x=fogMode(0=off,1=exp,2=exp2,3=linear,4=vertexFog), y=fogStart, z=fogEnd, w=fogDensity
     float    fogColor[4];   // r, g, b, isAdditiveBlend
@@ -467,11 +475,23 @@ struct alignas(16) PerDrawCBData {
     uint32_t stageColorSign[4];     // Stage 0..3 D3DTSS_COLORSIGN bitmask (bit5=B, bit6=G, bit7=R, bit8=A)
     float    bumpLuminance[4];      // x=stage0 LScale, y=stage0 LOffset, z=stage1 LScale, w=stage1 LOffset
     float    scissorRects[8][4];    // Up to 8 scissor rects (left, top, right, bottom)
+    uint32_t skinParams[4];         // x=skinWeightCount (0=off, 1..4), y=indexedPalette (0=WORLD0..3, 1=BonePaletteCB), z=worldMatCount, w=0
+    float    psStageC0[8][4];       // NV2A Register Combiner stage 0..7 C0 constants (RGBA)
+    float    psStageC1[8][4];       // NV2A Register Combiner stage 0..7 C1 constants (RGBA)
+    float    psFcConst[2][4];       // NV2A Final Combiner C0, C1 constants (RGBA)
+    float    stageBumpMat[4][4];    // Stage 0..3 BumpEnvMat (x=m00, y=m01, z=m10, w=m11)
+    float    stageBumpLum[4][4];    // Stage 0..3 BumpEnvLum (x=LScale, y=LOffset, z=0, w=0)
+    float    psEyeDir[4];           // Raw unclamped c0.xyz (NV097_SET_EYE_DIRECTION) for DOT_RFLCT_SPEC_CONST
 };
 #pragma pack(pop)
 
 struct ID3D11VertexShader;
 struct ID3D11InputLayout;
+
+struct XboxDeclConstEntry {
+    uint8_t hwSlot;
+    float   val[4];
+};
 
 struct XboxShaderDeclInfo {
     bool                hasPos;
@@ -502,6 +522,44 @@ struct XboxShaderDeclInfo {
     ID3D11InputLayout*  gpuInputLayout;
     uint16_t            streamStrides[2];
     bool                usesStream[2];
+    uint8_t             numDeclConsts;
+    XboxDeclConstEntry  declConsts[32];
+    bool                hasBlendWeight;
+    uint8_t             numBlendWeights;
+    uint16_t            offBlendWeight;
+    bool                hasBlendIndices;
+    uint16_t            offBlendIndices;
+};
+
+// Matches Xbox D3D::VertexShader binary header (+0x00..+0x114) so unhooked Xbox D3D8
+// helpers (e.g. CommonSetViewport reading [CDevice+0x794]->Flags at +0x04) see valid fields.
+struct alignas(16) XboxVertexShaderObject {
+    uint32_t           RefCount;         // +0x00
+    uint32_t           Flags;            // +0x04 (0x01=program, 0x02=state, 0x10=passthrough, 0x20=writesOFog)
+    uint32_t           Dimensionality;   // +0x08
+    uint32_t           ProgramSize;      // +0x0C (number of 16-byte Cheops microcode slots)
+    uint32_t           DeclarationSize;  // +0x10
+    uint32_t           ConstantsCount;   // +0x14
+    uint32_t           StreamCount;      // +0x18
+    uint8_t            SlotData[0xF8];   // +0x1C..+0x113 (Xbox StreamInfo array)
+    uint32_t           ProgramAndConstants[136 * 4 + 64]; // +0x114
+    XboxShaderDeclInfo hostDecl;
+    uint64_t           programHash;
+};
+static_assert(offsetof(XboxVertexShaderObject, Flags) == 0x04, "XboxVertexShaderObject::Flags must be at +0x04");
+static_assert(offsetof(XboxVertexShaderObject, ProgramSize) == 0x0C, "XboxVertexShaderObject::ProgramSize must be at +0x0C");
+static_assert(offsetof(XboxVertexShaderObject, ProgramAndConstants) == 0x114, "XboxVertexShaderObject::ProgramAndConstants must be at +0x114");
+
+struct ActiveGpuSkinSetup {
+    bool           active;
+    uintptr_t      dynVbDataPtr;
+    uint32_t       boundStride;
+    uint32_t       outBaseVert;
+    uint32_t       numVerts;
+    const uint8_t* srcMeshVerts;
+    uint32_t       srcStride;
+    uint32_t       numBones;
+    float          boneRows[256 * 3][4];
 };
 
 // ============================================================================
@@ -525,20 +583,75 @@ struct ID3D11DepthStencilState;
 struct ID3D11RasterizerState;
 struct ID3D11SamplerState;
 
+struct XboxVideoOverlayState {
+    bool                      active;
+    RECT                      dstRect;
+    bool                      useColorKey;
+    uint32_t                  colorKey;
+    ID3D11ShaderResourceView* srv;
+};
+
+struct D3D11StateBackup {
+    ID3D11DeviceContext*      ctx;
+    ID3D11InputLayout*        inputLayout;
+    uint32_t                  topology;
+    ID3D11Buffer*             vb[2];
+    uint32_t                  vbStrides[2];
+    uint32_t                  vbOffsets[2];
+    ID3D11Buffer*             ib;
+    uint32_t                  ibFormat;
+    uint32_t                  ibOffset;
+    ID3D11VertexShader*       vs;
+    ID3D11Buffer*             vsCB[3];
+    ID3D11PixelShader*        ps;
+    ID3D11Buffer*             psCB[1];
+    ID3D11ShaderResourceView* psSRV[13];
+    ID3D11SamplerState*       psSmp[4];
+    ID3D11RasterizerState*    rs;
+    uint32_t                  numViewports;
+    float                     viewports[4][6];
+    uint32_t                  numScissors;
+    RECT                      scissors[4];
+    ID3D11BlendState*         bs;
+    float                     blendFactor[4];
+    uint32_t                  sampleMask;
+    ID3D11DepthStencilState*  ds;
+    uint32_t                  stencilRef;
+    ID3D11RenderTargetView*   rtv;
+    ID3D11DepthStencilView*   dsv;
+    bool                      captured;
+
+    D3D11StateBackup();
+    explicit D3D11StateBackup(ID3D11DeviceContext* deviceCtx);
+    ~D3D11StateBackup();
+    void Capture(ID3D11DeviceContext* deviceCtx);
+    void Restore();
+    void ReleaseRefs();
+
+    D3D11StateBackup(const D3D11StateBackup&) = delete;
+    D3D11StateBackup& operator=(const D3D11StateBackup&) = delete;
+};
+
 // d3d11_backend.cpp
 extern ID3D11Device*             g_d3dDevice;
 extern ID3D11DeviceContext*      g_d3dCtx;
 extern IDXGISwapChain*           g_swapChain;
+extern ID3D11Texture2D*          g_swapChainTex;
+extern ID3D11RenderTargetView*   g_swapChainRTV;
 extern ID3D11Texture2D*          g_backBufferTex;
+extern ID3D11ShaderResourceView* g_backBufferSRV;
 extern ID3D11Texture2D*          g_backBufferCopyTex;
 extern ID3D11ShaderResourceView* g_backBufferCopySRV;
 extern bool                      g_backBufferDirty;
+extern bool                      g_backBufferCpuDirty;
 extern ID3D11RenderTargetView*   g_rtv;
 extern ID3D11Texture2D*          g_depthTex;
 extern ID3D11DepthStencilView*   g_dsv;
+extern ID3D11ShaderResourceView* g_depthSRV;
 extern ID3D11RenderTargetView*   g_curActiveRTV;
 extern ID3D11DepthStencilView*   g_curActiveDSV;
 extern void*                     g_curOffscreenRT;
+extern void*                     g_curOffscreenZS;
 extern float                     g_gamma;
 extern float                     g_brightness;
 extern ID3D11ShaderResourceView* g_gammaLutSRV;
@@ -551,6 +664,7 @@ extern ID3D11VertexShader*       g_vs;
 extern ID3D11InputLayout*        g_inputLayout;
 extern ID3D11Buffer*             g_cbPerDraw;
 extern ID3D11Buffer*             g_cbVSConstants;
+extern ID3D11Buffer*             g_cbBonePalette;
 extern ID3D11Buffer*             g_dynVB;
 extern uint32_t                  g_dynVBCapacity;
 
@@ -568,7 +682,27 @@ ID3D11SamplerState* GetSamplerState(
     uint32_t mipmapLodBiasBits = 0u, uint32_t addrW = kXboxTexAddressWrap);
 ID3D11SamplerState* GetStageSamplerState(uint32_t stage);
 ID3D11PixelShader* GetPixelShaderPermutation(uint32_t psMode);
+extern bool g_swapChainFlipModel;
+extern bool g_swapChainAllowTearing;
+void InvalidateD3D11ShadowState();
+void ApplyShadowedD3D11RenderPipeline(
+    const void* pViewport11,
+    ID3D11BlendState* bs, const float blendFactor[4], uint32_t sampleMask,
+    ID3D11DepthStencilState* ds, uint32_t stencilRef,
+    ID3D11RasterizerState* rs,
+    ID3D11InputLayout* inputLayout, uint32_t primitiveTopology,
+    uint32_t numStreams, ID3D11Buffer* const* vbs, const uint32_t* vbStrides, const uint32_t* vbOffsets,
+    bool bindIndexBuffer, ID3D11Buffer* ib, uint32_t ibFormat, uint32_t ibOffset,
+    ID3D11VertexShader* vs, uint32_t numVsCbs, ID3D11Buffer* const* vsCbs,
+    ID3D11PixelShader* ps, ID3D11Buffer* psCb0,
+    ID3D11ShaderResourceView* const srvs[13],
+    ID3D11SamplerState* const smps[4]);
+uint32_t DecodeSimpleRenderStateIndex(uint32_t hwMethodOffset);
+bool IsSwapChainFlipModel();
+bool DoesSwapChainAllowTearing();
+void DrawOsdOverlayOnTarget(ID3D11RenderTargetView* targetRtv, float targetW, float targetH, bool backupState = true);
 void DrawOsdOverlayOnBackbuffer();
+bool GetActiveXboxVideoOverlay(XboxVideoOverlayState* outState);
 void FlushXboxOverlayToBackbuffer();
 
 // d3d8_texture.cpp
@@ -577,23 +711,46 @@ void DecodeXboxTextureFormat(
     const XboxPixelContainer* pTex,
     uint32_t* outWidth, uint32_t* outHeight, uint32_t* outLevels,
     uint32_t* outXboxFmt, bool* outSwizzled, uint32_t* outLinearPitch);
+uint32_t ComputeExactXboxTextureBytes(const XboxPixelContainer* pTex);
+bool IsXboxSignedBumpFormat(uint32_t xboxFmt);
 ID3D11ShaderResourceView* GetOrCreateD3D11SRV(
     XboxPixelContainer* pTex, float* outUScale = nullptr, float* outVScale = nullptr,
-    bool* outIsCube = nullptr, bool* outIsVolume = nullptr);
-void __cdecl Bridge_rlMain_SetRenderTarget(void* pTex, int bClear, int bFast);
+    bool* outIsCube = nullptr, bool* outIsVolume = nullptr, bool* outIsDepth = nullptr);
+void MarkActiveRenderTargetGpuDirty();
+void MarkActiveDepthStencilGpuDirty();
+void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level = 0u);
+void EvictTexturesByMemoryRange(uintptr_t addr, size_t byteLen);
+void DrainPendingTextureEvictions();
+uint32_t GetCachedTextureCount();
+uint64_t GetSurfaceGpuReadbackCount();
+void __stdcall Bridge_D3DDevice_SetRenderTarget(XboxPixelContainer* pRenderTarget, XboxPixelContainer* pZStencil);
+void __stdcall Bridge_D3DDevice_SetRenderTargetFast(XboxPixelContainer* pRenderTarget, XboxPixelContainer* pZStencil, uint32_t Flags);
 void InitXboxD3D8TextureBridges();
 
 // d3d8_shader.cpp
-extern uint32_t        g_currentVsHandle;
-extern uint32_t        g_currentPsHandle;
-extern int32_t         g_currentPsType;
-extern float           g_psConstants[8][4];
-extern const uint32_t* g_curPrelitColors;
-extern uint32_t        g_curPrelitBaseVertex;
-extern bool            g_curPrelitUseCustomBase;
+extern uint32_t           g_currentVsHandle;
+extern uint32_t           g_currentPsHandle;
+extern int32_t            g_currentPsType;
+extern float              g_psConstants[8][4];
+extern float              g_psStageC0[8][4];
+extern float              g_psStageC1[8][4];
+extern float              g_psFcConst[2][4];
+extern float              g_psEyeDir[4];
+extern const uint32_t*    g_curPrelitColors;
+extern uint32_t           g_curPrelitBaseVertex;
+extern bool               g_curPrelitUseCustomBase;
+extern ActiveGpuSkinSetup g_activeGpuSkin;
+extern uint64_t           g_vsConstantsDirtyGen;
+extern bool               g_boundPsCombinerDirty;
 
 bool GetXboxVertexShaderDecl(uint32_t handle, XboxShaderDeclInfo* outDecl);
 void __stdcall Bridge_D3DDevice_SetVertexShader(uint32_t Handle);
+void LoadCheopsProgramSlots(uint32_t startSlot, const uint32_t* dwords, uint32_t slotCount);
+void NotifyXboxPsRenderStateChanged(uint32_t rsIndex, uint32_t value);
+void NotifyXboxTextureFactorChanged(uint32_t tfactorArgb);
+ID3D11PixelShader* GetActiveProgramPixelShader(bool* outIsProgramPs);
+void EvictPixelShaderPointerByRange(uintptr_t addr, size_t byteLen);
+uint64_t GetPsPointerCacheHitCount();
 bool LoadShaderCsoFromDisk(const char* shaderBaseName, void** outData, size_t* outSize);
 void InitXboxD3D8ShaderBridges();
 
@@ -604,4 +761,18 @@ void __stdcall Bridge_D3DDevice_SetStreamSource(uint32_t StreamNumber, XboxVerte
 void __stdcall Bridge_D3DDevice_SetIndices(XboxVertexBuffer* pIndexData, uint32_t BaseVertexIndex);
 void __stdcall Bridge_D3DDevice_SetTransform(uint32_t State, const Mat44* pMatrix);
 void __stdcall Bridge_D3DDevice_SetViewport(const XboxViewport* pViewport);
+XboxVertexBuffer* __stdcall Bridge_D3DDevice_CreateVertexBuffer2(uint32_t Length);
+XboxVertexBuffer* __stdcall Bridge_D3DDevice_CreateIndexBuffer2(uint32_t Length);
+uint8_t* __stdcall Bridge_D3DVertexBuffer_Lock2(XboxVertexBuffer* pVB, uint32_t Flags);
+int32_t  __stdcall Bridge_D3DIndexBuffer_Lock(XboxVertexBuffer* pIB, uint32_t OffsetToLock, uint32_t SizeToLock, uint8_t** ppbData, uint32_t Flags);
+void     __stdcall Bridge_D3D_DestroyResource(XboxVertexBuffer* pRes);
+void     __cdecl   Bridge_directBuffer_FreePushBuffer(XboxPushBuffer* pPB);
+void EvictGpuBuffersByMemoryRange(uintptr_t addr, size_t byteLen);
+void DrainPendingGpuBufferEvictions();
+uint32_t GetCachedGpuBufferCount();
+uint64_t GetBackBufferCopyCount();
+uint64_t GetStaticVbCacheHitCount();
+uint64_t GetStaticIbCacheHitCount();
+uint64_t GetStaticPushBufferHitCount();
+void ResetPhase3DiagCounters();
 void InitXboxD3D8DrawBridges();

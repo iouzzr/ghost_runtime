@@ -18,6 +18,7 @@ enum : UINT_PTR {
 static ID3D11Texture2D*          g_osdTex           = nullptr;
 static ID3D11ShaderResourceView* g_osdSRV           = nullptr;
 static ID3D11Buffer*             g_osdVB            = nullptr;
+static ID3D11Buffer*             g_osdCB            = nullptr;
 static uint32_t                  g_osdTexW          = 0;
 static uint32_t                  g_osdTexH          = 0;
 static wchar_t                   g_lastOsdText[256] = { 0 };
@@ -208,16 +209,16 @@ static void UpdateOsdTexture(const wchar_t* text) {
     DeleteDC(hdc);
 }
 
-void DrawOsdOverlayOnBackbuffer() {
+void DrawOsdOverlayOnTarget(ID3D11RenderTargetView* targetRtv, float targetW, float targetH, bool backupState) {
+    if (!g_osdShowFps || !targetRtv || targetW <= 0.0f || targetH <= 0.0f) return;
     ID3D11PixelShader* osdPS = GetPixelShaderPermutation(0u);
-    if (!g_d3dDevice || !g_d3dCtx || !g_rtv || !g_vs || !osdPS || !g_cbPerDraw) return;
-    if (!g_osdShowFps) return;
+    if (!g_d3dDevice || !g_d3dCtx || !g_vs || !osdPS || !g_inputLayout) return;
 
     wchar_t curText[64];
     swprintf(curText, 64, L"%.1f FPS", g_osdCurrentFps);
 
     if (wcscmp(curText, g_lastOsdText) != 0 || !g_osdSRV) {
-        wcscpy(g_lastOsdText, curText);
+        wcscpy_s(g_lastOsdText, curText);
         UpdateOsdTexture(curText);
     }
     if (!g_osdSRV || g_osdTexW == 0 || g_osdTexH == 0) return;
@@ -231,7 +232,23 @@ void DrawOsdOverlayOnBackbuffer() {
         if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &g_osdVB))) return;
     }
 
-    float x0 = static_cast<float>(640 - static_cast<int>(g_osdTexW) - 8);
+    if (!g_osdCB) {
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth      = sizeof(PerDrawCBData);
+        cbd.Usage          = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_d3dDevice->CreateBuffer(&cbd, nullptr, &g_osdCB))) return;
+    }
+
+    D3D11StateBackup stateBackup;
+    if (backupState) {
+        stateBackup.Capture(g_d3dCtx);
+    } else {
+        InvalidateD3D11ShadowState();
+    }
+
+    float x0 = targetW - static_cast<float>(g_osdTexW) - 8.0f;
     float y0 = 8.0f;
     float x1 = x0 + static_cast<float>(g_osdTexW);
     float y1 = y0 + static_cast<float>(g_osdTexH);
@@ -249,29 +266,33 @@ void DrawOsdOverlayOnBackbuffer() {
     }
 
     PerDrawCBData cb = {};
-    cb.viewport[0]    = 0.0f;
-    cb.viewport[1]    = 0.0f;
-    cb.viewport[2]    = 640.0f;
-    cb.viewport[3]    = 480.0f;
-    cb.stage0Ops[0]   = 2u; // D3DTOP_SELECTARG1
-    cb.stage0Ops[1]   = 2u; // D3DTA_TEXTURE
-    cb.stage0Alpha[0] = 2u; // D3DTOP_SELECTARG1
-    cb.stage0Alpha[1] = 2u; // D3DTA_TEXTURE
-    cb.flags[0]       = 1u; // isRhw = 1
-    cb.flags[1]       = 1u; // texMask = Stage 0
-    cb.alphaTest[2]   = 1.0f; // gamma = 1.0
-    cb.alphaTest[3]   = 1.0f; // brightness = 1.0
-    cb.uvScale01[0]   = 1.0f;
-    cb.uvScale01[1]   = 1.0f;
+    cb.viewport[0]          = 0.0f;
+    cb.viewport[1]          = 0.0f;
+    cb.viewport[2]          = targetW;
+    cb.viewport[3]          = targetH;
+    cb.stage0Ops[0]         = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Ops[1]         = 2u; // D3DTA_TEXTURE
+    cb.stage0Alpha[0]       = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Alpha[1]       = 2u; // D3DTA_TEXTURE
+    cb.flags[0]             = 1u; // isRhw = 1
+    cb.flags[1]             = 1u; // texMask = Stage 0
+    cb.alphaTest[2]         = 1.0f; // gamma = 1.0
+    cb.alphaTest[3]         = 1.0f; // brightness = 1.0
+    cb.uvScale01[0]         = 1.0f;
+    cb.uvScale01[1]         = 1.0f;
+    cb.screenSpaceParams[2] = 16777215.0f;
 
     D3D11_MAPPED_SUBRESOURCE mappedCB = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
+    if (SUCCEEDED(g_d3dCtx->Map(g_osdCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
         memcpy(mappedCB.pData, &cb, sizeof(cb));
-        g_d3dCtx->Unmap(g_cbPerDraw, 0);
+        g_d3dCtx->Unmap(g_osdCB, 0);
     }
 
-    g_d3dCtx->OMSetRenderTargets(1, &g_rtv, nullptr);
-    D3D11_VIEWPORT vp11 = { 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f };
+    ID3D11ShaderResourceView* clearSrvs[13] = {};
+    g_d3dCtx->PSSetShaderResources(0, 13, clearSrvs);
+
+    g_d3dCtx->OMSetRenderTargets(1, &targetRtv, nullptr);
+    D3D11_VIEWPORT vp11 = { 0.0f, 0.0f, targetW, targetH, 0.0f, 1.0f };
     g_d3dCtx->RSSetViewports(1, &vp11);
 
     ID3D11BlendState*        bs  = GetBlendState(1u, 5u /* SRCALPHA */, 6u /* INVSRCALPHA */, 1u /* ADD */, 0x0Fu);
@@ -291,9 +312,9 @@ void DrawOsdOverlayOnBackbuffer() {
     g_d3dCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
     g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
-    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
+    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_osdCB);
     g_d3dCtx->PSSetShader(osdPS, nullptr, 0);
-    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
+    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_osdCB);
 
     ID3D11ShaderResourceView* srvs[4] = { g_osdSRV, nullptr, nullptr, nullptr };
     ID3D11SamplerState*       smps[4] = { smp, smp, smp, smp };
@@ -304,4 +325,8 @@ void DrawOsdOverlayOnBackbuffer() {
 
     ID3D11ShaderResourceView* nullSrv = nullptr;
     g_d3dCtx->PSSetShaderResources(0, 1, &nullSrv);
+}
+
+void DrawOsdOverlayOnBackbuffer() {
+    DrawOsdOverlayOnTarget(g_swapChainRTV ? g_swapChainRTV : g_rtv, 640.0f, 480.0f);
 }

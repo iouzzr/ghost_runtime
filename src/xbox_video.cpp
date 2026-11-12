@@ -14,31 +14,8 @@
 // return exact 733.333 MHz Xbox CPU cycles * 3 in edx:eax while letting Ghost.exe's
 // native cDivxVideo::FrameMove and cDivxVideo::Render execute unmodified.
 
-static LARGE_INTEGER g_qpcFreq  = {};
-static LARGE_INTEGER g_qpcStart = {};
-static bool          g_qpcInit  = false;
-
-static uint64_t QueryXbox733MHzCyclesTimes3() {
-    if (!g_qpcInit) {
-        QueryPerformanceFrequency(&g_qpcFreq);
-        QueryPerformanceCounter(&g_qpcStart);
-        g_qpcInit = true;
-    }
-    LARGE_INTEGER now = {};
-    QueryPerformanceCounter(&now);
-    uint64_t elapsedTicks = static_cast<uint64_t>(now.QuadPart - g_qpcStart.QuadPart);
-    uint64_t freq = static_cast<uint64_t>(g_qpcFreq.QuadPart);
-    if (freq == 0) {
-        return static_cast<uint64_t>(GetTickCount64()) * 0x2191C0ULL;
-    }
-    // 733,333,333.333 Hz * 3 = 2,200,000,000 Hz = 2,200,000 (0x2191C0) ticks per millisecond
-    uint64_t secPart = elapsedTicks / freq;
-    uint64_t remPart = elapsedTicks % freq;
-    return secPart * 2200000000ULL + (remPart * 2200000000ULL) / freq;
-}
-
 static uint64_t __cdecl Bridge_DivxRdtscTimes3_FrameMove() {
-    return QueryXbox733MHzCyclesTimes3();
+    return QueryXbox733MHzCyclesTimes3Shared();
 }
 
 static uint64_t __cdecl Bridge_DivxRdtscTimes3_Render() {
@@ -46,7 +23,7 @@ static uint64_t __cdecl Bridge_DivxRdtscTimes3_Render() {
     UpdateXboxInputTick();
     UpdateXboxAudioTick();
     SwitchToThread();
-    return QueryXbox733MHzCyclesTimes3();
+    return QueryXbox733MHzCyclesTimes3Shared();
 }
 
 static void PatchCallAndNops(uint32_t addr, const void* targetFn, size_t totalBytes) {
@@ -68,20 +45,38 @@ static void PatchCallAndNops(uint32_t addr, const void* targetFn, size_t totalBy
 // _D3DDevice_EnableOverlay@4 (0x006B3250), and _D3DDevice_GetOverlayUpdateStatus@0 (0x006B30B0).
 // ============================================================================
 
-static std::vector<uint32_t> g_overlayFrameBuf;
-static bool                  g_overlayEnabled     = false;
-static bool                  g_overlayHasData     = false;
-static RECT                  g_overlayDstRect     = { 0, 0, 640, 480 };
-static bool                  g_overlayUseColorKey = false;
-static uint32_t              g_overlayColorKey    = 0u;
+static ID3D11Texture2D*          g_videoOverlayTex    = nullptr;
+static ID3D11ShaderResourceView* g_videoOverlaySRV    = nullptr;
+static uint32_t                  g_videoOverlayTexW   = 0u;
+static uint32_t                  g_videoOverlayTexH   = 0u;
+static bool                      g_overlayEnabled     = false;
+static bool                      g_overlayHasData     = false;
+static RECT                      g_overlayDstRect     = { 0, 0, 640, 480 };
+static bool                      g_overlayUseColorKey = false;
+static uint32_t                  g_overlayColorKey    = 0u;
+
+static inline uint32_t YuvBt601StudioToBgra(int yVal, int uVal, int vVal) {
+    // NV_PVIDEO_FORMAT_MATRIX_ITURBT601 (0x00010000 at 0x006B31FD):
+    // Studio-range ITU-R BT.601 Y in [16..235], U/V in [16..240]
+    int c = yVal - 16;
+    int d = uVal - 128;
+    int e = vVal - 128;
+    int r = (298 * c + 409 * e + 128) >> 8;
+    int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+    int b = (298 * c + 516 * d + 128) >> 8;
+    r = r < 0 ? 0 : (r > 255 ? 255 : r);
+    g = g < 0 ? 0 : (g > 255 ? 255 : g);
+    b = b < 0 ? 0 : (b > 255 ? 255 : b);
+    return 0xFF000000u | (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+}
 
 static void __stdcall Bridge_D3DDevice_EnableOverlay(BOOL bEnable) {
-    // In Ghost.exe (0x006B3250), EnableOverlay stops active NV_PVIDEO_BUFFER ([esi+8704h] = 1)
-    // and resets the NV_PVIDEO overlay registers; the overlay only scans out after UpdateOverlay
-    // sets NV_PVIDEO_BUFFER = 1 ([esi+8700h] = 1) while enabled.
+    // In Ghost.exe (0x006B3250), EnableOverlay stops any active NV_PVIDEO_BUFFER ([eax+8704h] = 1)
+    // and resets the NV_PVIDEO overlay registers; the overlay scans out persistently once UpdateOverlay
+    // sets NV_PVIDEO_BUFFER = 1 ([esi+8700h] = 1) until EnableOverlay stops it again.
     g_overlayEnabled = (bEnable != FALSE);
+    g_overlayHasData = false;
     if (!g_overlayEnabled) {
-        g_overlayHasData = false;
         *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1C1C) = 0u;
     }
 }
@@ -99,63 +94,41 @@ static BOOL __stdcall Bridge_D3DDevice_GetOverlayUpdateStatus() {
     return (*pOverlaySwap != *pSwapCount) ? TRUE : FALSE;
 }
 
-void FlushXboxOverlayToBackbuffer() {
-    if (!g_overlayEnabled || !g_overlayHasData) return;
-    if (g_d3dDevice && g_d3dCtx && g_backBufferTex && g_overlayFrameBuf.size() == 640u * 480u) {
-        int32_t l = g_overlayDstRect.left   < 0   ? 0   : (g_overlayDstRect.left   > 640 ? 640 : g_overlayDstRect.left);
-        int32_t t = g_overlayDstRect.top    < 0   ? 0   : (g_overlayDstRect.top    > 480 ? 480 : g_overlayDstRect.top);
-        int32_t r = g_overlayDstRect.right  < 0   ? 0   : (g_overlayDstRect.right  > 640 ? 640 : g_overlayDstRect.right);
-        int32_t b = g_overlayDstRect.bottom < 0   ? 0   : (g_overlayDstRect.bottom > 480 ? 480 : g_overlayDstRect.bottom);
-        if (r > l && b > t) {
-            D3D11_BOX dstBox = {
-                static_cast<UINT>(l), static_cast<UINT>(t), 0u,
-                static_cast<UINT>(r), static_cast<UINT>(b), 1u
-            };
-            if (g_overlayUseColorKey) {
-                static ID3D11Texture2D* s_overlayStagingTex = nullptr;
-                if (!s_overlayStagingTex) {
-                    D3D11_TEXTURE2D_DESC td = {};
-                    td.Width            = 640u;
-                    td.Height           = 480u;
-                    td.MipLevels        = 1u;
-                    td.ArraySize        = 1u;
-                    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-                    td.SampleDesc.Count = 1u;
-                    td.Usage            = D3D11_USAGE_STAGING;
-                    td.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
-                    g_d3dDevice->CreateTexture2D(&td, nullptr, &s_overlayStagingTex);
-                }
-                if (s_overlayStagingTex) {
-                    g_d3dCtx->CopySubresourceRegion(s_overlayStagingTex, 0, static_cast<UINT>(l), static_cast<UINT>(t), 0, g_backBufferTex, 0, &dstBox);
-                    D3D11_MAPPED_SUBRESOURCE mapped = {};
-                    if (SUCCEEDED(g_d3dCtx->Map(s_overlayStagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
-                        uint32_t keyRgb = g_overlayColorKey & 0x00FFFFFFu;
-                        for (int32_t y = t; y < b; ++y) {
-                            const uint32_t* bbRow = reinterpret_cast<const uint32_t*>(
-                                static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch);
-                            uint32_t* ovRow = &g_overlayFrameBuf[static_cast<size_t>(y) * 640u];
-                            for (int32_t x = l; x < r; ++x) {
-                                if ((bbRow[x] & 0x00FFFFFFu) != keyRgb) {
-                                    ovRow[x] = bbRow[x];
-                                }
-                            }
-                        }
-                        g_d3dCtx->Unmap(s_overlayStagingTex, 0);
-                    }
-                }
-            }
-            const uint32_t* srcPtr = &g_overlayFrameBuf[static_cast<size_t>(t) * 640u + static_cast<size_t>(l)];
-            g_d3dCtx->UpdateSubresource(g_backBufferTex, 0, &dstBox, srcPtr, 640u * 4u, 0);
-        }
+bool GetActiveXboxVideoOverlay(XboxVideoOverlayState* outState) {
+    if (!outState) return false;
+    outState->active      = false;
+    outState->dstRect     = { 0, 0, 0, 0 };
+    outState->useColorKey = false;
+    outState->colorKey    = 0u;
+    outState->srv         = nullptr;
+
+    if (!g_overlayEnabled || !g_overlayHasData || !g_videoOverlaySRV) {
+        return false;
     }
-    g_overlayHasData = false;
+    if (g_overlayDstRect.right <= g_overlayDstRect.left ||
+        g_overlayDstRect.bottom <= g_overlayDstRect.top)
+    {
+        return false;
+    }
+
+    outState->active      = true;
+    outState->dstRect     = g_overlayDstRect;
+    outState->useColorKey = g_overlayUseColorKey;
+    outState->colorKey    = g_overlayColorKey;
+    outState->srv         = g_videoOverlaySRV;
+    return true;
+}
+
+void FlushXboxOverlayToBackbuffer() {
+    // NV_PVIDEO hardware overlay is now composited non-destructively onto g_swapChainRTV
+    // during Bridge_D3DDevice_Swap without mutating g_backBufferTex or clearing g_overlayHasData.
 }
 
 static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     XboxPixelContainer* pSurface, const RECT* pSrcRect, const RECT* pDstRect,
     BOOL bColorKey, DWORD ColorKey)
 {
-    if (!pSurface || !pSurface->Data) return;
+    if (!pSurface || !pSurface->Data || static_cast<uintptr_t>(pSurface->Data) < kMinValidHostAddress) return;
 
     // 1. Update D3DDevice overlay tracking fields (0x006B30D3..0x006B30E9)
     uint32_t swapCount = *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1DE8);
@@ -166,13 +139,18 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     bool isSwizzled = false;
     DecodeXboxTextureFormat(pSurface, &surfW, &surfH, &levels, &xboxFmt, &isSwizzled, &pitch);
     if (surfW == 0 || surfH == 0 || surfW > 2048 || surfH > 2048) return;
-    if (pitch == 0) pitch = surfW * 2;
+
+    bool is32Bit = (xboxFmt == 0x06u || xboxFmt == 0x07u || xboxFmt == 0x12u || xboxFmt == 0x1Eu ||
+                    xboxFmt == 0x3Au || xboxFmt == 0x3Bu || xboxFmt == 0x3Cu ||
+                    xboxFmt == 0x3Fu || xboxFmt == 0x40u || xboxFmt == 0x41u);
+    uint32_t bpp = is32Bit ? 4u : 2u;
+    if (pitch == 0) pitch = surfW * bpp;
 
     // 2. Extract pSrcRect & pDstRect (0x006B30F8..0x006B3165)
     int32_t srcLeft = pSrcRect ? (pSrcRect->left & ~1) : 0;
     int32_t srcTop  = pSrcRect ? (pSrcRect->top  & ~1) : 0;
-    int32_t srcW    = (pSrcRect && pSrcRect->right  > pSrcRect->left) ? (pSrcRect->right  - pSrcRect->left) : (int32_t)surfW;
-    int32_t srcH    = (pSrcRect && pSrcRect->bottom > pSrcRect->top)  ? (pSrcRect->bottom - pSrcRect->top)  : (int32_t)surfH;
+    int32_t srcW    = (pSrcRect && pSrcRect->right  > pSrcRect->left) ? (pSrcRect->right  - pSrcRect->left) : static_cast<int32_t>(surfW);
+    int32_t srcH    = (pSrcRect && pSrcRect->bottom > pSrcRect->top)  ? (pSrcRect->bottom - pSrcRect->top)  : static_cast<int32_t>(surfH);
 
     int32_t dstLeft = pDstRect ? pDstRect->left : 0;
     int32_t dstTop  = pDstRect ? pDstRect->top  : 0;
@@ -182,8 +160,8 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
     if (srcLeft < 0) srcLeft = 0;
     if (srcTop  < 0) srcTop  = 0;
-    if (srcLeft + srcW > (int32_t)surfW) srcW = (int32_t)surfW - srcLeft;
-    if (srcTop  + srcH > (int32_t)surfH) srcH = (int32_t)surfH - srcTop;
+    if (srcLeft + srcW > static_cast<int32_t>(surfW)) srcW = static_cast<int32_t>(surfW) - srcLeft;
+    if (srcTop  + srcH > static_cast<int32_t>(surfH)) srcH = static_cast<int32_t>(surfH) - srcTop;
     if (srcW <= 0 || srcH <= 0) return;
 
     g_overlayDstRect.left   = dstLeft;
@@ -193,77 +171,125 @@ static void __stdcall Bridge_D3DDevice_UpdateOverlay(
     g_overlayUseColorKey    = (bColorKey != FALSE);
     g_overlayColorKey       = ColorKey;
 
-    // 3. Decode source YUY2 (0x24) / UYVY (0x25) region to BGRA8
-    std::vector<uint32_t> decodedSrc((size_t)srcW * (size_t)srcH);
-    const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(pSurface->Data)
-                           + (size_t)srcTop * pitch + (size_t)srcLeft * 2u;
+    // 3. Unswizzle if swizzled RGB, then decode source YUY2 (0x24) / UYVY (0x25) / RGB region to BGRA8
+    std::vector<uint8_t> unswizzled;
+    const uint8_t* linearSurf = reinterpret_cast<const uint8_t*>(pSurface->Data);
+    if (isSwizzled && xboxFmt != 0x24u && xboxFmt != 0x25u) {
+        typedef void (__stdcall *PFN_XGUnswizzleRect)(
+            const void*, uint32_t, uint32_t, const RECT*, void*, uint32_t, const POINT*, uint32_t);
+        PFN_XGUnswizzleRect pfnUnswizzle = reinterpret_cast<PFN_XGUnswizzleRect>(ADDR_XG_UNSWIZZLE_RECT);
+        unswizzled.resize(static_cast<size_t>(surfW) * static_cast<size_t>(surfH) * bpp);
+        pfnUnswizzle(linearSurf, surfW, surfH, nullptr, unswizzled.data(), surfW * bpp, nullptr, bpp);
+        linearSurf = unswizzled.data();
+        pitch      = surfW * bpp;
+    }
+
+    std::vector<uint32_t> decodedSrc(static_cast<size_t>(srcW) * static_cast<size_t>(srcH));
+    const uint8_t* srcBase = linearSurf + static_cast<size_t>(srcTop) * pitch + static_cast<size_t>(srcLeft) * bpp;
 
     for (int32_t y = 0; y < srcH; ++y) {
-        const uint8_t* sRow = srcBase + (size_t)y * pitch;
-        uint32_t* dRow = &decodedSrc[(size_t)y * (size_t)srcW];
-        for (int32_t x = 0; x < srcW; x += 2) {
-            int y0, u, y1, v;
-            if (xboxFmt == 0x25) { // D3DFMT_UYVY
-                u  = (int)sRow[x * 2 + 0] - 128;
-                y0 = (int)sRow[x * 2 + 1];
-                v  = (int)sRow[x * 2 + 2] - 128;
-                y1 = (int)sRow[x * 2 + 3];
-            } else {               // D3DFMT_YUY2 (0x24)
-                y0 = (int)sRow[x * 2 + 0];
-                u  = (int)sRow[x * 2 + 1] - 128;
-                y1 = (int)sRow[x * 2 + 2];
-                v  = (int)sRow[x * 2 + 3] - 128;
+        const uint8_t* sRow = srcBase + static_cast<size_t>(y) * pitch;
+        uint32_t* dRow = &decodedSrc[static_cast<size_t>(y) * static_cast<size_t>(srcW)];
+        if (bpp == 4u) {
+            const uint32_t* s32 = reinterpret_cast<const uint32_t*>(sRow);
+            for (int32_t x = 0; x < srcW; ++x) {
+                uint32_t v = s32[x];
+                if (xboxFmt == 0x3Au || xboxFmt == 0x3Fu) { // A8B8G8R8
+                    v = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
+                } else if (xboxFmt == 0x3Bu || xboxFmt == 0x40u) { // B8G8R8A8
+                    v = ((v & 0xFFu) << 24) | (((v >> 8) & 0xFFu) << 16) | (((v >> 16) & 0xFFu) << 8) | ((v >> 24) & 0xFFu);
+                } else if (xboxFmt == 0x3Cu || xboxFmt == 0x41u) { // R8G8B8A8
+                    v = ((v & 0xFFu) << 24) | ((v >> 8) & 0xFFFFFFu);
+                }
+                dRow[x] = v | 0xFF000000u;
             }
-
-            int r0 = y0 + ((359 * v) >> 8);
-            int g0 = y0 - ((88 * u + 183 * v) >> 8);
-            int b0 = y0 + ((454 * u) >> 8);
-            r0 = r0 < 0 ? 0 : (r0 > 255 ? 255 : r0);
-            g0 = g0 < 0 ? 0 : (g0 > 255 ? 255 : g0);
-            b0 = b0 < 0 ? 0 : (b0 > 255 ? 255 : b0);
-            dRow[x] = 0xFF000000u | ((uint32_t)r0 << 16) | ((uint32_t)g0 << 8) | (uint32_t)b0;
-
-            if (x + 1 < srcW) {
-                int r1 = y1 + ((359 * v) >> 8);
-                int g1 = y1 - ((88 * u + 183 * v) >> 8);
-                int b1 = y1 + ((454 * u) >> 8);
-                r1 = r1 < 0 ? 0 : (r1 > 255 ? 255 : r1);
-                g1 = g1 < 0 ? 0 : (g1 > 255 ? 255 : g1);
-                b1 = b1 < 0 ? 0 : (b1 > 255 ? 255 : b1);
-                dRow[x + 1] = 0xFF000000u | ((uint32_t)r1 << 16) | ((uint32_t)g1 << 8) | (uint32_t)b1;
+        } else if (xboxFmt == 0x05u || xboxFmt == 0x11u) { // R5G6B5 / LIN_R5G6B5
+            const uint16_t* s16 = reinterpret_cast<const uint16_t*>(sRow);
+            for (int32_t x = 0; x < srcW; ++x) {
+                uint16_t p = s16[x];
+                uint32_t r = ((p >> 11) & 0x1Fu); r = (r << 3) | (r >> 2);
+                uint32_t g = ((p >> 5)  & 0x3Fu); g = (g << 2) | (g >> 4);
+                uint32_t b = ( p        & 0x1Fu); b = (b << 3) | (b >> 2);
+                dRow[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        } else if (xboxFmt == 0x02u || xboxFmt == 0x03u || xboxFmt == 0x10u || xboxFmt == 0x1Cu) { // A1R5G5B5 / X1R5G5B5 / LIN_A1R5G5B5 / LIN_X1R5G5B5
+            const uint16_t* s16 = reinterpret_cast<const uint16_t*>(sRow);
+            for (int32_t x = 0; x < srcW; ++x) {
+                uint16_t p = s16[x];
+                uint32_t r = ((p >> 10) & 0x1Fu); r = (r << 3) | (r >> 2);
+                uint32_t g = ((p >> 5)  & 0x1Fu); g = (g << 3) | (g >> 2);
+                uint32_t b = ( p        & 0x1Fu); b = (b << 3) | (b >> 2);
+                dRow[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        } else if (xboxFmt == 0x04u || xboxFmt == 0x1Du) { // A4R4G4B4 / LIN_A4R4G4B4
+            const uint16_t* s16 = reinterpret_cast<const uint16_t*>(sRow);
+            for (int32_t x = 0; x < srcW; ++x) {
+                uint16_t p = s16[x];
+                uint32_t r = ((p >> 8) & 0x0Fu) * 17u;
+                uint32_t g = ((p >> 4) & 0x0Fu) * 17u;
+                uint32_t b = ( p       & 0x0Fu) * 17u;
+                dRow[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        } else {
+            for (int32_t x = 0; x < srcW; x += 2) {
+                if (x + 1 < srcW) {
+                    int y0, u, y1, v;
+                    if (xboxFmt == 0x25u) { // D3DFMT_UYVY
+                        u  = static_cast<int>(sRow[x * 2 + 0]);
+                        y0 = static_cast<int>(sRow[x * 2 + 1]);
+                        v  = static_cast<int>(sRow[x * 2 + 2]);
+                        y1 = static_cast<int>(sRow[x * 2 + 3]);
+                    } else {                // D3DFMT_YUY2 (0x24)
+                        y0 = static_cast<int>(sRow[x * 2 + 0]);
+                        u  = static_cast<int>(sRow[x * 2 + 1]);
+                        y1 = static_cast<int>(sRow[x * 2 + 2]);
+                        v  = static_cast<int>(sRow[x * 2 + 3]);
+                    }
+                    dRow[x]     = YuvBt601StudioToBgra(y0, u, v);
+                    dRow[x + 1] = YuvBt601StudioToBgra(y1, u, v);
+                } else {
+                    int y0 = (xboxFmt == 0x25u) ? static_cast<int>(sRow[x * 2 + 1]) : static_cast<int>(sRow[x * 2 + 0]);
+                    int u  = (xboxFmt == 0x25u) ? static_cast<int>(sRow[x * 2 + 0]) : static_cast<int>(sRow[x * 2 + 1]);
+                    dRow[x] = YuvBt601StudioToBgra(y0, u, 128);
+                }
             }
         }
     }
 
-    // 4. Scale into 640x480 overlay plane using NV_PVIDEO 12.20 fixed-point step ratios
-    // (0x006B3197..0x006B31F8: ds_dx = ((srcW - 1) << 20) / (dstW - 1), dt_dy = ((srcH - 1) << 20) / (dstH - 1))
-    uint32_t dsDx = (dstW > 1) ? (((uint32_t)(srcW - 1) << 20) / (uint32_t)(dstW - 1)) : 0x100000u;
-    uint32_t dtDy = (dstH > 1) ? (((uint32_t)(srcH - 1) << 20) / (uint32_t)(dstH - 1)) : 0x100000u;
+    // 4. Upload decoded source frame to GPU SRV for persistent non-destructive Present compositing
+    if (g_d3dDevice && g_d3dCtx) {
+        uint32_t uw = static_cast<uint32_t>(srcW);
+        uint32_t uh = static_cast<uint32_t>(srcH);
+        if (!g_videoOverlayTex || g_videoOverlayTexW != uw || g_videoOverlayTexH != uh) {
+            if (g_videoOverlaySRV) { g_videoOverlaySRV->Release(); g_videoOverlaySRV = nullptr; }
+            if (g_videoOverlayTex) { g_videoOverlayTex->Release(); g_videoOverlayTex = nullptr; }
+            g_videoOverlayTexW = uw;
+            g_videoOverlayTexH = uh;
 
-    g_overlayFrameBuf.assign(640u * 480u, (bColorKey != FALSE) ? (ColorKey | 0xFF000000u) : 0xFF000000u);
-    if (dstLeft == 0 && dstTop == 0 && dstW == 640 && dstH == 480 && srcW == 640 && srcH == 480) {
-        memcpy(g_overlayFrameBuf.data(), decodedSrc.data(), 640u * 480u * sizeof(uint32_t));
-    } else {
-        for (int32_t dy = 0; dy < dstH; ++dy) {
-            int32_t outY = dstTop + dy;
-            if (outY < 0 || outY >= 480) continue;
-            uint32_t sy = ((uint32_t)dy * dtDy) >> 20;
-            if (sy >= (uint32_t)srcH) sy = (uint32_t)(srcH - 1);
-            const uint32_t* sLine = &decodedSrc[(size_t)sy * (size_t)srcW];
-            uint32_t* dLine = &g_overlayFrameBuf[(size_t)outY * 640u];
-            for (int32_t dx = 0; dx < dstW; ++dx) {
-                int32_t outX = dstLeft + dx;
-                if (outX < 0 || outX >= 640) continue;
-                uint32_t sx = ((uint32_t)dx * dsDx) >> 20;
-                if (sx >= (uint32_t)srcW) sx = (uint32_t)(srcW - 1);
-                dLine[outX] = sLine[sx];
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width            = uw;
+            td.Height           = uh;
+            td.MipLevels        = 1u;
+            td.ArraySize        = 1u;
+            td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1u;
+            td.Usage            = D3D11_USAGE_DEFAULT;
+            td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+            D3D11_SUBRESOURCE_DATA initData = {};
+            initData.pSysMem     = decodedSrc.data();
+            initData.SysMemPitch = uw * 4u;
+            if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &initData, &g_videoOverlayTex))) {
+                g_d3dDevice->CreateShaderResourceView(g_videoOverlayTex, nullptr, &g_videoOverlaySRV);
             }
+        } else {
+            g_d3dCtx->UpdateSubresource(g_videoOverlayTex, 0u, nullptr, decodedSrc.data(), uw * 4u, 0u);
         }
     }
 
-    // Setting NV_PVIDEO_BUFFER = 1 ([esi+8700h] = 1 at 0x006B3233) activates the overlay plane
+    // Setting NV_PVIDEO_BUFFER = 1 ([esi+8700h] = 1 at 0x006B3233) activates the persistent overlay plane
     g_overlayEnabled = true;
-    g_overlayHasData = true;
+    g_overlayHasData = (g_videoOverlaySRV != nullptr);
 
     UpdateXboxKernelTick();
     UpdateXboxInputTick();

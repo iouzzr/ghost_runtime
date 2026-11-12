@@ -9,7 +9,7 @@
     {
       "name": "x86-release",
       "displayName": "Windows x86 Release",
-      "description": "Build 32-bit x86 GhostWin11.exe (Release) using Visual Studio",
+      "description": "Build 32-bit x86 GhostXR.exe (Release) using Visual Studio",
       "binaryDir": "${sourceDir}/build",
       "architecture": {
         "value": "Win32",
@@ -19,7 +19,7 @@
     {
       "name": "x86-debug",
       "displayName": "Windows x86 RelWithDebInfo",
-      "description": "Build 32-bit x86 GhostWin11.exe with full symbols",
+      "description": "Build 32-bit x86 GhostXR.exe with full symbols",
       "binaryDir": "${sourceDir}/build",
       "architecture": {
         "value": "Win32",

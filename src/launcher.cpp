@@ -33,14 +33,14 @@ static HWND    s_hEditGameDir = nullptr;
 static HBRUSH  s_hDlgBrush    = nullptr;
 static bool    s_launcherOk   = false;
 static bool    s_launcherDone = false;
-static wchar_t s_selectedGameDirW[MAX_PATH] = { 0 };
+static wchar_t s_selectedGameDirW[kMaxHostPath] = { 0 };
 
 static bool TryPortableFallbackToExeDir() {
-    wchar_t exeDirW[MAX_PATH] = {};
-    GetExeDirW(exeDirW, MAX_PATH);
+    wchar_t exeDirW[kMaxHostPath] = {};
+    GetExeDirW(exeDirW, kMaxHostPath);
     if (IsValidGameDirW(exeDirW)) {
-        wcsncpy(s_selectedGameDirW, exeDirW, MAX_PATH - 1);
-        s_selectedGameDirW[MAX_PATH - 1] = L'\0';
+        wcsncpy(s_selectedGameDirW, exeDirW, kMaxHostPath - 1);
+        s_selectedGameDirW[kMaxHostPath - 1] = L'\0';
         if (s_hEditGameDir) {
             SetWindowTextW(s_hEditGameDir, s_selectedGameDirW);
         }
@@ -434,9 +434,18 @@ static LRESULT CALLBACK KeyConfigWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
             }
             return 0;
         }
+        case WM_XBUTTONDOWN: {
+            if (s_activeBindSlot >= 0 && s_activeBindSlot < (int)kNumKeyBindSlots) {
+                WORD xbtn = HIWORD(wParam);
+                *g_keySlots[s_activeBindSlot].pVk = (xbtn == XBUTTON2) ? VK_XBUTTON2 : VK_XBUTTON1;
+                s_activeBindSlot = -1;
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            return TRUE;
+        }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
-            int vk = (int)wParam;
+            int vk = ResolveDistinguishedVk(wParam, lParam);
             if (s_activeBindSlot >= 0 && s_activeBindSlot < (int)kNumKeyBindSlots) {
                 if (vk > 0 && vk < 256) {
                     *g_keySlots[s_activeBindSlot].pVk = vk;
@@ -524,9 +533,9 @@ static void ShowKeyboardConfigDialog(HWND hParent, HINSTANCE hInst) {
     SetForegroundWindow(hParent);
 
     if (s_keyDlgSaved) {
-        wchar_t userDataDirW[MAX_PATH] = {};
-        wchar_t iniPathW[MAX_PATH] = {};
-        GetAppDataAndIniPathsW(userDataDirW, MAX_PATH, iniPathW, MAX_PATH);
+        wchar_t userDataDirW[kMaxHostPath] = {};
+        wchar_t iniPathW[kMaxHostPath]     = {};
+        GetAppDataAndIniPathsW(userDataDirW, kMaxHostPath, iniPathW, kMaxHostPath);
         CreateDirectoryW(userDataDirW, nullptr);
         SaveKeyBindingsToIniW(iniPathW);
     }
@@ -570,20 +579,20 @@ static bool BrowseForGameFolder(HWND hParent) {
         if (SUCCEEDED(pFileDlg->GetResult(&pItem)) && pItem) {
             PWSTR pszFolderPath = nullptr;
             if (SUCCEEDED(pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszFolderPath)) && pszFolderPath) {
-                wchar_t candidateW[MAX_PATH] = {};
-                wcsncpy(candidateW, pszFolderPath, MAX_PATH - 1);
-                candidateW[MAX_PATH - 1] = L'\0';
+                wchar_t candidateW[kMaxHostPath] = {};
+                wcsncpy(candidateW, pszFolderPath, kMaxHostPath - 1);
+                candidateW[kMaxHostPath - 1] = L'\0';
                 TrimTrailingSlashesW(candidateW);
                 if (IsValidGameDirW(candidateW)) {
-                    wcsncpy(s_selectedGameDirW, candidateW, MAX_PATH - 1);
-                    s_selectedGameDirW[MAX_PATH - 1] = L'\0';
+                    wcsncpy(s_selectedGameDirW, candidateW, kMaxHostPath - 1);
+                    s_selectedGameDirW[kMaxHostPath - 1] = L'\0';
                     if (s_hEditGameDir) {
                         SetWindowTextW(s_hEditGameDir, s_selectedGameDirW);
                     }
                     selectedValid = true;
                 } else {
-                    wchar_t errMsg[512] = {};
-                    swprintf(errMsg, 512,
+                    wchar_t errMsg[kMaxHostPath + 256] = {};
+                    swprintf(errMsg, kMaxHostPath + 256,
                         L"The selected directory does not contain 'Ghost.exe':\n\n%ls\n\nPlease select the root game folder where 'Ghost.exe' is located.",
                         pszFolderPath);
                     MessageBoxW(hParent, errMsg, L"Ghost.exe Not Found", MB_ICONWARNING | MB_OK);
@@ -630,26 +639,27 @@ static char     s_currentShaderName[128] = "fixed_ps";
 static void UpdateShaderCheckboxState() {
     if (!s_hChkCompileShaders) return;
 
-    wchar_t exeDataDirW[MAX_PATH] = {};
-    wchar_t exeIniPathW[MAX_PATH] = {};
-    GetAppDataAndIniPathsW(exeDataDirW, MAX_PATH, exeIniPathW, MAX_PATH);
+    wchar_t exeDataDirW[kMaxHostPath] = {};
+    wchar_t exeIniPathW[kMaxHostPath] = {};
+    GetAppDataAndIniPathsW(exeDataDirW, kMaxHostPath, exeIniPathW, kMaxHostPath);
 
     UINT compiledVal = GetPrivateProfileIntW(L"Shaders", L"Compiled", 0, exeIniPathW);
+    UINT cacheVer    = GetPrivateProfileIntW(L"Shaders", L"CacheVersion", 0, exeIniPathW);
 
-    wchar_t savedGameDirW[MAX_PATH] = {};
-    GetPrivateProfileStringW(L"Paths", L"GameDir", L"", savedGameDirW, MAX_PATH, exeIniPathW);
+    wchar_t savedGameDirW[kMaxHostPath] = {};
+    GetPrivateProfileStringW(L"Paths", L"GameDir", L"", savedGameDirW, static_cast<DWORD>(kMaxHostPath), exeIniPathW);
     TrimTrailingSlashesW(savedGameDirW);
 
     bool gameDirMatches = (savedGameDirW[0] != L'\0' && _wcsicmp(savedGameDirW, s_selectedGameDirW) == 0);
 
-    wchar_t fixedVsCsoW[MAX_PATH] = {};
-    wchar_t fixedPsCsoW[MAX_PATH] = {};
-    JoinPathW(fixedVsCsoW, MAX_PATH, exeDataDirW, L"shaders\\fixed_vs.cso");
-    JoinPathW(fixedPsCsoW, MAX_PATH, exeDataDirW, L"shaders\\fixed_ps.cso");
+    wchar_t fixedVsCsoW[kMaxHostPath] = {};
+    wchar_t fixedPsCsoW[kMaxHostPath] = {};
+    JoinPathW(fixedVsCsoW, kMaxHostPath, exeDataDirW, L"shaders\\fixed_vs.cso");
+    JoinPathW(fixedPsCsoW, kMaxHostPath, exeDataDirW, L"shaders\\fixed_ps.cso");
     bool csoExists = (GetFileAttributesW(fixedVsCsoW) != INVALID_FILE_ATTRIBUTES &&
                       GetFileAttributesW(fixedPsCsoW) != INVALID_FILE_ATTRIBUTES);
 
-    if (compiledVal != 0 && gameDirMatches && csoExists) {
+    if (compiledVal != 0 && cacheVer == kCurrentShaderCacheVersion && gameDirMatches && csoExists) {
         // Compiled=1: Unchecked by default, enabled so the user can check it to force recompilation
         SetWindowTextW(s_hChkCompileShaders, L"Recompile Shaders");
         SendMessageW(s_hChkCompileShaders, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -727,7 +737,7 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             // 1. Top Title & Subtitle (matching exact Page 1 coordinates)
             SetTextColor(memDC, RGB(30, 34, 42));
             RECT rcTitle = { 22, 16, 558, 42 };
-            DrawTextW(memDC, L"StarCraft: Ghost (PC Native Port)", -1, &rcTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, L"StarCraft: Ghost (GhostXR)", -1, &rcTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
             SelectObject(memDC, s_hFontUI);
             SetTextColor(memDC, RGB(60, 66, 78));
@@ -890,9 +900,9 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
                     ClearShaderCacheDirectory();
                     SetShaderCacheCompiledInIni(false);
                 }
-                SetCurrentDirectoryA(g_gameRootDir);
+                SetCurrentDirectoryUtf8(g_gameRootDir);
 
-                char ghostExePath[MAX_PATH] = {};
+                char ghostExePath[kMaxHostPath] = {};
                 snprintf(ghostExePath, sizeof(ghostExePath), "%s\\Ghost.exe", g_gameRootDir);
                 if (!LoadGhostXboxPeImage(ghostExePath)) {
                     MessageBoxW(hWnd, L"Failed to load Ghost.exe from the selected Game Directory!", L"Error", MB_ICONERROR);
@@ -977,7 +987,35 @@ static LRESULT CALLBACK LauncherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+struct ScopedLauncherGdiDpiScaling {
+    typedef HANDLE (WINAPI *PFN_SetThreadDpiAwarenessContext)(HANDLE);
+    PFN_SetThreadDpiAwarenessContext pfnSet  = nullptr;
+    HANDLE                           prevCtx = nullptr;
+
+    ScopedLauncherGdiDpiScaling() {
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        if (hUser32) {
+            pfnSet = reinterpret_cast<PFN_SetThreadDpiAwarenessContext>(
+                GetProcAddress(hUser32, "SetThreadDpiAwarenessContext"));
+        }
+        if (pfnSet) {
+            // DPI_AWARENESS_CONTEXT_UNAWARE_GDI_SCALED (-5) renders fixed 96-DPI GDI layouts with crisp HiDPI ClearType
+            prevCtx = pfnSet(reinterpret_cast<HANDLE>(static_cast< intptr_t >(-5)));
+            if (!prevCtx) {
+                prevCtx = pfnSet(reinterpret_cast<HANDLE>(static_cast< intptr_t >(-1)));
+            }
+        }
+    }
+    ~ScopedLauncherGdiDpiScaling() {
+        if (pfnSet && prevCtx) {
+            pfnSet(prevCtx);
+        }
+    }
+};
+
 bool ShowLauncherDialog(HINSTANCE hInst) {
+    ScopedLauncherGdiDpiScaling dpiScope;
+
     // Enumerate DXGI Hardware Adapters
     s_gpuAdapters.clear();
     IDXGIFactory* pFactory = nullptr;
@@ -1007,13 +1045,13 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
     }
 
     // 1. Locate config.ini in <exeDir>\<exeBaseName>\config.ini
-    wchar_t exeDataDirW[MAX_PATH] = {};
-    wchar_t exeIniPathW[MAX_PATH] = {};
-    GetAppDataAndIniPathsW(exeDataDirW, MAX_PATH, exeIniPathW, MAX_PATH);
+    wchar_t exeDataDirW[kMaxHostPath] = {};
+    wchar_t exeIniPathW[kMaxHostPath] = {};
+    GetAppDataAndIniPathsW(exeDataDirW, kMaxHostPath, exeIniPathW, kMaxHostPath);
 
     s_selectedGameDirW[0] = L'\0';
     if (GetFileAttributesW(exeIniPathW) != INVALID_FILE_ATTRIBUTES) {
-        GetPrivateProfileStringW(L"Paths", L"GameDir", L"", s_selectedGameDirW, MAX_PATH, exeIniPathW);
+        GetPrivateProfileStringW(L"Paths", L"GameDir", L"", s_selectedGameDirW, static_cast<DWORD>(kMaxHostPath), exeIniPathW);
         TrimTrailingSlashesW(s_selectedGameDirW);
     }
 
@@ -1080,7 +1118,7 @@ bool ShowLauncherDialog(HINSTANCE hInst) {
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 
     // Title & Subtitle
-    s_hTitle = CreateWindowExW(0, L"STATIC", L"StarCraft: Ghost (PC Native Port)",
+    s_hTitle = CreateWindowExW(0, L"STATIC", L"StarCraft: Ghost (GhostXR)",
         WS_CHILD | WS_VISIBLE, 22, 16, 536, 26, hDlg, nullptr, hInst, nullptr);
     SendMessageW(s_hTitle, WM_SETFONT, (WPARAM)s_hFontTitle, TRUE);
 

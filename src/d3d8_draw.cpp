@@ -2,10 +2,212 @@
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
 #include <d3d11.h>
+#include <algorithm>
+#include <atomic>
 #include <math.h>
 #include <stdio.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+extern uint64_t g_diagBackBufferCopyCount;
+extern uint64_t g_diagSurfaceGpuReadbackCount;
+extern uint64_t g_diagPsPointerCacheHitCount;
+
+static uint64_t g_diagStaticVbCacheHitCount     = 0ULL;
+static uint64_t g_diagStaticIbCacheHitCount     = 0ULL;
+static uint64_t g_diagStaticPushBufferHitCount  = 0ULL;
+
+uint64_t GetBackBufferCopyCount()       { return g_diagBackBufferCopyCount; }
+uint64_t GetStaticVbCacheHitCount()     { return g_diagStaticVbCacheHitCount; }
+uint64_t GetStaticIbCacheHitCount()     { return g_diagStaticIbCacheHitCount; }
+uint64_t GetStaticPushBufferHitCount()  { return g_diagStaticPushBufferHitCount; }
+
+void ResetPhase3DiagCounters() {
+    g_diagBackBufferCopyCount      = 0ULL;
+    g_diagSurfaceGpuReadbackCount  = 0ULL;
+    g_diagPsPointerCacheHitCount   = 0ULL;
+    g_diagStaticVbCacheHitCount    = 0ULL;
+    g_diagStaticIbCacheHitCount    = 0ULL;
+    g_diagStaticPushBufferHitCount = 0ULL;
+}
+
+// ============================================================================
+// Optimization 1 & [P1-1]: Static GPU VB / IB / PushBuffer Cache & Lifecycle
+// ============================================================================
+
+struct CachedStaticGpuBuffer {
+    uint32_t      dataPtr;
+    uint32_t      byteSize;
+    uint32_t      resHeaderAddr;
+    ID3D11Buffer* gpuBuf;
+    ID3D11Device* device;
+    bool          dirty;
+};
+
+struct PushBufferPacketKey {
+    uint32_t pbDataPtr;
+    uint32_t packetByteOffset;
+    uint32_t xboxPrim;
+
+    bool operator==(const PushBufferPacketKey& o) const {
+        return pbDataPtr == o.pbDataPtr &&
+               packetByteOffset == o.packetByteOffset &&
+               xboxPrim == o.xboxPrim;
+    }
+};
+
+struct PushBufferPacketKeyHasher {
+    size_t operator()(const PushBufferPacketKey& k) const {
+        uint64_t h = 14695981039346656037ULL;
+        h = (h ^ k.pbDataPtr) * 1099511628211ULL;
+        h = (h ^ k.packetByteOffset) * 1099511628211ULL;
+        h = (h ^ k.xboxPrim) * 1099511628211ULL;
+        return static_cast<size_t>(h ^ (h >> 32));
+    }
+};
+
+struct CachedPushBufferPacket {
+    ID3D11Buffer*            ib;
+    ID3D11Device*            device;
+    D3D11_PRIMITIVE_TOPOLOGY d3dTopo;
+    uint32_t                 drawIdxCount;
+    uint32_t                 pbByteSpan;
+    std::vector<uint16_t>    rawIndices;
+};
+
+static std::vector<CachedStaticGpuBuffer> g_staticVbCache; // Kept sorted by dataPtr
+static std::vector<CachedStaticGpuBuffer> g_staticIbCache; // Kept sorted by dataPtr
+static std::unordered_map<PushBufferPacketKey, CachedPushBufferPacket, PushBufferPacketKeyHasher> g_staticPbCache;
+
+struct PendingBufEvictRange {
+    uintptr_t addr;
+    size_t    byteLen;
+};
+
+static DWORD                             g_gpuBufOwnerThreadId    = 0u;
+static std::atomic<uintptr_t>            g_minTrackedGpuBufAddr{ ~static_cast<uintptr_t>(0) };
+static std::atomic<uintptr_t>            g_maxTrackedGpuBufAddr{ 0u };
+static SRWLOCK                           g_pendingBufEvictLock    = SRWLOCK_INIT;
+static std::atomic<bool>                 g_hasPendingBufEvictions{ false };
+static std::vector<PendingBufEvictRange> g_pendingBufEvictions;
+
+static void NoteTrackedGpuBufBounds(uintptr_t startAddr, uintptr_t endAddr) {
+    if (startAddr == 0u || endAddr <= startAddr) return;
+    uintptr_t curMin = g_minTrackedGpuBufAddr.load(std::memory_order_relaxed);
+    while (startAddr < curMin &&
+           !g_minTrackedGpuBufAddr.compare_exchange_weak(curMin, startAddr, std::memory_order_relaxed)) {}
+    uintptr_t curMax = g_maxTrackedGpuBufAddr.load(std::memory_order_relaxed);
+    while (endAddr > curMax &&
+           !g_maxTrackedGpuBufAddr.compare_exchange_weak(curMax, endAddr, std::memory_order_relaxed)) {}
+}
+
+uint32_t GetCachedGpuBufferCount() {
+    uint32_t liveCount = 0u;
+    for (size_t i = 0; i < g_staticVbCache.size(); ++i) {
+        if (g_staticVbCache[i].gpuBuf != nullptr) ++liveCount;
+    }
+    for (size_t i = 0; i < g_staticIbCache.size(); ++i) {
+        if (g_staticIbCache[i].gpuBuf != nullptr) ++liveCount;
+    }
+    for (const auto& kv : g_staticPbCache) {
+        if (kv.second.ib != nullptr) ++liveCount;
+    }
+    return liveCount;
+}
+
+// Excludes all 5 Ghost.exe dynamic ring buffers:
+//   0x008AAA80: cDynamicVB::pMeshBuffer
+//   0x008AAA84: cDynamicVB::pParticleBuffer
+//   0x008AAA88: cDynamicVB::pParticleBuffer3D
+//   0x008AAA8C: cDynamicVB::pLineBuffer
+//   0x008AAA90: cDynamicIB::pDynamicIB (writes pIB->Data inline without calling D3DIndexBuffer_Lock)
+static bool IsEngineDynamicRingAddress(uintptr_t ptr) {
+    if (ptr == 0u) return false;
+    static const uint32_t kDynVbGlobals[4] = { 0x008AAA80u, 0x008AAA84u, 0x008AAA88u, 0x008AAA8Cu };
+    for (uint32_t i = 0; i < 4u; ++i) {
+        const uint8_t* pDynVb = *reinterpret_cast<const uint8_t* const*>(kDynVbGlobals[i]);
+        if (reinterpret_cast<uintptr_t>(pDynVb) >= kMinValidHostAddress) {
+            const XboxVertexBuffer* ringVb = *reinterpret_cast<const XboxVertexBuffer* const*>(pDynVb + 0x10);
+            if (reinterpret_cast<uintptr_t>(ringVb) >= kMinValidHostAddress && ringVb->Data != 0u) {
+                uint32_t maxVerts = *reinterpret_cast<const uint32_t*>(pDynVb + 0x00);
+                uint32_t stride   = *reinterpret_cast<const uint32_t*>(pDynVb + 0x08);
+                uint64_t span     = static_cast<uint64_t>(maxVerts) * static_cast<uint64_t>(stride ? stride : 64u);
+                if (span == 0u) span = 1u;
+                uintptr_t startA  = static_cast<uintptr_t>(ringVb->Data);
+                uintptr_t endA    = (span > 0xFFFFFFFFULL - startA) ? 0xFFFFFFFFu : static_cast<uintptr_t>(startA + span);
+                if (ptr >= startA && ptr < endA) return true;
+            }
+        }
+    }
+    const uint8_t* pDynIb = *reinterpret_cast<const uint8_t* const*>(0x008AAA90u);
+    if (reinterpret_cast<uintptr_t>(pDynIb) >= kMinValidHostAddress) {
+        const XboxVertexBuffer* ringIb = *reinterpret_cast<const XboxVertexBuffer* const*>(pDynIb + 0x08);
+        if (reinterpret_cast<uintptr_t>(ringIb) >= kMinValidHostAddress && ringIb->Data != 0u) {
+            uint32_t maxIdx  = *reinterpret_cast<const uint32_t*>(pDynIb + 0x00);
+            uint64_t span    = static_cast<uint64_t>(maxIdx) * 2ULL;
+            if (span == 0u) span = 1u;
+            uintptr_t startA = static_cast<uintptr_t>(ringIb->Data);
+            uintptr_t endA   = (span > 0xFFFFFFFFULL - startA) ? 0xFFFFFFFFu : static_cast<uintptr_t>(startA + span);
+            if (ptr >= startA && ptr < endA) return true;
+        }
+    }
+    return false;
+}
+
+static CachedStaticGpuBuffer* FindStaticBufContaining(std::vector<CachedStaticGpuBuffer>& list, uint32_t addr) {
+    if (list.empty() || addr == 0u) return nullptr;
+    auto it = std::upper_bound(
+        list.begin(), list.end(), addr,
+        [](uint32_t a, const CachedStaticGpuBuffer& e) { return a < e.dataPtr; });
+    if (it == list.begin()) return nullptr;
+    --it;
+    uint32_t endAddr = (0xFFFFFFFFu - it->dataPtr < it->byteSize) ? 0xFFFFFFFFu : (it->dataPtr + it->byteSize);
+    if (addr >= it->dataPtr && addr < endAddr) {
+        return &(*it);
+    }
+    return nullptr;
+}
+
+static void RegisterStaticBufRange(
+    std::vector<CachedStaticGpuBuffer>& list, uint32_t dataPtr, uint32_t byteSize, uint32_t resHeaderAddr);
+
+void EvictGpuBuffersByMemoryRange(uintptr_t addr, size_t byteLen);
+
+void DrainPendingGpuBufferEvictions() {
+    if (!g_hasPendingBufEvictions.load(std::memory_order_acquire)) return;
+    std::vector<PendingBufEvictRange> local;
+    AcquireSRWLockExclusive(&g_pendingBufEvictLock);
+    local.swap(g_pendingBufEvictions);
+    g_hasPendingBufEvictions.store(false, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_pendingBufEvictLock);
+
+    for (size_t i = 0; i < local.size(); ++i) {
+        EvictGpuBuffersByMemoryRange(local[i].addr, local[i].byteLen);
+    }
+}
+
+static void OnXboxMemoryFreedBufferHook(const void* ptr, size_t byteLen) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    if (addr == 0u || byteLen == 0u) return;
+    uintptr_t minA = g_minTrackedGpuBufAddr.load(std::memory_order_relaxed);
+    uintptr_t maxA = g_maxTrackedGpuBufAddr.load(std::memory_order_relaxed);
+    if (minA > maxA) return;
+    uintptr_t endAddr = (UINTPTR_MAX - addr < byteLen) ? UINTPTR_MAX : (addr + byteLen);
+    if (endAddr <= minA || addr >= maxA) return;
+
+    DWORD curTid  = GetCurrentThreadId();
+    DWORD ownerId = g_gpuBufOwnerThreadId;
+    if (ownerId != 0u && curTid == ownerId) {
+        DrainPendingGpuBufferEvictions();
+        EvictGpuBuffersByMemoryRange(addr, byteLen);
+    } else {
+        AcquireSRWLockExclusive(&g_pendingBufEvictLock);
+        g_pendingBufEvictions.push_back({ addr, byteLen });
+        g_hasPendingBufEvictions.store(true, std::memory_order_release);
+        ReleaseSRWLockExclusive(&g_pendingBufEvictLock);
+    }
+}
 
 // ============================================================================
 // Stream Sources, Indices, Transforms, Viewport, Material, Lights & Scissors
@@ -23,6 +225,21 @@ static Mat44        g_matView  = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} 
 static Mat44        g_matProj  = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
 static Mat44        g_matWorld = { {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0,0,1}} };
 XboxViewport        g_viewport = { 0, 0, 640, 480, 0.0f, 1.0f };
+static float        g_screenSpaceOffsetX = 0.0f;
+static float        g_screenSpaceOffsetY = 0.0f;
+
+static float GetXboxDeviceZScale() {
+    float zScale = *reinterpret_cast<const float*>(ADDR_D3D_DEVICE + 0x948);
+    return (zScale > 1.0f) ? zScale : 16777215.0f;
+}
+
+// _D3DDevice_SetScreenSpaceOffset@8 (0x006B2050)
+static void __stdcall Bridge_D3DDevice_SetScreenSpaceOffset(float x, float y) {
+    g_screenSpaceOffsetX = x;
+    g_screenSpaceOffsetY = y;
+    *reinterpret_cast<float*>(ADDR_D3D_DEVICE + 0xEF8) = x + 0.53125f;
+    *reinterpret_cast<float*>(ADDR_D3D_DEVICE + 0xEFC) = y + 0.53125f;
+}
 
 static Mat44 MulMat44(const Mat44& A, const Mat44& B) {
     Mat44 R = {};
@@ -45,6 +262,7 @@ void __stdcall Bridge_D3DDevice_SetStreamSource(uint32_t StreamNumber, XboxVerte
         *reinterpret_cast<XboxVertexBuffer**>(ADDR_D3D_STREAM + StreamNumber * 12 + 8) = pStreamData;
         if (StreamNumber == 0) {
             g_curPrelitUseCustomBase = false;
+            g_activeGpuSkin.active   = false;
         } else if (StreamNumber == 1 && Stride == 4) {
             g_curPrelitColors = (pStreamData && pStreamData->Data)
                 ? reinterpret_cast<const uint32_t*>(pStreamData->Data)
@@ -56,11 +274,318 @@ void __stdcall Bridge_D3DDevice_SetStreamSource(uint32_t StreamNumber, XboxVerte
 }
 
 void __stdcall Bridge_D3DDevice_SetIndices(XboxVertexBuffer* pIndexData, uint32_t BaseVertexIndex) {
+    g_activeGpuSkin.active = false;
     g_indexData = (pIndexData && pIndexData->Data) ? reinterpret_cast<const uint16_t*>(pIndexData->Data) : nullptr;
     g_baseVertexIndex = BaseVertexIndex;
     *reinterpret_cast<const uint16_t**>(ADDR_D3D_INDEXDATA) = g_indexData;
     *reinterpret_cast<XboxVertexBuffer**>(ADDR_D3D_DEVICE + 0x7A0) = pIndexData;
     *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1C) = BaseVertexIndex;
+}
+
+void EvictGpuBuffersByMemoryRange(uintptr_t addr, size_t byteLen) {
+    if (addr == 0u || byteLen == 0u) return;
+    uint32_t qStart = (addr > 0xFFFFFFFFu) ? 0xFFFFFFFFu : static_cast<uint32_t>(addr);
+    uint64_t qEnd64 = static_cast<uint64_t>(addr) + static_cast<uint64_t>(byteLen);
+    uint32_t qEnd   = (qEnd64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : static_cast<uint32_t>(qEnd64);
+    if (qEnd <= qStart) return;
+
+    bool releasedAnyGpuBuf = false;
+
+    auto sweepList = [&](std::vector<CachedStaticGpuBuffer>& list) {
+        for (size_t i = list.size(); i > 0u; --i) {
+            CachedStaticGpuBuffer& e = list[i - 1u];
+            uint32_t span   = e.byteSize ? e.byteSize : 1u;
+            uint32_t dEnd   = (0xFFFFFFFFu - e.dataPtr < span) ? 0xFFFFFFFFu : (e.dataPtr + span);
+            uint32_t hdrEnd = (0xFFFFFFFFu - e.resHeaderAddr < 12u) ? 0xFFFFFFFFu : (e.resHeaderAddr + 12u);
+            bool hitData    = (e.dataPtr != 0u) && (e.dataPtr < qEnd && dEnd > qStart);
+            bool hitHdr     = (e.resHeaderAddr != 0u) && (e.resHeaderAddr < qEnd && hdrEnd > qStart);
+            if (hitData || hitHdr) {
+                if (e.gpuBuf) {
+                    e.gpuBuf->Release();
+                    e.gpuBuf          = nullptr;
+                    releasedAnyGpuBuf = true;
+                }
+                list.erase(list.begin() + static_cast<ptrdiff_t>(i - 1u));
+            }
+        }
+    };
+
+    sweepList(g_staticVbCache);
+    sweepList(g_staticIbCache);
+
+    for (auto it = g_staticPbCache.begin(); it != g_staticPbCache.end();) {
+        uint32_t pbStart = it->first.pbDataPtr;
+        uint32_t span    = it->second.pbByteSpan ? it->second.pbByteSpan : 1u;
+        uint32_t pbEnd   = (0xFFFFFFFFu - pbStart < span) ? 0xFFFFFFFFu : (pbStart + span);
+        if (pbStart < qEnd && pbEnd > qStart) {
+            if (it->second.ib) {
+                it->second.ib->Release();
+                it->second.ib     = nullptr;
+                releasedAnyGpuBuf = true;
+            }
+            it = g_staticPbCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Clear bound stream / index pointers if they point into the freed range
+    for (uint32_t s = 0; s < 16u; ++s) {
+        uintptr_t sp = reinterpret_cast<uintptr_t>(g_streams[s].data);
+        if (sp >= qStart && sp < qEnd) {
+            g_streams[s].data = nullptr;
+        }
+    }
+    uintptr_t ip = reinterpret_cast<uintptr_t>(g_indexData);
+    if (ip >= qStart && ip < qEnd) {
+        g_indexData = nullptr;
+    }
+
+    if (g_staticVbCache.empty() && g_staticIbCache.empty() && g_staticPbCache.empty()) {
+        g_minTrackedGpuBufAddr.store(~static_cast<uintptr_t>(0), std::memory_order_relaxed);
+        g_maxTrackedGpuBufAddr.store(0u, std::memory_order_relaxed);
+    }
+
+    if (releasedAnyGpuBuf) {
+        InvalidateD3D11ShadowState();
+    }
+}
+
+static void RegisterStaticBufRange(
+    std::vector<CachedStaticGpuBuffer>& list, uint32_t dataPtr, uint32_t byteSize, uint32_t resHeaderAddr)
+{
+    if (dataPtr == 0u || byteSize == 0u) return;
+    if (g_gpuBufOwnerThreadId == 0u) {
+        g_gpuBufOwnerThreadId = GetCurrentThreadId();
+    }
+    DrainPendingGpuBufferEvictions();
+    EvictGpuBuffersByMemoryRange(dataPtr, byteSize);
+
+    CachedStaticGpuBuffer entry = {};
+    entry.dataPtr       = dataPtr;
+    entry.byteSize      = byteSize;
+    entry.resHeaderAddr = resHeaderAddr;
+    entry.gpuBuf        = nullptr;
+    entry.device        = nullptr;
+    entry.dirty         = true;
+
+    auto pos = std::lower_bound(
+        list.begin(), list.end(), dataPtr,
+        [](const CachedStaticGpuBuffer& e, uint32_t a) { return e.dataPtr < a; });
+    list.insert(pos, entry);
+
+    uint64_t end64 = static_cast<uint64_t>(dataPtr) + static_cast<uint64_t>(byteSize);
+    NoteTrackedGpuBufBounds(dataPtr, (end64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : static_cast<uintptr_t>(end64));
+    if (resHeaderAddr != 0u) {
+        NoteTrackedGpuBufBounds(resHeaderAddr, resHeaderAddr + 12u);
+    }
+}
+
+// _D3DDevice_CreateVertexBuffer2@4 (0x006B34C0)
+XboxVertexBuffer* __stdcall Bridge_D3DDevice_CreateVertexBuffer2(uint32_t Length) {
+    XboxVertexBuffer* pVB = reinterpret_cast<XboxVertexBuffer*>(Bridge_XMemAlloc(0x0Cu, 0x64800000u));
+    if (!pVB) return nullptr;
+    uint32_t allocLen = (Length > 0u) ? Length : 4u;
+    void* pData = Bridge_XMemAlloc(allocLen, 0xB2800000u);
+    if (!pData) {
+        Bridge_XMemFree(pVB, 0x24800000u);
+        return nullptr;
+    }
+    pVB->Common = 0x01000001u;
+    pVB->Data   = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pData));
+    pVB->Lock   = 0u;
+    if (Length > 0u) {
+        RegisterStaticBufRange(
+            g_staticVbCache, pVB->Data, Length,
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pVB)));
+    }
+    return pVB;
+}
+
+// _D3DDevice_CreateIndexBuffer2@4 (0x006B3480)
+XboxVertexBuffer* __stdcall Bridge_D3DDevice_CreateIndexBuffer2(uint32_t Length) {
+    uint32_t allocLen = (Length > 0u) ? Length : 2u;
+    uint8_t* raw = reinterpret_cast<uint8_t*>(Bridge_XMemAlloc(allocLen + 0x0Cu, 0x24800000u));
+    if (!raw) return nullptr;
+    XboxVertexBuffer* pIB = reinterpret_cast<XboxVertexBuffer*>(raw);
+    pIB->Common = 0x01010001u;
+    pIB->Data   = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(raw + 0x0Cu));
+    pIB->Lock   = 0u;
+    if (Length > 0u) {
+        RegisterStaticBufRange(
+            g_staticIbCache, pIB->Data, Length,
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pIB)));
+    }
+    return pIB;
+}
+
+// _D3DVertexBuffer_Lock2@8 (0x006B3510)
+uint8_t* __stdcall Bridge_D3DVertexBuffer_Lock2(XboxVertexBuffer* pVB, uint32_t Flags) {
+    if (!pVB) return nullptr;
+    constexpr uint32_t kXboxVbLockReadOnly = 0x80u; // D3DLOCK_READONLY (0x10=NOFLUSH, 0x20=NOOVERWRITE are writable!)
+    if ((Flags & kXboxVbLockReadOnly) == 0u && pVB->Data != 0u) {
+        CachedStaticGpuBuffer* found = FindStaticBufContaining(g_staticVbCache, pVB->Data);
+        if (found) {
+            found->dirty = true;
+        }
+    }
+    return reinterpret_cast<uint8_t*>(pVB->Data);
+}
+
+// Public C++ & LTCG helper for D3DIndexBuffer_Lock (0x005F1990, 0x005FBBC0, 0x00604A60)
+int32_t __stdcall Bridge_D3DIndexBuffer_Lock(
+    XboxVertexBuffer* pIB, uint32_t OffsetToLock, uint32_t SizeToLock, uint8_t** ppbData, uint32_t Flags)
+{
+    (void)SizeToLock;
+    if (!pIB) {
+        if (ppbData) *ppbData = nullptr;
+        return E_INVALIDARG;
+    }
+    uint32_t lockAddr = pIB->Data + OffsetToLock;
+    if (ppbData) {
+        *ppbData = reinterpret_cast<uint8_t*>(lockAddr);
+    }
+    constexpr uint32_t kXboxIbLockReadOnly = 0x80u;
+    if ((Flags & kXboxIbLockReadOnly) == 0u && pIB->Data != 0u) {
+        CachedStaticGpuBuffer* found = FindStaticBufContaining(g_staticIbCache, lockAddr);
+        if (!found) found = FindStaticBufContaining(g_staticIbCache, pIB->Data);
+        if (found) {
+            found->dirty = true;
+        }
+    }
+    return S_OK;
+}
+
+static void __fastcall Helper_XboxIndexBufferLock_LTCG(
+    XboxVertexBuffer* pIB, uint8_t** ppbData, uint32_t offsetToLock)
+{
+    Bridge_D3DIndexBuffer_Lock(pIB, offsetToLock, 0u, ppbData, 0u);
+}
+
+// Ghost.exe LTCG custom calling convention for D3DIndexBuffer_Lock (0x005F1990, 0x005FBBC0, 0x00604A60):
+// Entry: eax = pIB, edx = ppbData, [esp+4] = OffsetToLock; preserves eax & edx; cleans 4 stack bytes (ret 4).
+static void __declspec(naked) Thunk_XboxIndexBufferLock_LTCG() {
+    __asm {
+        push eax
+        push edx
+        mov  ecx, [esp + 12]
+        push ecx
+        mov  ecx, eax
+        call Helper_XboxIndexBufferLock_LTCG
+        pop  edx
+        pop  eax
+        ret  4
+    }
+}
+
+// ?DestroyResource@D3D@@YGXPAUD3DResource@@@Z (0x006B4210)
+void __stdcall Bridge_D3D_DestroyResource(XboxVertexBuffer* pRes) {
+    if (!pRes) return;
+
+    DrainPendingTextureEvictions();
+    DrainPendingGpuBufferEvictions();
+
+    uint32_t common  = pRes->Common;
+    uint32_t resType = common & 0x00070000u;
+    uint32_t dataPtr = pRes->Data;
+
+    // Determine whether this D3DResource owns its Data allocation (matching 0x006B4238..0x006B428C).
+    // Subresource D3DSurface wrappers from GetSurfaceLevel/GetCubeMapSurface have resType==0x50000
+    // with bit 31 clear (Common >= 0), meaning the parent D3DTexture still owns Data!
+    bool ownsExternalData = false;
+    if (resType == 0x00050000u) {
+        ownsExternalData = (static_cast<int32_t>(common) < 0);
+    } else if (resType == 0x00020000u) {
+        ownsExternalData = (static_cast<int32_t>(common) >= 0);
+    } else if (resType != 0x00010000u && resType != 0x00060000u) {
+        ownsExternalData = true;
+    }
+
+    uintptr_t hdrAddr = reinterpret_cast<uintptr_t>(pRes);
+    size_t    hdrSpan = (resType == 0x00050000u) ? 24u : ((resType == 0x00040000u) ? sizeof(XboxPixelContainer) : sizeof(XboxVertexBuffer));
+
+    // Evict textures & GPU buffers associated with the resource header and (when owned) its data
+    EvictTexturesByMemoryRange(hdrAddr, hdrSpan);
+    EvictGpuBuffersByMemoryRange(hdrAddr, hdrSpan);
+    if (resType == 0x00010000u && dataPtr != 0u) {
+        // IndexBuffer Data lives inline at pRes + 0x0C
+        EvictGpuBuffersByMemoryRange(dataPtr, 4u);
+    } else if (ownsExternalData && dataPtr != 0u) {
+        uint32_t texBytes = 4u;
+        if (resType == 0x00040000u || resType == 0x00050000u) {
+            uint32_t exact = ComputeExactXboxTextureBytes(reinterpret_cast<const XboxPixelContainer*>(pRes));
+            if (exact > texBytes) texBytes = exact;
+        }
+        EvictTexturesByMemoryRange(dataPtr, texBytes);
+        EvictGpuBuffersByMemoryRange(dataPtr, 4u);
+    }
+
+    // Replicate CleanPrivateData@D3D (0x006B41C0..0x006B4208)
+    uint8_t** ppHead = reinterpret_cast<uint8_t**>(0x006C3038u);
+    uint8_t*  cur    = *ppHead;
+    uint8_t** ppPrev = ppHead;
+    while (reinterpret_cast<uintptr_t>(cur) >= kMinValidHostAddress) {
+        if (*reinterpret_cast<void**>(cur + 0x04) == pRes) {
+            *ppPrev = *reinterpret_cast<uint8_t**>(cur);
+            if ((cur[0x1C] & 1u) != 0u) {
+                void* pUnk = *reinterpret_cast<void**>(cur + 0x20);
+                if (reinterpret_cast<uintptr_t>(pUnk) >= kMinValidHostAddress) {
+                    void** vtbl = *reinterpret_cast<void***>(pUnk);
+                    typedef ULONG (__stdcall *PFN_Release)(void*);
+                    reinterpret_cast<PFN_Release>(vtbl[2])(pUnk);
+                }
+            }
+            Bridge_XMemFree(cur, 0x24800000u);
+            cur = *ppPrev;
+        } else {
+            ppPrev = reinterpret_cast<uint8_t**>(cur);
+            cur    = *ppPrev;
+        }
+    }
+
+    if (ownsExternalData && dataPtr != 0u) {
+        Bridge_XMemFree(reinterpret_cast<void*>(dataPtr), 0xA1800000u);
+    }
+    Bridge_XMemFree(pRes, 0x24800000u);
+}
+
+// ?directBuffer_FreePushBuffer@@YAXPAUD3DPushBuffer@@@Z (0x005FBE20)
+// Replicates 0x005FBE20..0x005FBE52 while evicting cached static GPU pushbuffer IB packets
+// BEFORE stdMemory_Free / _D3D_FreeContiguousMemory recycles the pushbuffer data block.
+void __cdecl Bridge_directBuffer_FreePushBuffer(XboxPushBuffer* pPB) {
+    if (!pPB) return;
+
+    DrainPendingGpuBufferEvictions();
+
+    uintptr_t pbHdr  = reinterpret_cast<uintptr_t>(pPB);
+    uintptr_t pbData = static_cast<uintptr_t>(pPB->Data);
+    uint32_t  pbSize = pPB->Size;
+    uint32_t  pbSpan = (pPB->AllocationSize > pbSize) ? pPB->AllocationSize : (pbSize ? pbSize : 4u);
+
+    EvictGpuBuffersByMemoryRange(pbHdr, sizeof(XboxPushBuffer));
+    if (pbData != 0u) {
+        EvictGpuBuffersByMemoryRange(pbData, pbSpan);
+    }
+
+    // Replicate 0x005FBE29..0x005FBE2F: update directBuffer_iPushbufferMemory & directBuffer_iPushbufferCount
+    *reinterpret_cast<uint32_t*>(0x008AAA9Cu) -= pbSize;
+    *reinterpret_cast<uint32_t*>(0x008AAAA0u) -= 1u;
+
+    // Replicate 0x005FBE35..0x005FBE52:
+    //   Common < 0 (bit 31 set) -> stdMemory_Free (0x005A76C0)
+    //   Common >= 0             -> _D3D_FreeContiguousMemory@4 (0x006BCCE0 -> XMemFree(Data, 0xA1800000))
+    if (pbData != 0u) {
+        if (static_cast<int32_t>(pPB->Common) < 0) {
+            if (*reinterpret_cast<const uint8_t*>(0x005A76C0u) != 0u) {
+                typedef void (__cdecl *PFN_stdMemory_Free)(void*);
+                reinterpret_cast<PFN_stdMemory_Free>(0x005A76C0u)(reinterpret_cast<void*>(pbData));
+            } else {
+                Bridge_XMemFree(reinterpret_cast<void*>(pbData), 0u);
+            }
+        } else {
+            Bridge_XMemFree(reinterpret_cast<void*>(pbData), 0xA1800000u);
+        }
+    }
 }
 
 void __stdcall Bridge_D3DDevice_SetTransform(uint32_t State, const Mat44* pMatrix) {
@@ -96,6 +621,21 @@ void __stdcall Bridge_D3DDevice_SetViewport(const XboxViewport* pViewport) {
             rtW = w;
             rtH = h;
         }
+    } else if (!g_curActiveRTV && g_curOffscreenZS) {
+        uint32_t zw = 0, zh = 0, levels = 1, fmt = 0, pitch = 0;
+        bool swiz = false;
+        DecodeXboxTextureFormat(reinterpret_cast<const XboxPixelContainer*>(g_curOffscreenZS), &zw, &zh, &levels, &fmt, &swiz, &pitch);
+        if (zw > 0 && zh > 0) {
+            rtW = zw;
+            rtH = zh;
+        }
+    }
+    if (g_curOffscreenZS) {
+        uint32_t zw = 0, zh = 0, levels = 1, fmt = 0, pitch = 0;
+        bool swiz = false;
+        DecodeXboxTextureFormat(reinterpret_cast<const XboxPixelContainer*>(g_curOffscreenZS), &zw, &zh, &levels, &fmt, &swiz, &pitch);
+        if (zw > 0 && zw < rtW) rtW = zw;
+        if (zh > 0 && zh < rtH) rtH = zh;
     }
 
     if (pViewport) {
@@ -131,6 +671,7 @@ void __stdcall Bridge_D3DDevice_SetViewport(const XboxViewport* pViewport) {
         vp11.MinDepth = g_viewport.MinZ;
         vp11.MaxDepth = g_viewport.MaxZ;
         g_d3dCtx->RSSetViewports(1, &vp11);
+        InvalidateD3D11ShadowState();
     }
 }
 
@@ -205,16 +746,30 @@ void UnpackD3DColor(uint32_t c, float* r, float* g, float* b, float* a) {
     *b = (c         & 0xFFu) * (1.0f / 255.0f);
 }
 
-static uint32_t g_lastProjMask = 0;
-static uint32_t g_gpuLightMode = 0; // 0 = off, 1 = defaultWorldLit (unit material), 2 = D3DMATERIAL8 lighting
+static uint32_t          g_lastProjMask        = 0;
+static uint32_t          g_gpuLightMode        = 0; // 0 = off, 1 = defaultWorldLit (unit material), 2 = D3DMATERIAL8 lighting
+static uint32_t          g_drawSkinWeightCount = 0;
+static uint32_t          g_drawBoneCount       = 0;
+static bool              g_drawSkinIgnoreWorld = false;
+static BonePaletteCBData g_drawBonePalette     = {};
+
+static const Mat44 kIdentityMat44 = {
+    { { 1.0f, 0.0f, 0.0f, 0.0f },
+      { 0.0f, 1.0f, 0.0f, 0.0f },
+      { 0.0f, 0.0f, 1.0f, 0.0f },
+      { 0.0f, 0.0f, 0.0f, 1.0f } }
+};
 
 static void DecodeVerticesToUnified(
-    const uint8_t* srcData, uint32_t stride, uint32_t vertexCount,
+    uint32_t xboxPrim, const uint8_t* srcData, uint32_t stride, uint32_t vertexCount,
     const uint16_t* optIndices, uint32_t baseVertexIndex,
     std::vector<UnifiedVertex>& outVerts, bool* outIsRhw)
 {
-    g_lastProjMask = 0;
-    g_gpuLightMode = 0;
+    g_lastProjMask        = 0;
+    g_gpuLightMode        = 0;
+    g_drawSkinWeightCount = 0;
+    g_drawBoneCount       = 0;
+    g_drawSkinIgnoreWorld = false;
     XboxShaderDeclInfo decl = {};
     decl.vsType = -1;
     GetXboxVertexShaderDecl(g_currentVsHandle, &decl);
@@ -241,8 +796,21 @@ static void DecodeVerticesToUnified(
         } else if (posMask != 0) {
             decl.hasPos = true; decl.offPos = off; off += 12;
             if (posMask >= 0x06u) {
-                uint32_t numWeights = (posMask - 0x04u) >> 1;
-                off += (uint16_t)(numWeights * 4);
+                uint32_t numBetas = (posMask - 0x04u) >> 1;
+                if ((fvf & 0x1000u) != 0u && numBetas >= 1u) { // D3DFVF_LASTBETA_UBYTE4
+                    if (numBetas > 1u) {
+                        decl.hasBlendWeight  = true;
+                        decl.offBlendWeight  = off;
+                        decl.numBlendWeights = static_cast<uint8_t>(numBetas - 1u);
+                    }
+                    decl.hasBlendIndices = true;
+                    decl.offBlendIndices = static_cast<uint16_t>(off + (numBetas - 1u) * 4u);
+                } else {
+                    decl.hasBlendWeight  = true;
+                    decl.offBlendWeight  = off;
+                    decl.numBlendWeights = static_cast<uint8_t>(numBetas);
+                }
+                off += static_cast<uint16_t>(numBetas * 4u);
             }
         }
         if (fvf & 0x010u) { decl.hasNorm = true; decl.offNorm = off; off += 12; }
@@ -359,6 +927,78 @@ static void DecodeVerticesToUnified(
     const bool offloadLightsToGpu    = (numActiveLights > 0 && !hasPerVertexMaterialSource);
     const bool needCpuWorldTransform = !decl.hasRhw && (numActiveLights > 0 && !offloadLightsToGpu);
 
+    // Check GPU Hardware Skinning sources:
+    //   1) cMeshGroup::RenderSetupBlendWeightedSkin (g_activeGpuSkin, 3-bone palette + CPU morph)
+    //   2) Xbox D3DRS_VERTEXBLEND (xboxRS[137]: 1=_1WEIGHTS, 2=_2WEIGHTS2, 3=_2WEIGHTS, 4=_3WEIGHTS3, 5=_3WEIGHTS, 6=_4WEIGHTS4)
+    const uint32_t expectedSkinStride = (g_activeGpuSkin.boundStride != 0u) ? g_activeGpuSkin.boundStride : 0x20u;
+    const bool useActiveGpuSkin = !decl.hasRhw &&
+                                  g_activeGpuSkin.active &&
+                                  srcData == reinterpret_cast<const uint8_t*>(g_activeGpuSkin.dynVbDataPtr) &&
+                                  stride == expectedSkinStride &&
+                                  baseVertexIndex == g_activeGpuSkin.outBaseVert &&
+                                  g_activeGpuSkin.srcMeshVerts != nullptr &&
+                                  g_activeGpuSkin.numBones > 0u;
+    const uint32_t vertexBlendMode = (!decl.hasRhw && !useActiveGpuSkin) ? xboxRS[XBOX_D3DRS_VERTEXBLEND] : 0u;
+
+    uint32_t skinTotalWeights = 0u;
+    uint32_t skinStreamFloats = 0u;
+    bool     skinHasComplement = false;
+    if (useActiveGpuSkin) {
+        skinTotalWeights = 3u;
+        g_drawBoneCount  = (g_activeGpuSkin.numBones <= 256u) ? g_activeGpuSkin.numBones : 256u;
+        memcpy(g_drawBonePalette.boneRows, g_activeGpuSkin.boneRows, g_drawBoneCount * 3u * sizeof(float) * 4u);
+        g_drawSkinIgnoreWorld = true;
+    } else if (vertexBlendMode >= 1u && vertexBlendMode <= 6u && (decl.hasBlendWeight || decl.hasBlendIndices)) {
+        switch (vertexBlendMode) {
+            case 1u: skinStreamFloats = 1u; skinTotalWeights = 2u; skinHasComplement = true;  break; // D3DVBF_1WEIGHTS
+            case 2u: skinStreamFloats = 2u; skinTotalWeights = 2u; skinHasComplement = false; break; // D3DVBF_2WEIGHTS2
+            case 3u: skinStreamFloats = 2u; skinTotalWeights = 3u; skinHasComplement = true;  break; // D3DVBF_2WEIGHTS
+            case 4u: skinStreamFloats = 3u; skinTotalWeights = 3u; skinHasComplement = false; break; // D3DVBF_3WEIGHTS3
+            case 5u: skinStreamFloats = 3u; skinTotalWeights = 4u; skinHasComplement = true;  break; // D3DVBF_3WEIGHTS
+            case 6u: skinStreamFloats = 4u; skinTotalWeights = 4u; skinHasComplement = false; break; // D3DVBF_4WEIGHTS4
+            default: break;
+        }
+        g_drawBoneCount = 4u;
+        const Mat44* worldMats = reinterpret_cast<const Mat44*>(ADDR_D3D_DEVICE + 0xC60 + 6 * 64); // D3DTS_WORLD0..3
+        for (uint32_t b = 0; b < 4u; ++b) {
+            const Mat44& wm = worldMats[b];
+            g_drawBonePalette.boneRows[b * 3u + 0u][0] = wm.m[0][0];
+            g_drawBonePalette.boneRows[b * 3u + 0u][1] = wm.m[1][0];
+            g_drawBonePalette.boneRows[b * 3u + 0u][2] = wm.m[2][0];
+            g_drawBonePalette.boneRows[b * 3u + 0u][3] = wm.m[3][0];
+            g_drawBonePalette.boneRows[b * 3u + 1u][0] = wm.m[0][1];
+            g_drawBonePalette.boneRows[b * 3u + 1u][1] = wm.m[1][1];
+            g_drawBonePalette.boneRows[b * 3u + 1u][2] = wm.m[2][1];
+            g_drawBonePalette.boneRows[b * 3u + 1u][3] = wm.m[3][1];
+            g_drawBonePalette.boneRows[b * 3u + 2u][0] = wm.m[0][2];
+            g_drawBonePalette.boneRows[b * 3u + 2u][1] = wm.m[1][2];
+            g_drawBonePalette.boneRows[b * 3u + 2u][2] = wm.m[2][2];
+            g_drawBonePalette.boneRows[b * 3u + 2u][3] = wm.m[3][2];
+        }
+        g_drawSkinIgnoreWorld = true;
+    }
+
+    bool anyStageHasCamTci = false;
+    if (!decl.hasRhw) {
+        for (uint32_t s = 0; s < 4u; ++s) {
+            if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_TEXCOORDINDEX] & 0xFFFF0000u) != 0u) {
+                anyStageHasCamTci = true;
+                break;
+            }
+        }
+    }
+    float pointSizeCheck = 1.0f;
+    memcpy(&pointSizeCheck, &xboxRS[XBOX_D3DRS_POINTSIZE], 4);
+    const bool cpuExpandedPoints = (xboxPrim == 1u) &&
+        (pointSizeCheck > 1.0f || xboxRS[XBOX_D3DRS_POINTSPRITEENABLE] != 0u || xboxRS[XBOX_D3DRS_POINTSCALEENABLE] != 0u);
+    const bool cpuSkinFallback = (skinTotalWeights > 0u) && (anyStageHasCamTci || needCpuWorldTransform || cpuExpandedPoints);
+    if (skinTotalWeights > 0u && !cpuSkinFallback) {
+        g_drawSkinWeightCount = skinTotalWeights;
+    }
+    if (g_drawSkinIgnoreWorld) {
+        worldView = g_matView;
+    }
+
     const uint8_t* pActiveCam = *reinterpret_cast<const uint8_t* const*>(ADDR_ACTIVE_CAMERA_PTR);
     const float*   camPosWorld = pActiveCam ? reinterpret_cast<const float*>(pActiveCam + 0x30) : reinterpret_cast<const float*>(0x008ACC38);
     float nonLocalVx = -g_matView.m[0][2], nonLocalVy = -g_matView.m[1][2], nonLocalVz = -g_matView.m[2][2];
@@ -376,11 +1016,15 @@ static void DecodeVerticesToUnified(
             postTnLTag[slot]    = rawIdx;
             postTnLOutIdx[slot] = i;
         }
-        uint32_t vIdx = optIndices ? ((uint32_t)optIndices[i] + baseVertexIndex) : (i + baseVertexIndex);
+        uint32_t localVertIdx = optIndices ? static_cast<uint32_t>(optIndices[i]) : i;
+        uint32_t vIdx = localVertIdx + baseVertexIndex;
         const uint8_t* vPtr = srcData + vIdx * stride;
         UnifiedVertex& dst = outVerts[i];
-        dst.w0 = 0.0f; dst.w1 = 0.0f; dst.w2 = 0.0f; dst.w3 = 0.0f;
-        dst.sr = 0.0f; dst.sg = 0.0f; dst.sb = 0.0f; dst.sa = 1.0f;
+        dst.w0  = 0.0f; dst.w1  = 0.0f; dst.w2  = 0.0f; dst.w3  = 0.0f;
+        dst.sr  = 0.0f; dst.sg  = 0.0f; dst.sb  = 0.0f; dst.sa  = 1.0f;
+        dst.bw0 = 0.0f; dst.bw1 = 0.0f; dst.bw2 = 0.0f; dst.bw3 = 0.0f;
+        dst.bi0 = 0u;   dst.bi1 = 0u;   dst.bi2 = 0u;   dst.bi3 = 0u;
+        dst.q0  = 1.0f; dst.q1  = 1.0f; dst.q2  = 1.0f; dst.q3  = 1.0f;
 
         if (decl.hasPos) {
             const float* p = reinterpret_cast<const float*>(vPtr + decl.offPos);
@@ -402,18 +1046,88 @@ static void DecodeVerticesToUnified(
             dst.nx = 0.0f; dst.ny = 1.0f; dst.nz = 0.0f;
         }
 
+        if (skinTotalWeights > 0u) {
+            float    bw[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            uint32_t bi[4] = { 0u, 1u, 2u, 3u };
+            if (useActiveGpuSkin) {
+                uint32_t mIdx = (localVertIdx < g_activeGpuSkin.numVerts) ? localVertIdx : 0u;
+                const uint8_t* sVert = g_activeGpuSkin.srcMeshVerts + mIdx * g_activeGpuSkin.srcStride;
+                const float* sf = reinterpret_cast<const float*>(sVert);
+                bw[0] = sf[8]; bw[1] = sf[9]; bw[2] = sf[10];
+                bi[0] = sVert[0x2C]; bi[1] = sVert[0x2D]; bi[2] = sVert[0x2E];
+            } else {
+                uint32_t availW = decl.hasBlendWeight ? decl.numBlendWeights : 0u;
+                if (availW > skinStreamFloats) availW = skinStreamFloats;
+                float sumW = 0.0f;
+                if (decl.hasBlendWeight) {
+                    const float* wf = reinterpret_cast<const float*>(vPtr + decl.offBlendWeight);
+                    for (uint32_t w = 0; w < availW; ++w) {
+                        bw[w] = wf[w];
+                        sumW += wf[w];
+                    }
+                }
+                if (skinHasComplement && skinStreamFloats < 4u) {
+                    bw[skinStreamFloats] = (decl.hasBlendWeight) ? (1.0f - sumW) : 1.0f;
+                } else if (!decl.hasBlendWeight) {
+                    bw[0] = 1.0f;
+                }
+                if (decl.hasBlendIndices) {
+                    const uint8_t* idxBytes = vPtr + decl.offBlendIndices;
+                    bi[0] = idxBytes[0] & 3u;
+                    bi[1] = idxBytes[1] & 3u;
+                    bi[2] = idxBytes[2] & 3u;
+                    bi[3] = idxBytes[3] & 3u;
+                }
+            }
+
+            if (cpuSkinFallback) {
+                float spx = 0.0f, spy = 0.0f, spz = 0.0f;
+                float snx = 0.0f, sny = 0.0f, snz = 0.0f;
+                for (uint32_t wi = 0; wi < skinTotalWeights; ++wi) {
+                    float w = bw[wi];
+                    uint32_t rBase = ((bi[wi] < g_drawBoneCount) ? bi[wi] : 0u) * 3u;
+                    const float* r0 = g_drawBonePalette.boneRows[rBase + 0u];
+                    const float* r1 = g_drawBonePalette.boneRows[rBase + 1u];
+                    const float* r2 = g_drawBonePalette.boneRows[rBase + 2u];
+                    spx += w * (dst.x * r0[0] + dst.y * r0[1] + dst.z * r0[2] + r0[3]);
+                    spy += w * (dst.x * r1[0] + dst.y * r1[1] + dst.z * r1[2] + r1[3]);
+                    spz += w * (dst.x * r2[0] + dst.y * r2[1] + dst.z * r2[2] + r2[3]);
+                    snx += w * (dst.nx * r0[0] + dst.ny * r0[1] + dst.nz * r0[2]);
+                    sny += w * (dst.nx * r1[0] + dst.ny * r1[1] + dst.nz * r1[2]);
+                    snz += w * (dst.nx * r2[0] + dst.ny * r2[1] + dst.nz * r2[2]);
+                }
+                dst.x  = spx; dst.y  = spy; dst.z  = spz;
+                dst.nx = snx; dst.ny = sny; dst.nz = snz;
+                if (normalizeNormals && decl.hasNorm) {
+                    float nLen = sqrtf(dst.nx * dst.nx + dst.ny * dst.ny + dst.nz * dst.nz);
+                    if (nLen > 0.0001f) { dst.nx /= nLen; dst.ny /= nLen; dst.nz /= nLen; }
+                }
+            } else {
+                dst.bw0 = bw[0]; dst.bw1 = bw[1]; dst.bw2 = bw[2]; dst.bw3 = bw[3];
+                dst.bi0 = bi[0]; dst.bi1 = bi[1]; dst.bi2 = bi[2]; dst.bi3 = bi[3];
+            }
+        }
+
         float wx = 0.0f, wy = 1.0f, wz = 0.0f;
         float wpx = dst.x, wpy = dst.y, wpz = dst.z;
         if (needCpuWorldTransform) {
-            wpx = dst.x * g_matWorld.m[0][0] + dst.y * g_matWorld.m[1][0] + dst.z * g_matWorld.m[2][0] + g_matWorld.m[3][0];
-            wpy = dst.x * g_matWorld.m[0][1] + dst.y * g_matWorld.m[1][1] + dst.z * g_matWorld.m[2][1] + g_matWorld.m[3][1];
-            wpz = dst.x * g_matWorld.m[0][2] + dst.y * g_matWorld.m[1][2] + dst.z * g_matWorld.m[2][2] + g_matWorld.m[3][2];
-            if (decl.hasNorm) {
-                wx = dst.nx * g_matWorld.m[0][0] + dst.ny * g_matWorld.m[1][0] + dst.nz * g_matWorld.m[2][0];
-                wy = dst.nx * g_matWorld.m[0][1] + dst.ny * g_matWorld.m[1][1] + dst.nz * g_matWorld.m[2][1];
-                wz = dst.nx * g_matWorld.m[0][2] + dst.ny * g_matWorld.m[1][2] + dst.nz * g_matWorld.m[2][2];
-                float len = sqrtf(wx * wx + wy * wy + wz * wz);
-                if (len > 0.0001f) { wx /= len; wy /= len; wz /= len; }
+            if (g_drawSkinIgnoreWorld) {
+                if (decl.hasNorm) {
+                    wx = dst.nx; wy = dst.ny; wz = dst.nz;
+                    float len = sqrtf(wx * wx + wy * wy + wz * wz);
+                    if (len > 0.0001f) { wx /= len; wy /= len; wz /= len; }
+                }
+            } else {
+                wpx = dst.x * g_matWorld.m[0][0] + dst.y * g_matWorld.m[1][0] + dst.z * g_matWorld.m[2][0] + g_matWorld.m[3][0];
+                wpy = dst.x * g_matWorld.m[0][1] + dst.y * g_matWorld.m[1][1] + dst.z * g_matWorld.m[2][1] + g_matWorld.m[3][1];
+                wpz = dst.x * g_matWorld.m[0][2] + dst.y * g_matWorld.m[1][2] + dst.z * g_matWorld.m[2][2] + g_matWorld.m[3][2];
+                if (decl.hasNorm) {
+                    wx = dst.nx * g_matWorld.m[0][0] + dst.ny * g_matWorld.m[1][0] + dst.nz * g_matWorld.m[2][0];
+                    wy = dst.nx * g_matWorld.m[0][1] + dst.ny * g_matWorld.m[1][1] + dst.nz * g_matWorld.m[2][1];
+                    wz = dst.nx * g_matWorld.m[0][2] + dst.ny * g_matWorld.m[1][2] + dst.nz * g_matWorld.m[2][2];
+                    float len = sqrtf(wx * wx + wy * wy + wz * wz);
+                    if (len > 0.0001f) { wx /= len; wy /= len; wz /= len; }
+                }
             }
         }
 
@@ -610,10 +1324,11 @@ static void DecodeVerticesToUnified(
             dst.a = hasColor1 ? c1A : 1.0f;
         }
 
-        // Read raw UVW0..3 from vertex stream
+        // Read raw UVWQ0..3 from vertex stream
         float rawU[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         float rawV[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         float rawW[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float rawQ[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         bool  has3DUv[4] = { false, false, false, false };
         if (decl.hasUv0) {
             const float* uv = reinterpret_cast<const float*>(vPtr + decl.offUv0);
@@ -621,6 +1336,7 @@ static void DecodeVerticesToUnified(
             rawU[0] = uv[0];
             rawV[0] = (d >= 2u) ? uv[1] : 0.0f;
             rawW[0] = (d >= 3u) ? uv[2] : 0.0f;
+            rawQ[0] = (d >= 4u) ? uv[3] : 1.0f;
             has3DUv[0] = (d >= 3u);
         }
         if (decl.hasUv1) {
@@ -629,9 +1345,10 @@ static void DecodeVerticesToUnified(
             rawU[1] = uv[0];
             rawV[1] = (d >= 2u) ? uv[1] : 0.0f;
             rawW[1] = (d >= 3u) ? uv[2] : 0.0f;
+            rawQ[1] = (d >= 4u) ? uv[3] : 1.0f;
             has3DUv[1] = (d >= 3u);
         } else {
-            rawU[1] = rawU[0]; rawV[1] = rawV[0]; rawW[1] = rawW[0]; has3DUv[1] = has3DUv[0];
+            rawU[1] = rawU[0]; rawV[1] = rawV[0]; rawW[1] = rawW[0]; rawQ[1] = rawQ[0]; has3DUv[1] = has3DUv[0];
         }
         if (decl.hasUv2) {
             const float* uv = reinterpret_cast<const float*>(vPtr + decl.offUv2);
@@ -639,9 +1356,10 @@ static void DecodeVerticesToUnified(
             rawU[2] = uv[0];
             rawV[2] = (d >= 2u) ? uv[1] : 0.0f;
             rawW[2] = (d >= 3u) ? uv[2] : 0.0f;
+            rawQ[2] = (d >= 4u) ? uv[3] : 1.0f;
             has3DUv[2] = (d >= 3u);
         } else {
-            rawU[2] = rawU[0]; rawV[2] = rawV[0]; rawW[2] = rawW[0]; has3DUv[2] = has3DUv[0];
+            rawU[2] = rawU[0]; rawV[2] = rawV[0]; rawW[2] = rawW[0]; rawQ[2] = rawQ[0]; has3DUv[2] = has3DUv[0];
         }
         if (decl.hasUv3) {
             const float* uv = reinterpret_cast<const float*>(vPtr + decl.offUv3);
@@ -649,9 +1367,10 @@ static void DecodeVerticesToUnified(
             rawU[3] = uv[0];
             rawV[3] = (d >= 2u) ? uv[1] : 0.0f;
             rawW[3] = (d >= 3u) ? uv[2] : 0.0f;
+            rawQ[3] = (d >= 4u) ? uv[3] : 1.0f;
             has3DUv[3] = (d >= 3u);
         } else {
-            rawU[3] = rawU[0]; rawV[3] = rawV[0]; rawW[3] = rawW[0]; has3DUv[3] = has3DUv[0];
+            rawU[3] = rawU[0]; rawV[3] = rawV[0]; rawW[3] = rawW[0]; rawQ[3] = rawQ[0]; has3DUv[3] = has3DUv[0];
         }
 
         // Standard 4-stage UV routing: D3DTSS_TEXCOORDINDEX (xboxTSS[s*32 + 28]) & D3DTSS_TEXTURETRANSFORMFLAGS (xboxTSS[s*32 + 21])
@@ -669,7 +1388,7 @@ static void DecodeVerticesToUnified(
             }
         }
 
-        float finalU[4], finalV[4], finalW[4];
+        float finalU[4], finalV[4], finalW[4], finalQ[4];
         for (uint32_t s = 0; s < 4; ++s) {
             uint32_t tci = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_TEXCOORDINDEX];
             uint32_t ttf = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_TEXTURETRANSFORMFLAGS];
@@ -679,9 +1398,11 @@ static void DecodeVerticesToUnified(
             float tu = rawU[srcIdx];
             float tv = rawV[srcIdx];
             float tw = has3DUv[srcIdx] ? rawW[srcIdx] : 1.0f;
+            float tq = rawQ[srcIdx];
             bool  is3DCoord = has3DUv[srcIdx];
 
             if (!decl.hasRhw && genMode != 0) {
+                tq = 1.0f;
                 if (!camComputed) {
                     camNx = dst.nx * worldView.m[0][0] + dst.ny * worldView.m[1][0] + dst.nz * worldView.m[2][0];
                     camNy = dst.nx * worldView.m[0][1] + dst.ny * worldView.m[1][1] + dst.nz * worldView.m[2][1];
@@ -721,22 +1442,23 @@ static void DecodeVerticesToUnified(
                 const Mat44& tm = texMats[s];
                 float inZ = is3DCoord ? tw : 1.0f;
                 // Direction vectors (normal / reflection vector) must not include translation row m[3][0..2]
-                float inW = ((genMode & kXboxTciDirectionMask) != 0u) ? 0.0f : 1.0f;
+                float inW = ((genMode & kXboxTciDirectionMask) != 0u) ? 0.0f : ((dimCount == 4u && genMode == 0u) ? tq : 1.0f);
                 float outU = tu * tm.m[0][0] + tv * tm.m[1][0] + inZ * tm.m[2][0] + inW * tm.m[3][0];
                 float outV = tu * tm.m[0][1] + tv * tm.m[1][1] + inZ * tm.m[2][1] + inW * tm.m[3][1];
                 float outZ = tu * tm.m[0][2] + tv * tm.m[1][2] + inZ * tm.m[2][2] + inW * tm.m[3][2];
                 float outW = tu * tm.m[0][3] + tv * tm.m[1][3] + inZ * tm.m[2][3] + inW * tm.m[3][3];
-                if ((ttf & kXboxTtffProjectedFlag) != 0u) { // D3DTTFF_PROJECTED (per-pixel division in PSMain)
+                if ((ttf & kXboxTtffProjectedFlag) != 0u) { // D3DTTFF_PROJECTED (per-stage Q in TEXCOORD5)
                     float denom = (dimCount == 3u) ? outZ : outW;
                     tu = outU;
                     tv = outV;
                     tw = outZ;
-                    dst.w = (fabsf(denom) > 0.0001f) ? denom : 1.0f;
+                    tq = (fabsf(denom) > 1e-6f) ? denom : 1.0f;
                     g_lastProjMask |= (1u << s);
                 } else if (stageNeeds3D[s]) {
                     tu = outU;
                     tv = outV;
                     tw = outZ;
+                    tq = outW;
                 } else if (is3DCoord && genMode != 0u) {
                     // Non-projected 3D reflection/normal vector mapped onto a 2D texture:
                     float rLen = sqrtf(outU * outU + outV * outV + outZ * outZ);
@@ -748,39 +1470,593 @@ static void DecodeVerticesToUnified(
                     tu = outU * 0.5f + 0.5f;
                     tv = 0.5f - outV * 0.5f;
                     tw = outZ;
+                    tq = 1.0f;
                 } else {
                     tu = outU;
                     tv = outV;
                     tw = outZ;
+                    tq = outW;
                 }
-            } else if (stageNeeds3D[s]) {
-                if (!is3DCoord) {
-                    tu = tu * 2.0f - 1.0f;
-                    tv = 1.0f - tv * 2.0f;
-                    tw = 1.0f;
+            } else {
+                if ((ttf & kXboxTtffProjectedFlag) != 0u) {
+                    tq = (fabsf(tq) > 1e-6f) ? tq : 1.0f;
+                    g_lastProjMask |= (1u << s);
+                } else if (stageNeeds3D[s]) {
+                    if (!is3DCoord) {
+                        tu = tu * 2.0f - 1.0f;
+                        tv = 1.0f - tv * 2.0f;
+                        tw = 1.0f;
+                    }
+                } else if (is3DCoord && genMode != 0u) {
+                    tu = tu * 0.5f + 0.5f;
+                    tv = 0.5f - tv * 0.5f;
                 }
-            } else if (is3DCoord && genMode != 0u) {
-                tu = tu * 0.5f + 0.5f;
-                tv = 0.5f - tv * 0.5f;
             }
 
             finalU[s] = tu;
             finalV[s] = tv;
             finalW[s] = tw;
+            finalQ[s] = tq;
         }
 
-        dst.u0 = finalU[0]; dst.v0 = finalV[0]; dst.w0 = finalW[0];
-        dst.u1 = finalU[1]; dst.v1 = finalV[1]; dst.w1 = finalW[1];
-        dst.u2 = finalU[2]; dst.v2 = finalV[2]; dst.w2 = finalW[2];
-        dst.u3 = finalU[3]; dst.v3 = finalV[3]; dst.w3 = finalW[3];
+        dst.u0 = finalU[0]; dst.v0 = finalV[0]; dst.w0 = finalW[0]; dst.q0 = finalQ[0];
+        dst.u1 = finalU[1]; dst.v1 = finalV[1]; dst.w1 = finalW[1]; dst.q1 = finalQ[1];
+        dst.u2 = finalU[2]; dst.v2 = finalV[2]; dst.w2 = finalW[2]; dst.q2 = finalQ[2];
+        dst.u3 = finalU[3]; dst.v3 = finalV[3]; dst.w3 = finalW[3]; dst.q3 = finalQ[3];
+    }
+}
+
+static ID3D11PixelShader* PopulateCommonPerDrawCB(
+    PerDrawCBData& cb,
+    const Mat44& effectiveWorld,
+    bool isRhw,
+    bool isXvuDraw,
+    bool writesOFog,
+    uint32_t initialProjMask,
+    float vpX, float vpY, float vpW, float vpH,
+    ID3D11ShaderResourceView* outSrvs[13],
+    bool* outHwScissor)
+{
+    const uint32_t* xboxRS  = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
+    const uint32_t* xboxTSS = reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE);
+
+    // [P0-1] Resolve active pixel shader & per-stage texture-sampling mask BEFORE calling
+    // GetOrCreateD3D11SRV so disabled TSS stages or non-sampling NV2A PS_TEXTUREMODES
+    // (NONE, PASSTHRU, CLIPPLANE, DOT_ZW, DOTPRODUCT) never trigger spurious full-screen
+    // CopyResource(g_backBufferCopyTex, g_backBufferTex) from stale mainBB0 bindings.
+    bool hasProgPs = false;
+    ID3D11PixelShader* progPs = GetActiveProgramPixelShader(&hasProgPs);
+    const bool useProgPs      = (hasProgPs && progPs != nullptr);
+    const uint32_t psTexModes = xboxRS[XBOX_D3DRS_PSTEXTUREMODES];
+
+    auto progModeSamplesTexture = [](uint32_t mode) -> bool {
+        return mode != 0x00u && // PS_TEXTUREMODES_NONE
+               mode != 0x04u && // PS_TEXTUREMODES_PASSTHRU
+               mode != 0x05u && // PS_TEXTUREMODES_CLIPPLANE
+               mode != 0x0Au && // PS_TEXTUREMODES_DOT_ZW
+               mode != 0x11u;   // PS_TEXTUREMODES_DOTPRODUCT
+    };
+
+    auto ffOpReferencesStageTex = [](uint32_t op, uint32_t a1, uint32_t a2, uint32_t a0) -> bool {
+        if (op <= 1u) return false;
+        if (op == 25u || op == 26u || op == 14u || op == 16u) return true;
+        if (op == 2u) return (a1 & 0x0Fu) == 2u;
+        if (op == 3u) return (a2 & 0x0Fu) == 2u;
+        if ((a1 & 0x0Fu) == 2u || (a2 & 0x0Fu) == 2u) return true;
+        if ((op == 23u || op == 24u) && (a0 & 0x0Fu) == 2u) return true;
+        return false;
+    };
+
+    bool stageShouldSample[4] = { false, false, false, false };
+    bool ffCascadePre = true;
+    bool prevBumpEnv  = false;
+    for (int s = 0; s < 4; ++s) {
+        if (useProgPs) {
+            uint32_t mode = (psTexModes >> (s * 5)) & 0x1Fu;
+            stageShouldSample[s] = progModeSamplesTexture(mode);
+        } else {
+            uint32_t cOp = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
+            if (cOp <= 1u) {
+                ffCascadePre = false;
+            }
+            if (ffCascadePre) {
+                uint32_t cA1 = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG1];
+                uint32_t cA2 = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG2];
+                uint32_t cA0 = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG0];
+                uint32_t aOp = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAOP];
+                uint32_t aA1 = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG1];
+                uint32_t aA2 = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG2];
+                uint32_t aA0 = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
+                bool alphaKill = (xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u;
+                bool usesTex = prevBumpEnv || alphaKill ||
+                               ffOpReferencesStageTex(cOp, cA1, cA2, cA0) ||
+                               (cOp != 22u && ffOpReferencesStageTex(aOp, aA1, aA2, aA0));
+                stageShouldSample[s] = usesTex;
+                prevBumpEnv = (cOp == 25u || cOp == 26u);
+            } else {
+                prevBumpEnv = false;
+            }
+        }
+    }
+
+    float uScale[4]  = { 1.0f, 1.0f, 1.0f, 1.0f };
+    float vScale[4]  = { 1.0f, 1.0f, 1.0f, 1.0f };
+    bool  isCube[4]  = { false, false, false, false };
+    bool  isVol[4]   = { false, false, false, false };
+    bool  isDepth[4] = { false, false, false, false };
+    ID3D11ShaderResourceView* stageSrvs[4] = { nullptr, nullptr, nullptr, nullptr };
+    for (int s = 0; s < 4; ++s) {
+        if (stageShouldSample[s] && g_boundTextures[s] != nullptr) {
+            stageSrvs[s] = GetOrCreateD3D11SRV(
+                g_boundTextures[s], &uScale[s], &vScale[s], &isCube[s], &isVol[s], &isDepth[s]);
+        }
+    }
+    memset(outSrvs, 0, sizeof(ID3D11ShaderResourceView*) * 13);
+    for (int s = 0; s < 4; ++s) {
+        if (!stageSrvs[s]) continue;
+        if (isCube[s])     outSrvs[4 + s] = stageSrvs[s];
+        else if (isVol[s]) outSrvs[8 + s] = stageSrvs[s];
+        else               outSrvs[0 + s] = stageSrvs[s];
+    }
+    outSrvs[12] = g_gammaLutSRV;
+
+    Mat44 wvp = MulMat44(MulMat44(effectiveWorld, g_matView), g_matProj);
+    for (int i = 0; i < 4; ++i) {
+        cb.wvpRow0[i] = wvp.m[0][i];
+        cb.wvpRow1[i] = wvp.m[1][i];
+        cb.wvpRow2[i] = wvp.m[2][i];
+        cb.wvpRow3[i] = wvp.m[3][i];
+    }
+    cb.viewport[0] = vpX;
+    cb.viewport[1] = vpY;
+    cb.viewport[2] = vpW;
+    cb.viewport[3] = vpH;
+
+    UnpackD3DColor(xboxRS[XBOX_D3DRS_TEXTUREFACTOR], &cb.tfactor[0], &cb.tfactor[1], &cb.tfactor[2], &cb.tfactor[3]);
+
+    bool           ffCascadeActive   = true;
+    uint32_t*      stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
+    uint32_t*      stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
+    uint32_t       texMask           = 0;
+    uint32_t       cubeMask          = 0;
+    uint32_t       volMask           = 0;
+    uint32_t       projMask          = initialProjMask & 0x0Fu;
+    uint32_t       alphaKillMask     = 0;
+    uint32_t       tempResultMask    = 0;
+    uint32_t       depthSrvMask      = 0;
+    for (int s = 0; s < 4; ++s) {
+        stageOpsPtrs[s][0]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
+        stageOpsPtrs[s][1]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG1];
+        stageOpsPtrs[s][2]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG2];
+        stageOpsPtrs[s][3]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG0];
+        stageAlphaPtrs[s][0] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAOP];
+        stageAlphaPtrs[s][1] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG1];
+        stageAlphaPtrs[s][2] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG2];
+        stageAlphaPtrs[s][3] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
+
+        if (!useProgPs && stageOpsPtrs[s][0] <= 1u) {
+            ffCascadeActive = false;
+        }
+        const uint32_t stagePsMode    = (psTexModes >> (s * 5)) & 0x1Fu;
+        const bool     stageEnabled   = useProgPs ? progModeSamplesTexture(stagePsMode) : (ffCascadeActive && stageShouldSample[s]);
+        const bool     stageTexActive = (stageSrvs[s] != nullptr) && stageEnabled;
+        if (stageTexActive) {
+            texMask |= (1u << s);
+            if (isCube[s])  cubeMask     |= (1u << s);
+            if (isVol[s])   volMask      |= (1u << s);
+            if (isDepth[s]) depthSrvMask |= (1u << s);
+            if (useProgPs) {
+                if (stagePsMode == 1u || stagePsMode == 2u) {
+                    projMask |= (1u << s);
+                }
+            } else if (isXvuDraw && ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_TEXTURETRANSFORMFLAGS] & 0x0100u) != 0u)) {
+                projMask |= (1u << s);
+            }
+            if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u) {
+                alphaKillMask |= (1u << s);
+            }
+        }
+        uint32_t resArg = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_RESULTARG] & 0x0Fu;
+        if (resArg == 0x05u || resArg == 0x0Du) { // D3DTA_TEMP
+            tempResultMask |= (1u << s);
+        }
+        cb.stageColorKeyOp[s] = stageTexActive ? (xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYOP] & 0x03u) : 0u;
+        UnpackD3DColor(
+            xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYCOLOR],
+            &cb.stageColorKeyColor[s][0], &cb.stageColorKeyColor[s][1],
+            &cb.stageColorKeyColor[s][2], &cb.stageColorKeyColor[s][3]);
+
+        uint32_t rawCs  = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORSIGN];
+        uint32_t normCs = (rawCs & 0xF0u) | ((rawCs >> 24) & 0xF0u);
+        if (g_boundTextures[s]) {
+            uint32_t xboxFmt = (g_boundTextures[s]->Format >> 8) & 0xFFu;
+            if (IsXboxSignedBumpFormat(xboxFmt)) {
+                normCs |= 0x60u;
+            }
+        }
+        cb.stageColorSign[s] = normCs;
+
+        memcpy(&cb.stageBumpMat[s][0], &xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT00],   4);
+        memcpy(&cb.stageBumpMat[s][1], &xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT01],   4);
+        memcpy(&cb.stageBumpMat[s][2], &xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT10],   4);
+        memcpy(&cb.stageBumpMat[s][3], &xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT11],   4);
+        memcpy(&cb.stageBumpLum[s][0], &xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLSCALE],  4);
+        memcpy(&cb.stageBumpLum[s][1], &xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLOFFSET], 4);
+    }
+
+    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
+    if (outHwScissor) *outHwScissor = hwScissor;
+    uint32_t scCount = (g_scissorEnabled && !hwScissor) ? g_scissorCount : 0u;
+    if (scCount > 8u) scCount = 8u;
+    for (uint32_t si = 0; si < scCount; ++si) {
+        cb.scissorRects[si][0] = static_cast<float>(g_scissorRects[si].left);
+        cb.scissorRects[si][1] = static_cast<float>(g_scissorRects[si].top);
+        cb.scissorRects[si][2] = static_cast<float>(g_scissorRects[si].right);
+        cb.scissorRects[si][3] = static_cast<float>(g_scissorRects[si].bottom);
+    }
+
+    cb.flags[0] = (isRhw ? 1u : 0u)
+                | (g_hasGammaRamp ? 2u : 0u)
+                | ((g_scissorEnabled && g_scissorExclusive) ? 4u : 0u)
+                | ((!isRhw && xboxRS[XBOX_D3DRS_SPECULARENABLE] != 0u) ? 8u : 0u)
+                | ((scCount & 0x0Fu) << 4);
+    cb.flags[1] = texMask
+                | (cubeMask << 4)
+                | ((projMask & 0x0Fu) << 8)
+                | (volMask << 12)
+                | (alphaKillMask << 16)
+                | (tempResultMask << 20)
+                | (depthSrvMask << 24);
+    cb.flags[2] = xboxRS[XBOX_D3DRS_ALPHATESTENABLE] ? 1u : 0u;
+    cb.flags[3] = useProgPs ? 1u : 0u;
+
+    cb.alphaTest[0] = static_cast<float>(MapXboxCmpFuncInt(xboxRS[XBOX_D3DRS_ALPHAFUNC]));
+    cb.alphaTest[1] = static_cast<float>(xboxRS[XBOX_D3DRS_ALPHAREF] & 0xFFu) * (1.0f / 255.0f);
+    cb.alphaTest[2] = g_gamma;
+    cb.alphaTest[3] = g_brightness;
+
+    cb.uvScale01[0] = uScale[0]; cb.uvScale01[1] = vScale[0];
+    cb.uvScale01[2] = uScale[1]; cb.uvScale01[3] = vScale[1];
+    cb.uvScale23[0] = uScale[2]; cb.uvScale23[1] = vScale[2];
+    cb.uvScale23[2] = uScale[3]; cb.uvScale23[3] = vScale[3];
+    cb.screenSpaceParams[0] = g_screenSpaceOffsetX;
+    cb.screenSpaceParams[1] = g_screenSpaceOffsetY;
+    cb.screenSpaceParams[2] = GetXboxDeviceZScale();
+    cb.screenSpaceParams[3] = 0.0f;
+
+    const bool useStage1Bump = (cb.stageBumpMat[1][0] != 0.0f || cb.stageBumpMat[1][1] != 0.0f ||
+                                cb.stageBumpMat[1][2] != 0.0f || cb.stageBumpMat[1][3] != 0.0f);
+    const uint32_t bumpStage0 = useStage1Bump ? 1u : 0u;
+    memcpy(&cb.bumpParams[0], cb.stageBumpMat[bumpStage0], 16);
+    if (cb.bumpParams[0] == 0.0f && cb.bumpParams[1] == 0.0f && cb.bumpParams[2] == 0.0f && cb.bumpParams[3] == 0.0f) {
+        cb.bumpParams[0] = 0.04f;
+        cb.bumpParams[3] = 0.04f;
+    }
+    cb.bumpLuminance[0] = cb.stageBumpLum[bumpStage0][0];
+    cb.bumpLuminance[1] = cb.stageBumpLum[bumpStage0][1];
+    cb.bumpLuminance[2] = cb.stageBumpLum[2][0];
+    cb.bumpLuminance[3] = cb.stageBumpLum[2][1];
+
+    if (xboxRS[XBOX_D3DRS_FOGENABLE] != 0 && !isRhw) {
+        uint32_t fogMode = xboxRS[XBOX_D3DRS_FOGTABLEMODE];
+        if (fogMode == 0) {
+            fogMode = (isXvuDraw && writesOFog) ? 4u : 3u;
+        }
+        cb.fogParams[0] = static_cast<float>(fogMode);
+        memcpy(&cb.fogParams[1], &xboxRS[XBOX_D3DRS_FOGSTART], 4);
+        memcpy(&cb.fogParams[2], &xboxRS[XBOX_D3DRS_FOGEND], 4);
+        memcpy(&cb.fogParams[3], &xboxRS[XBOX_D3DRS_FOGDENSITY], 4);
+        float fA = 1.0f;
+        UnpackD3DColor(xboxRS[XBOX_D3DRS_FOGCOLOR], &cb.fogColor[0], &cb.fogColor[1], &cb.fogColor[2], &fA);
+        bool isAddBlend = (xboxRS[XBOX_D3DRS_ALPHABLENDENABLE] != 0) &&
+                          (xboxRS[XBOX_D3DRS_DESTBLEND] == 1 || xboxRS[XBOX_D3DRS_DESTBLEND] == 0x302);
+        cb.fogColor[3] = isAddBlend ? 1.0f : 0.0f;
+    }
+
+    memcpy(cb.psConst0, g_psConstants[0], 16);
+    memcpy(cb.psConst1, g_psConstants[1], 16);
+    memcpy(cb.psConst2, g_psConstants[2], 16);
+    memcpy(cb.psConst3, g_psConstants[3], 16);
+    memcpy(cb.psConst4, g_psConstants[4], 16);
+    memcpy(cb.psConst5, g_psConstants[5], 16);
+    memcpy(cb.psConst6, g_psConstants[6], 16);
+    memcpy(cb.psConst7, g_psConstants[7], 16);
+    memcpy(cb.psEyeDir, g_psEyeDir, 16);
+
+    if (g_currentPsHandle != 0u) {
+        memcpy(cb.psStageC0, g_psStageC0, sizeof(g_psStageC0));
+        memcpy(cb.psStageC1, g_psStageC1, sizeof(g_psStageC1));
+        memcpy(cb.psFcConst, g_psFcConst, sizeof(g_psFcConst));
+    } else if (useProgPs) {
+        for (int s = 0; s < 8; ++s) {
+            UnpackD3DColor(xboxRS[XBOX_D3DRS_PSCONSTANT0_0 + s], &cb.psStageC0[s][0], &cb.psStageC0[s][1], &cb.psStageC0[s][2], &cb.psStageC0[s][3]);
+            UnpackD3DColor(xboxRS[XBOX_D3DRS_PSCONSTANT1_0 + s], &cb.psStageC1[s][0], &cb.psStageC1[s][1], &cb.psStageC1[s][2], &cb.psStageC1[s][3]);
+        }
+        UnpackD3DColor(xboxRS[XBOX_D3DRS_PSFINALCOMBINERCONSTANT0], &cb.psFcConst[0][0], &cb.psFcConst[0][1], &cb.psFcConst[0][2], &cb.psFcConst[0][3]);
+        UnpackD3DColor(xboxRS[XBOX_D3DRS_PSFINALCOMBINERCONSTANT1], &cb.psFcConst[1][0], &cb.psFcConst[1][1], &cb.psFcConst[1][2], &cb.psFcConst[1][3]);
+    }
+
+    return useProgPs ? progPs : GetPixelShaderPermutation(0u);
+}
+
+static void UploadPerDrawCBIfChanged(const PerDrawCBData& cb) {
+    if (!g_d3dCtx || !g_cbPerDraw) return;
+    static PerDrawCBData s_shadowPerDrawCB    = {};
+    static ID3D11Buffer* s_shadowPerDrawBuf   = nullptr;
+    static bool          s_shadowPerDrawValid = false;
+
+    if (s_shadowPerDrawValid && s_shadowPerDrawBuf == g_cbPerDraw &&
+        memcmp(&s_shadowPerDrawCB, &cb, sizeof(PerDrawCBData)) == 0)
+    {
+        return;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
+    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
+        memcpy(mappedCB.pData, &cb, sizeof(PerDrawCBData));
+        g_d3dCtx->Unmap(g_cbPerDraw, 0);
+        memcpy(&s_shadowPerDrawCB, &cb, sizeof(PerDrawCBData));
+        s_shadowPerDrawBuf   = g_cbPerDraw;
+        s_shadowPerDrawValid = true;
+    }
+}
+
+static void UploadVsConstantsCBIfChanged() {
+    if (!g_d3dCtx || !g_cbVSConstants) return;
+    static uint32_t      s_shadowVsConsts[192 * 4] = {};
+    static ID3D11Buffer* s_shadowVsConstBuf        = nullptr;
+    static uint64_t      s_uploadedVsConstGen      = 0ULL;
+    static bool          s_shadowVsConstsValid     = false;
+
+    if (s_shadowVsConstsValid &&
+        s_shadowVsConstBuf == g_cbVSConstants &&
+        s_uploadedVsConstGen == g_vsConstantsDirtyGen)
+    {
+        return;
+    }
+
+    const void* srcConsts = reinterpret_cast<const void*>(ADDR_D3D_VS_CONSTANTS);
+    if (!s_shadowVsConstsValid ||
+        s_shadowVsConstBuf != g_cbVSConstants ||
+        memcmp(s_shadowVsConsts, srcConsts, 192u * 16u) != 0)
+    {
+        D3D11_MAPPED_SUBRESOURCE mappedVS = {};
+        if (SUCCEEDED(g_d3dCtx->Map(g_cbVSConstants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVS))) {
+            memcpy(mappedVS.pData, srcConsts, 192u * 16u);
+            g_d3dCtx->Unmap(g_cbVSConstants, 0);
+            memcpy(s_shadowVsConsts, srcConsts, 192u * 16u);
+            s_shadowVsConstBuf    = g_cbVSConstants;
+            s_shadowVsConstsValid = true;
+        } else {
+            return;
+        }
+    }
+    s_uploadedVsConstGen = g_vsConstantsDirtyGen;
+}
+
+static bool TryResolveStaticGpuVB(
+    const uint8_t* streamPtr, uint32_t stride, uint32_t minVertexReach,
+    ID3D11Buffer** outBuf, uint32_t* outByteOffset, bool* outCacheHit)
+{
+    if (outCacheHit) *outCacheHit = false;
+    if (!g_d3dDevice || !g_d3dCtx || !streamPtr || stride == 0u || !outBuf || !outByteOffset) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(streamPtr);
+    if (addr == 0u || addr > 0xFFFFFFFFu) return false;
+    if (IsEngineDynamicRingAddress(addr)) return false;
+
+    CachedStaticGpuBuffer* entry = FindStaticBufContaining(g_staticVbCache, static_cast<uint32_t>(addr));
+    if (!entry || entry->byteSize < stride) return false;
+
+    uint32_t byteOff   = static_cast<uint32_t>(addr) - entry->dataPtr;
+    uint32_t reqVerts  = (minVertexReach > 0u) ? minVertexReach : 1u;
+    uint64_t minBytes  = static_cast<uint64_t>(byteOff) + static_cast<uint64_t>(reqVerts) * static_cast<uint64_t>(stride);
+    if (minBytes > static_cast<uint64_t>(entry->byteSize)) return false;
+
+    if (entry->gpuBuf != nullptr && entry->device == g_d3dDevice && !entry->dirty) {
+        *outBuf        = entry->gpuBuf;
+        *outByteOffset = byteOff;
+        if (outCacheHit) *outCacheHit = true;
+        return true;
+    }
+
+    if (entry->gpuBuf != nullptr && entry->device != g_d3dDevice) {
+        entry->gpuBuf->Release();
+        entry->gpuBuf = nullptr;
+        InvalidateD3D11ShadowState();
+    }
+
+    if (!entry->gpuBuf) {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth      = entry->byteSize;
+        bd.Usage          = D3D11_USAGE_DEFAULT;
+        bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+        bd.CPUAccessFlags = 0u;
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem = reinterpret_cast<const void*>(entry->dataPtr);
+        if (FAILED(g_d3dDevice->CreateBuffer(&bd, &initData, &entry->gpuBuf)) || !entry->gpuBuf) {
+            return false;
+        }
+        entry->device = g_d3dDevice;
+        entry->dirty  = false;
+    } else {
+        g_d3dCtx->UpdateSubresource(
+            entry->gpuBuf, 0u, nullptr, reinterpret_cast<const void*>(entry->dataPtr), 0u, 0u);
+        entry->dirty = false;
+    }
+
+    *outBuf        = entry->gpuBuf;
+    *outByteOffset = byteOff;
+    return true;
+}
+
+static bool TryResolveStaticGpuIB(
+    const uint16_t* idxPtr, uint32_t indexCount,
+    ID3D11Buffer** outBuf, uint32_t* outStartIndex, bool* outCacheHit)
+{
+    if (outCacheHit) *outCacheHit = false;
+    if (!g_d3dDevice || !g_d3dCtx || !idxPtr || indexCount == 0u || !outBuf || !outStartIndex) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(idxPtr);
+    if (addr == 0u || addr > 0xFFFFFFFFu) return false;
+    if (IsEngineDynamicRingAddress(addr)) return false;
+
+    CachedStaticGpuBuffer* entry = FindStaticBufContaining(g_staticIbCache, static_cast<uint32_t>(addr));
+    if (!entry || entry->byteSize < 2u) return false;
+
+    uint32_t byteOff   = static_cast<uint32_t>(addr) - entry->dataPtr;
+    uint64_t bytesNeed = static_cast<uint64_t>(byteOff) + static_cast<uint64_t>(indexCount) * 2ULL;
+    if ((byteOff & 1u) != 0u || bytesNeed > (entry->byteSize & ~1u)) return false;
+
+    if (entry->gpuBuf != nullptr && entry->device == g_d3dDevice && !entry->dirty) {
+        *outBuf        = entry->gpuBuf;
+        *outStartIndex = byteOff >> 1u;
+        if (outCacheHit) *outCacheHit = true;
+        return true;
+    }
+
+    if (entry->gpuBuf != nullptr && entry->device != g_d3dDevice) {
+        entry->gpuBuf->Release();
+        entry->gpuBuf = nullptr;
+        InvalidateD3D11ShadowState();
+    }
+
+    if (!entry->gpuBuf) {
+        D3D11_BUFFER_DESC ibd = {};
+        ibd.ByteWidth      = entry->byteSize & ~1u;
+        ibd.Usage          = D3D11_USAGE_DEFAULT;
+        ibd.BindFlags      = D3D11_BIND_INDEX_BUFFER;
+        ibd.CPUAccessFlags = 0u;
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem = reinterpret_cast<const void*>(entry->dataPtr);
+        if (FAILED(g_d3dDevice->CreateBuffer(&ibd, &initData, &entry->gpuBuf)) || !entry->gpuBuf) {
+            return false;
+        }
+        entry->device = g_d3dDevice;
+        entry->dirty  = false;
+    } else {
+        g_d3dCtx->UpdateSubresource(
+            entry->gpuBuf, 0u, nullptr, reinterpret_cast<const void*>(entry->dataPtr), 0u, 0u);
+        entry->dirty = false;
+    }
+
+    *outBuf        = entry->gpuBuf;
+    *outStartIndex = byteOff >> 1u;
+    return true;
+}
+
+static bool ConvertXboxPrimIndices(
+    uint32_t xboxPrim, const uint16_t* srcIndices, uint32_t vertexCount, uint16_t subtractBase,
+    D3D11_PRIMITIVE_TOPOLOGY* outTopo, std::vector<uint16_t>& outIndices)
+{
+    outIndices.clear();
+    switch (xboxPrim) {
+        case 1: // POINTLIST
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+            outIndices.resize(vertexCount);
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+                uint16_t raw = srcIndices ? srcIndices[i] : static_cast<uint16_t>(i);
+                outIndices[i] = static_cast<uint16_t>(raw - subtractBase);
+            }
+            return true;
+        case 2: // LINELIST
+            if (vertexCount < 2u) return false;
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
+            outIndices.resize(vertexCount);
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+                uint16_t raw = srcIndices ? srcIndices[i] : static_cast<uint16_t>(i);
+                outIndices[i] = static_cast<uint16_t>(raw - subtractBase);
+            }
+            return true;
+        case 3: // LINELOOP
+            if (vertexCount < 2u) return false;
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+            outIndices.resize(vertexCount + 1u);
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+                uint16_t raw = srcIndices ? srcIndices[i] : static_cast<uint16_t>(i);
+                outIndices[i] = static_cast<uint16_t>(raw - subtractBase);
+            }
+            outIndices[vertexCount] = outIndices[0];
+            return true;
+        case 4: // LINESTRIP
+            if (vertexCount < 2u) return false;
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+            outIndices.resize(vertexCount);
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+                uint16_t raw = srcIndices ? srcIndices[i] : static_cast<uint16_t>(i);
+                outIndices[i] = static_cast<uint16_t>(raw - subtractBase);
+            }
+            return true;
+        case 5: // TRIANGLELIST
+            if (vertexCount < 3u) return false;
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            outIndices.resize(vertexCount);
+            if (srcIndices && subtractBase == 0u) {
+                memcpy(outIndices.data(), srcIndices, vertexCount * sizeof(uint16_t));
+            } else {
+                for (uint32_t i = 0; i < vertexCount; ++i) {
+                    uint16_t raw = srcIndices ? srcIndices[i] : static_cast<uint16_t>(i);
+                    outIndices[i] = static_cast<uint16_t>(raw - subtractBase);
+                }
+            }
+            return true;
+        case 6: // TRIANGLESTRIP
+        case 9: // QUADSTRIP
+            if (vertexCount < 3u) return false;
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+            outIndices.resize(vertexCount);
+            if (srcIndices && subtractBase == 0u) {
+                memcpy(outIndices.data(), srcIndices, vertexCount * sizeof(uint16_t));
+            } else {
+                for (uint32_t i = 0; i < vertexCount; ++i) {
+                    uint16_t raw = srcIndices ? srcIndices[i] : static_cast<uint16_t>(i);
+                    outIndices[i] = static_cast<uint16_t>(raw - subtractBase);
+                }
+            }
+            return true;
+        case 7:  // TRIANGLEFAN
+        case 10: { // POLYGON
+            if (vertexCount < 3u) return false;
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            uint32_t numTris = vertexCount - 2u;
+            outIndices.resize(numTris * 3u);
+            uint16_t i0 = static_cast<uint16_t>((srcIndices ? srcIndices[0] : 0u) - subtractBase);
+            for (uint32_t t = 0; t < numTris; ++t) {
+                uint16_t i1 = static_cast<uint16_t>((srcIndices ? srcIndices[t + 1u] : (t + 1u)) - subtractBase);
+                uint16_t i2 = static_cast<uint16_t>((srcIndices ? srcIndices[t + 2u] : (t + 2u)) - subtractBase);
+                outIndices[t * 3u + 0u] = i0;
+                outIndices[t * 3u + 1u] = i1;
+                outIndices[t * 3u + 2u] = i2;
+            }
+            return true;
+        }
+        case 8: { // QUADLIST
+            uint32_t numQuads = vertexCount / 4u;
+            if (numQuads == 0u) return false;
+            *outTopo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+            outIndices.resize(numQuads * 6u);
+            for (uint32_t q = 0; q < numQuads; ++q) {
+                uint16_t q0 = static_cast<uint16_t>((srcIndices ? srcIndices[q * 4u + 0u] : (q * 4u + 0u)) - subtractBase);
+                uint16_t q1 = static_cast<uint16_t>((srcIndices ? srcIndices[q * 4u + 1u] : (q * 4u + 1u)) - subtractBase);
+                uint16_t q2 = static_cast<uint16_t>((srcIndices ? srcIndices[q * 4u + 2u] : (q * 4u + 2u)) - subtractBase);
+                uint16_t q3 = static_cast<uint16_t>((srcIndices ? srcIndices[q * 4u + 3u] : (q * 4u + 3u)) - subtractBase);
+                outIndices[q * 6u + 0u] = q0;
+                outIndices[q * 6u + 1u] = q1;
+                outIndices[q * 6u + 2u] = q2;
+                outIndices[q * 6u + 3u] = q0;
+                outIndices[q * 6u + 4u] = q2;
+                outIndices[q * 6u + 5u] = q3;
+            }
+            return true;
+        }
+        default:
+            return false;
     }
 }
 
 static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVertex>& verts, bool isRhw) {
     if (!g_d3dDevice || !g_d3dCtx || !g_vs || verts.empty()) return;
 
-    const uint32_t* xboxRS  = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
-    const uint32_t* xboxTSS = reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE);
+    const uint32_t* xboxRS = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
+    const Mat44& effWorld  = g_drawSkinIgnoreWorld ? kIdentityMat44 : g_matWorld;
 
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     static std::vector<UnifiedVertex> expanded;
@@ -805,7 +2081,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
                 memcpy(&scaleB, &xboxRS[XBOX_D3DRS_POINTSCALE_B], 4);
                 memcpy(&scaleC, &xboxRS[XBOX_D3DRS_POINTSCALE_C], 4);
 
-                Mat44 wv  = MulMat44(g_matWorld, g_matView);
+                Mat44 wv  = MulMat44(effWorld, g_matView);
                 Mat44 wvp = MulMat44(wv, g_matProj);
                 float rx = wv.m[0][0], ry = wv.m[1][0], rz = wv.m[2][0];
                 float ux = wv.m[0][1], uy = wv.m[1][1], uz = wv.m[2][1];
@@ -934,7 +2210,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     // Ensure dynamic VB capacity (ring buffer using WRITE_NO_OVERWRITE to avoid 5MB/draw WDDM stalls)
     static uint32_t s_dynVBOffset = 0;
     if (!g_dynVB || drawCount > g_dynVBCapacity) {
-        if (g_dynVB) { g_dynVB->Release(); g_dynVB = nullptr; }
+        if (g_dynVB) { g_dynVB->Release(); g_dynVB = nullptr; InvalidateD3D11ShadowState(); }
         g_dynVBCapacity = (drawCount > 65536) ? (drawCount * 2) : 65536;
         s_dynVBOffset = 0;
         D3D11_BUFFER_DESC bd = {};
@@ -958,170 +2234,23 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         s_dynVBOffset += drawCount;
     }
 
-    float uScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    float vScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    bool  isCube[4] = { false, false, false, false };
-    bool  isVol[4]  = { false, false, false, false };
-    ID3D11ShaderResourceView* stageSrvs[4] = {
-        GetOrCreateD3D11SRV(g_boundTextures[0], &uScale[0], &vScale[0], &isCube[0], &isVol[0]),
-        GetOrCreateD3D11SRV(g_boundTextures[1], &uScale[1], &vScale[1], &isCube[1], &isVol[1]),
-        GetOrCreateD3D11SRV(g_boundTextures[2], &uScale[2], &vScale[2], &isCube[2], &isVol[2]),
-        GetOrCreateD3D11SRV(g_boundTextures[3], &uScale[3], &vScale[3], &isCube[3], &isVol[3])
-    };
     ID3D11ShaderResourceView* srvs[13] = {};
-    for (int s = 0; s < 4; ++s) {
-        if (!stageSrvs[s]) continue;
-        if (isCube[s])     srvs[4 + s] = stageSrvs[s];
-        else if (isVol[s]) srvs[8 + s] = stageSrvs[s];
-        else               srvs[0 + s] = stageSrvs[s];
-    }
-    srvs[12] = g_gammaLutSRV;
-
-    // Build PerDrawCB
+    bool hwScissor = false;
     PerDrawCBData cb = {};
-    Mat44 wvp = MulMat44(MulMat44(g_matWorld, g_matView), g_matProj);
-    for (int i = 0; i < 4; ++i) {
-        cb.wvpRow0[i] = wvp.m[0][i];
-        cb.wvpRow1[i] = wvp.m[1][i];
-        cb.wvpRow2[i] = wvp.m[2][i];
-        cb.wvpRow3[i] = wvp.m[3][i];
-    }
-    cb.viewport[0] = (float)g_viewport.X;
-    cb.viewport[1] = (float)g_viewport.Y;
-    cb.viewport[2] = (float)(g_viewport.Width  ? g_viewport.Width  : 640);
-    cb.viewport[3] = (float)(g_viewport.Height ? g_viewport.Height : 480);
-
-    UnpackD3DColor(xboxRS[XBOX_D3DRS_TEXTUREFACTOR], &cb.tfactor[0], &cb.tfactor[1], &cb.tfactor[2], &cb.tfactor[3]);
-
-    const bool     hasProgPs        = (g_currentPsHandle != 0 && g_currentPsType >= 0);
-    const uint32_t psTexModes       = xboxRS[XBOX_D3DRS_PSTEXTUREMODES];
-    bool           ffCascadeActive  = true;
-    uint32_t*      stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
-    uint32_t*      stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
-    uint32_t       texMask          = 0;
-    uint32_t       cubeMask         = 0;
-    uint32_t       volMask          = 0;
-    uint32_t       projMask         = g_lastProjMask & 0x0Fu;
-    uint32_t       alphaKillMask    = 0;
-    uint32_t       tempResultMask   = 0;
-    for (int s = 0; s < 4; ++s) {
-        stageOpsPtrs[s][0]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
-        stageOpsPtrs[s][1]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG1];
-        stageOpsPtrs[s][2]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG2];
-        stageOpsPtrs[s][3]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG0];
-        stageAlphaPtrs[s][0] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAOP];
-        stageAlphaPtrs[s][1] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG1];
-        stageAlphaPtrs[s][2] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG2];
-        stageAlphaPtrs[s][3] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
-
-        if (!hasProgPs && stageOpsPtrs[s][0] <= 1u) {
-            ffCascadeActive = false;
-        }
-        const uint32_t stagePsMode    = (psTexModes >> (s * 5)) & 0x1Fu;
-        const bool     stageEnabled   = hasProgPs ? (stagePsMode != 0u) : ffCascadeActive;
-        const bool     stageTexActive = (stageSrvs[s] != nullptr) && stageEnabled;
-        if (stageTexActive) {
-            texMask |= (1u << s);
-            if (isCube[s]) cubeMask |= (1u << s);
-            if (isVol[s])  volMask  |= (1u << s);
-            if (hasProgPs && (stagePsMode == 1u || stagePsMode == 2u)) {
-                projMask |= (1u << s);
-            }
-            if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u) {
-                alphaKillMask |= (1u << s);
-            }
-        }
-        uint32_t resArg = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_RESULTARG] & 0x0Fu;
-        if (resArg == 0x05u || resArg == 0x0Du) { // D3DTA_TEMP
-            tempResultMask |= (1u << s);
-        }
-        cb.stageColorKeyOp[s] = stageTexActive ? (xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYOP] & 0x03u) : 0u;
-        UnpackD3DColor(
-            xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYCOLOR],
-            &cb.stageColorKeyColor[s][0], &cb.stageColorKeyColor[s][1],
-            &cb.stageColorKeyColor[s][2], &cb.stageColorKeyColor[s][3]);
-        cb.stageColorSign[s] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORSIGN];
-    }
-
-    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
-    uint32_t scCount = (g_scissorEnabled && !hwScissor) ? g_scissorCount : 0u;
-    if (scCount > 8u) scCount = 8u;
-    for (uint32_t si = 0; si < scCount; ++si) {
-        cb.scissorRects[si][0] = (float)g_scissorRects[si].left;
-        cb.scissorRects[si][1] = (float)g_scissorRects[si].top;
-        cb.scissorRects[si][2] = (float)g_scissorRects[si].right;
-        cb.scissorRects[si][3] = (float)g_scissorRects[si].bottom;
-    }
-
-    cb.flags[0] = (isRhw ? 1u : 0u)
-                | (g_hasGammaRamp ? 2u : 0u)
-                | ((g_scissorEnabled && g_scissorExclusive) ? 4u : 0u)
-                | ((!isRhw && xboxRS[XBOX_D3DRS_SPECULARENABLE] != 0u) ? 8u : 0u)
-                | ((scCount & 0x0Fu) << 4);
-    cb.flags[1] = texMask
-                | (cubeMask << 4)
-                | ((projMask & 0x0Fu) << 8)
-                | (volMask << 12)
-                | (alphaKillMask << 16)
-                | (tempResultMask << 20);
-    cb.flags[2] = xboxRS[XBOX_D3DRS_ALPHATESTENABLE] ? 1u : 0u;
-    cb.flags[3] = (g_currentPsHandle != 0 && g_currentPsType >= 0) ? (uint32_t)(g_currentPsType + 1) : 0u;
-
-    cb.alphaTest[0] = (float)MapXboxCmpFuncInt(xboxRS[XBOX_D3DRS_ALPHAFUNC]);
-    cb.alphaTest[1] = (float)(xboxRS[XBOX_D3DRS_ALPHAREF] & 0xFFu) * (1.0f / 255.0f);
-    cb.alphaTest[2] = g_gamma;
-    cb.alphaTest[3] = g_brightness;
-
-    cb.uvScale01[0] = uScale[0]; cb.uvScale01[1] = vScale[0];
-    cb.uvScale01[2] = uScale[1]; cb.uvScale01[3] = vScale[1];
-    cb.uvScale23[0] = uScale[2]; cb.uvScale23[1] = vScale[2];
-    cb.uvScale23[2] = uScale[3]; cb.uvScale23[3] = vScale[3];
-
-    // BumpEnv matrix & luminance scale/offset from Stage 1 (or Stage 0 if Stage 1's BumpEnvMat is zero)
-    const uint32_t* bumpMat1 = &xboxTSS[1 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT00];
-    const uint32_t* bumpMat0 = &xboxTSS[0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT00];
-    bool useStage1Bump = (bumpMat1[0] || bumpMat1[1] || bumpMat1[2] || bumpMat1[3]);
-    const uint32_t* chosenBump = useStage1Bump ? bumpMat1 : bumpMat0;
-    memcpy(&cb.bumpParams[0], chosenBump, 16);
-    if (cb.bumpParams[0] == 0.0f && cb.bumpParams[1] == 0.0f && cb.bumpParams[2] == 0.0f && cb.bumpParams[3] == 0.0f) {
-        cb.bumpParams[0] = 0.04f;
-        cb.bumpParams[2] = 0.04f;
-    }
-    uint32_t bumpStage0 = useStage1Bump ? 1u : 0u;
-    memcpy(&cb.bumpLuminance[0], &xboxTSS[bumpStage0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLSCALE], 4);
-    memcpy(&cb.bumpLuminance[1], &xboxTSS[bumpStage0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLOFFSET], 4);
-    memcpy(&cb.bumpLuminance[2], &xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLSCALE], 4);
-    memcpy(&cb.bumpLuminance[3], &xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLOFFSET], 4);
-
-    // Hardware Distance & Atmospheric Fog (xboxRS[92]=FOGENABLE, [93]=FOGTABLEMODE, [94]=FOGSTART, [95]=FOGEND, [96]=FOGDENSITY, [138]=FOGCOLOR)
-    if (xboxRS[XBOX_D3DRS_FOGENABLE] != 0 && !isRhw) {
-        uint32_t fogMode = xboxRS[XBOX_D3DRS_FOGTABLEMODE];
-        if (fogMode == 0) fogMode = 3; // Default to LINEAR if FOGENABLE is true
-        cb.fogParams[0] = (float)fogMode;
-        memcpy(&cb.fogParams[1], &xboxRS[XBOX_D3DRS_FOGSTART], 4);
-        memcpy(&cb.fogParams[2], &xboxRS[XBOX_D3DRS_FOGEND], 4);
-        memcpy(&cb.fogParams[3], &xboxRS[XBOX_D3DRS_FOGDENSITY], 4);
-        float fA = 1.0f;
-        UnpackD3DColor(xboxRS[XBOX_D3DRS_FOGCOLOR], &cb.fogColor[0], &cb.fogColor[1], &cb.fogColor[2], &fA);
-        bool isAddBlend = (xboxRS[XBOX_D3DRS_ALPHABLENDENABLE] != 0) && (xboxRS[XBOX_D3DRS_DESTBLEND] == 1 || xboxRS[XBOX_D3DRS_DESTBLEND] == 0x302);
-        cb.fogColor[3] = isAddBlend ? 1.0f : 0.0f;
-    }
-
-    memcpy(cb.psConst0, g_psConstants[0], 16);
-    memcpy(cb.psConst1, g_psConstants[1], 16);
-    memcpy(cb.psConst2, g_psConstants[2], 16);
-    memcpy(cb.psConst3, g_psConstants[3], 16);
-    memcpy(cb.psConst4, g_psConstants[4], 16);
-    memcpy(cb.psConst5, g_psConstants[5], 16);
-    memcpy(cb.psConst6, g_psConstants[6], 16);
-    memcpy(cb.psConst7, g_psConstants[7], 16);
+    ID3D11PixelShader* activePS = PopulateCommonPerDrawCB(
+        cb, effWorld, isRhw, false, false, g_lastProjMask,
+        static_cast<float>(g_viewport.X),
+        static_cast<float>(g_viewport.Y),
+        static_cast<float>(g_viewport.Width  ? g_viewport.Width  : 640),
+        static_cast<float>(g_viewport.Height ? g_viewport.Height : 480),
+        srvs, &hwScissor);
 
     if (g_gpuLightMode != 0u && !isRhw) {
         for (int i = 0; i < 4; ++i) {
-            cb.worldRow0[i] = g_matWorld.m[0][i];
-            cb.worldRow1[i] = g_matWorld.m[1][i];
-            cb.worldRow2[i] = g_matWorld.m[2][i];
-            cb.worldRow3[i] = g_matWorld.m[3][i];
+            cb.worldRow0[i] = effWorld.m[0][i];
+            cb.worldRow1[i] = effWorld.m[1][i];
+            cb.worldRow2[i] = effWorld.m[2][i];
+            cb.worldRow3[i] = effWorld.m[3][i];
         }
         const XboxMaterial8* devFrontMat = reinterpret_cast<const XboxMaterial8*>(ADDR_DEVICE_MATERIAL);
         const XboxMaterial8& frontMat = (devFrontMat->Diffuse[0] != 0.0f || devFrontMat->Diffuse[1] != 0.0f ||
@@ -1205,11 +2334,21 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
                          | ((xboxRS[XBOX_D3DRS_TWOSIDEDLIGHTING] != 0) ? 4u : 0u);
     }
 
-    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
-        memcpy(mappedCB.pData, &cb, sizeof(cb));
-        g_d3dCtx->Unmap(g_cbPerDraw, 0);
+    bool bindBonePalette = false;
+    if (g_drawSkinWeightCount > 0u && !isRhw && g_cbBonePalette) {
+        uint32_t bCount = (g_drawBoneCount > 0u && g_drawBoneCount <= 256u) ? g_drawBoneCount : 256u;
+        D3D11_MAPPED_SUBRESOURCE mappedBP = {};
+        if (SUCCEEDED(g_d3dCtx->Map(g_cbBonePalette, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedBP))) {
+            memcpy(mappedBP.pData, g_drawBonePalette.boneRows, bCount * 3u * sizeof(float) * 4u);
+            g_d3dCtx->Unmap(g_cbBonePalette, 0);
+            cb.skinParams[0] = g_drawSkinWeightCount;
+            cb.skinParams[1] = 1u;
+            cb.skinParams[2] = bCount;
+            bindBonePalette  = true;
+        }
     }
+
+    UploadPerDrawCBIfChanged(cb);
 
     // Bind pipeline states (COLORWRITEENABLE is 0x040358 -> index 67)
     uint32_t cwRaw = xboxRS[XBOX_D3DRS_COLORWRITEENABLE];
@@ -1226,23 +2365,18 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         if (cwRaw & 0xFF000000u) cwMask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
     }
 
-    // ALPHABLENDENABLE=[59], SRCBLEND=[62], DESTBLEND=[63], BLENDOP=[74]
     ID3D11BlendState* bs = GetBlendState(
         xboxRS[XBOX_D3DRS_ALPHABLENDENABLE], xboxRS[XBOX_D3DRS_SRCBLEND],
         xboxRS[XBOX_D3DRS_DESTBLEND], xboxRS[XBOX_D3DRS_BLENDOP], cwMask);
-    // ZENABLE=[143], ZWRITEENABLE=[64], ZFUNC=[57], STENCILENABLE=[144], STENCILFAIL=[145],
-    // STENCILZFAIL=[68], STENCILPASS=[69], STENCILFUNC=[70], STENCILREF=[71], STENCILMASK=[72], STENCILWRITEMASK=[73]
     ID3D11DepthStencilState* ds = GetDepthState(
         xboxRS[XBOX_D3DRS_ZENABLE], xboxRS[XBOX_D3DRS_ZWRITEENABLE], xboxRS[XBOX_D3DRS_ZFUNC],
         xboxRS[XBOX_D3DRS_STENCILENABLE], xboxRS[XBOX_D3DRS_STENCILFAIL],
         xboxRS[XBOX_D3DRS_STENCILZFAIL], xboxRS[XBOX_D3DRS_STENCILPASS],
         xboxRS[XBOX_D3DRS_STENCILFUNC], xboxRS[XBOX_D3DRS_STENCILMASK], xboxRS[XBOX_D3DRS_STENCILWRITEMASK]);
-    // Disable backface culling on RHW 2D UI quads; use Xbox CULLMODE=[147] and FRONTFACE=[146] for 3D
-    uint32_t cull = isRhw ? 0 : xboxRS[XBOX_D3DRS_CULLMODE];
+    uint32_t cull = xboxRS[XBOX_D3DRS_CULLMODE];
     ID3D11RasterizerState* rs = GetRastState(
         cull, xboxRS[XBOX_D3DRS_FILLMODE], xboxRS[XBOX_D3DRS_ZBIAS], hwScissor, xboxRS[XBOX_D3DRS_FRONTFACE]);
 
-    // Pre-transformed XYZRHW vertices bypass viewport MinZ..MaxZ on Xbox NV2A
     D3D11_VIEWPORT vp11 = {};
     vp11.TopLeftX = (float)g_viewport.X;
     vp11.TopLeftY = (float)g_viewport.Y;
@@ -1250,7 +2384,6 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     vp11.Height   = (float)(g_viewport.Height ? g_viewport.Height : 480);
     vp11.MinDepth = isRhw ? 0.0f : g_viewport.MinZ;
     vp11.MaxDepth = isRhw ? 1.0f : ((g_viewport.MaxZ > g_viewport.MinZ) ? g_viewport.MaxZ : 1.0f);
-    g_d3dCtx->RSSetViewports(1, &vp11);
 
     ID3D11SamplerState* smps[4] = {
         GetStageSamplerState(0),
@@ -1273,472 +2406,329 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
             blendFactor[0] = blendFactor[1] = blendFactor[2] = blendFactor[3];
         }
     }
-    g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
-    g_d3dCtx->OMSetDepthStencilState(ds, xboxRS[XBOX_D3DRS_STENCILREF] & 0xFFu);
-    g_d3dCtx->RSSetState(rs);
 
-    g_d3dCtx->IASetInputLayout(g_inputLayout);
-    UINT vbStride = sizeof(UnifiedVertex);
-    UINT vbOffset = 0;
-    g_d3dCtx->IASetVertexBuffers(0, 1, &g_dynVB, &vbStride, &vbOffset);
-    g_d3dCtx->IASetPrimitiveTopology(topo);
+    uint32_t vbStride = sizeof(UnifiedVertex);
+    uint32_t vbOffset = 0u;
+    ID3D11Buffer* vsCbs[3] = { g_cbPerDraw, g_cbVSConstants, g_cbBonePalette };
+    uint32_t numVsCbs = bindBonePalette ? 3u : 1u;
 
-    g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
-    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
-    ID3D11PixelShader* activePS = GetPixelShaderPermutation(cb.flags[3]);
-    g_d3dCtx->PSSetShader(activePS, nullptr, 0);
-    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
-
-    g_d3dCtx->PSSetShaderResources(0, 13, srvs);
-    g_d3dCtx->PSSetSamplers(0, 4, smps);
+    ApplyShadowedD3D11RenderPipeline(
+        &vp11,
+        bs, blendFactor, 0xFFFFFFFFu,
+        ds, xboxRS[XBOX_D3DRS_STENCILREF] & 0xFFu,
+        rs,
+        g_inputLayout, static_cast<uint32_t>(topo),
+        1u, &g_dynVB, &vbStride, &vbOffset,
+        false, nullptr, 0u, 0u,
+        g_vs, numVsCbs, vsCbs,
+        activePS, g_cbPerDraw,
+        srvs, smps);
 
     g_d3dCtx->Draw(drawCount, startVertex);
-    if (g_curOffscreenRT == nullptr) {
-        g_backBufferDirty = true;
+    MarkActiveRenderTargetGpuDirty();
+    if (g_curActiveDSV != nullptr &&
+        ((xboxRS[XBOX_D3DRS_ZENABLE] != 0u && xboxRS[XBOX_D3DRS_ZWRITEENABLE] != 0u) ||
+         xboxRS[XBOX_D3DRS_STENCILENABLE] != 0u))
+    {
+        MarkActiveDepthStencilGpuDirty();
     }
 }
 
 static void SubmitXvuDrawD3D11(
     const XboxShaderDeclInfo& decl, uint32_t xboxPrim,
     const uint8_t* stream0Data, uint32_t stream0Stride,
-    uint32_t vertexCount, const uint16_t* optIndices, uint32_t baseVertexIndex)
+    uint32_t vertexCount, const uint16_t* optIndices, uint32_t baseVertexIndex,
+    bool allowStaticCache = false, const CachedPushBufferPacket* optCachedPb = nullptr)
 {
-    if (!g_d3dDevice || !g_d3dCtx || !decl.gpuVS || !decl.gpuInputLayout || !g_cbVSConstants || !stream0Data || vertexCount == 0) return;
+    if (!g_d3dDevice || !g_d3dCtx || !decl.gpuVS || !g_cbVSConstants || vertexCount == 0) return;
+    if (decl.gpuInputLayout != nullptr && decl.usesStream[0] && !stream0Data) return;
 
-    const uint32_t* xboxRS  = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
-    const uint32_t* xboxTSS = reinterpret_cast<const uint32_t*>(ADDR_D3D_TEXTURESTATE);
+    DrainPendingGpuBufferEvictions();
 
-    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    static std::vector<uint16_t> drawIndices;
-    drawIndices.clear();
-    bool useIB = false;
+    const uint32_t* xboxRS = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
 
-    uint32_t firstVert = baseVertexIndex;
-    uint32_t numVerts  = vertexCount;
-
-    if (optIndices) {
-        uint16_t minIdx = 0xFFFFu;
-        uint16_t maxIdx = 0u;
-        for (uint32_t i = 0; i < vertexCount; ++i) {
-            uint16_t idx = optIndices[i];
-            if (idx < minIdx) minIdx = idx;
-            if (idx > maxIdx) maxIdx = idx;
-        }
-        if (minIdx > maxIdx) return;
-        firstVert = baseVertexIndex + minIdx;
-        numVerts  = (uint32_t)(maxIdx - minIdx) + 1u;
-        useIB     = true;
-
-        switch (xboxPrim) {
-            case 1: // POINTLIST
-                topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
-                drawIndices.resize(vertexCount);
-                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
-                break;
-            case 2: // LINELIST
-                if (vertexCount < 2) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-                drawIndices.resize(vertexCount);
-                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
-                break;
-            case 3: // LINELOOP
-                if (vertexCount < 2) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
-                drawIndices.resize(vertexCount + 1);
-                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
-                drawIndices[vertexCount] = (uint16_t)(optIndices[0] - minIdx);
-                break;
-            case 4: // LINESTRIP
-                if (vertexCount < 2) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
-                drawIndices.resize(vertexCount);
-                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
-                break;
-            case 5: // TRIANGLELIST
-                if (vertexCount < 3) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                drawIndices.resize(vertexCount);
-                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
-                break;
-            case 6: // TRIANGLESTRIP
-            case 9: // QUADSTRIP
-                if (vertexCount < 3) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-                drawIndices.resize(vertexCount);
-                for (uint32_t i = 0; i < vertexCount; ++i) drawIndices[i] = (uint16_t)(optIndices[i] - minIdx);
-                break;
-            case 7: // TRIANGLEFAN
-            case 10: { // POLYGON
-                if (vertexCount < 3) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                uint32_t numTris = vertexCount - 2;
-                drawIndices.resize(numTris * 3);
-                uint16_t i0 = (uint16_t)(optIndices[0] - minIdx);
-                for (uint32_t t = 0; t < numTris; ++t) {
-                    drawIndices[t * 3 + 0] = i0;
-                    drawIndices[t * 3 + 1] = (uint16_t)(optIndices[t + 1] - minIdx);
-                    drawIndices[t * 3 + 2] = (uint16_t)(optIndices[t + 2] - minIdx);
-                }
-                break;
-            }
-            case 8: { // QUADLIST
-                uint32_t numQuads = vertexCount / 4;
-                if (numQuads == 0) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                drawIndices.resize(numQuads * 6);
-                for (uint32_t q = 0; q < numQuads; ++q) {
-                    uint16_t q0 = (uint16_t)(optIndices[q * 4 + 0] - minIdx);
-                    uint16_t q1 = (uint16_t)(optIndices[q * 4 + 1] - minIdx);
-                    uint16_t q2 = (uint16_t)(optIndices[q * 4 + 2] - minIdx);
-                    uint16_t q3 = (uint16_t)(optIndices[q * 4 + 3] - minIdx);
-                    drawIndices[q * 6 + 0] = q0;
-                    drawIndices[q * 6 + 1] = q1;
-                    drawIndices[q * 6 + 2] = q2;
-                    drawIndices[q * 6 + 3] = q0;
-                    drawIndices[q * 6 + 4] = q2;
-                    drawIndices[q * 6 + 5] = q3;
-                }
-                break;
-            }
-            default:
-                return;
-        }
-    } else {
-        switch (xboxPrim) {
-            case 1: // POINTLIST
-                topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
-                break;
-            case 2: // LINELIST
-                if (numVerts < 2) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-                break;
-            case 3: // LINELOOP
-                if (numVerts < 2) return;
-                topo  = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
-                useIB = true;
-                drawIndices.resize(numVerts + 1);
-                for (uint32_t i = 0; i < numVerts; ++i) drawIndices[i] = (uint16_t)i;
-                drawIndices[numVerts] = 0;
-                break;
-            case 4: // LINESTRIP
-                if (numVerts < 2) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
-                break;
-            case 5: // TRIANGLELIST
-                if (numVerts < 3) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                break;
-            case 6: // TRIANGLESTRIP
-            case 9: // QUADSTRIP
-                if (numVerts < 3) return;
-                topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-                break;
-            case 7: // TRIANGLEFAN
-            case 10: { // POLYGON
-                if (numVerts < 3) return;
-                topo  = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                useIB = true;
-                uint32_t numTris = numVerts - 2;
-                drawIndices.resize(numTris * 3);
-                for (uint32_t t = 0; t < numTris; ++t) {
-                    drawIndices[t * 3 + 0] = 0;
-                    drawIndices[t * 3 + 1] = (uint16_t)(t + 1);
-                    drawIndices[t * 3 + 2] = (uint16_t)(t + 2);
-                }
-                break;
-            }
-            case 8: { // QUADLIST
-                uint32_t numQuads = numVerts / 4;
-                if (numQuads == 0) return;
-                topo  = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-                useIB = true;
-                drawIndices.resize(numQuads * 6);
-                for (uint32_t q = 0; q < numQuads; ++q) {
-                    drawIndices[q * 6 + 0] = (uint16_t)(q * 4 + 0);
-                    drawIndices[q * 6 + 1] = (uint16_t)(q * 4 + 1);
-                    drawIndices[q * 6 + 2] = (uint16_t)(q * 4 + 2);
-                    drawIndices[q * 6 + 3] = (uint16_t)(q * 4 + 0);
-                    drawIndices[q * 6 + 4] = (uint16_t)(q * 4 + 2);
-                    drawIndices[q * 6 + 5] = (uint16_t)(q * 4 + 3);
-                }
-                break;
-            }
-            default:
-                return;
-        }
-    }
-
-    static ID3D11Buffer* s_dynStreamVB[2] = { nullptr, nullptr };
+    static ID3D11Buffer* s_dynStreamVB[2]  = { nullptr, nullptr };
     static uint32_t      s_dynStreamCap[2] = { 0, 0 };
     static uint32_t      s_dynStreamOff[2] = { 0, 0 };
-    UINT strides[2] = { 0, 0 };
-    UINT byteOff[2] = { 0, 0 };
+    static ID3D11Buffer* s_dynIB           = nullptr;
+    static uint32_t      s_dynIBCap        = 0;
+    static uint32_t      s_dynIBOff        = 0;
+    static std::vector<uint16_t> drawIndices;
 
-    auto uploadStreamSlice = [&](uint32_t slot, const uint8_t* basePtr, uint32_t stride, uint32_t firstV, uint32_t countV) -> bool {
-        if (stride == 0 || countV == 0) return false;
-        uint32_t bytesNeeded = countV * stride;
-        uint32_t alignedBytes = (bytesNeeded + 15u) & ~15u;
-        if (!s_dynStreamVB[slot] || alignedBytes > s_dynStreamCap[slot]) {
-            if (s_dynStreamVB[slot]) { s_dynStreamVB[slot]->Release(); s_dynStreamVB[slot] = nullptr; }
-            s_dynStreamCap[slot] = (alignedBytes > 2 * 1024 * 1024) ? (alignedBytes * 2) : (2 * 1024 * 1024);
-            s_dynStreamOff[slot] = 0;
-            D3D11_BUFFER_DESC bd = {};
-            bd.ByteWidth      = s_dynStreamCap[slot];
-            bd.Usage          = D3D11_USAGE_DYNAMIC;
-            bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
-            bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &s_dynStreamVB[slot]))) return false;
-        }
-        D3D11_MAP mapMode = D3D11_MAP_WRITE_NO_OVERWRITE;
-        if (s_dynStreamOff[slot] == 0 || (s_dynStreamOff[slot] + alignedBytes) > s_dynStreamCap[slot]) {
-            mapMode = D3D11_MAP_WRITE_DISCARD;
-            s_dynStreamOff[slot] = 0;
-        }
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        if (FAILED(g_d3dCtx->Map(s_dynStreamVB[slot], 0, mapMode, 0, &mapped))) return false;
-        uint8_t* dst = reinterpret_cast<uint8_t*>(mapped.pData) + s_dynStreamOff[slot];
-        if (basePtr) {
-            memcpy(dst, basePtr + firstV * stride, bytesNeeded);
-        } else {
-            memset(dst, 0, bytesNeeded);
-        }
-        g_d3dCtx->Unmap(s_dynStreamVB[slot], 0);
-        strides[slot] = stride;
-        byteOff[slot] = s_dynStreamOff[slot];
-        s_dynStreamOff[slot] += alignedBytes;
-        return true;
-    };
-
-    uint32_t s0 = (stream0Stride != 0) ? stream0Stride : decl.streamStrides[0];
-    if (!uploadStreamSlice(0, stream0Data, s0, firstVert, numVerts)) return;
-
-    uint32_t numStreams = 1u;
-    if (decl.usesStream[1]) {
-        uint32_t s1 = (decl.streamStrides[1] != 0) ? decl.streamStrides[1] : g_streams[1].stride;
-        const uint8_t* p1 = (g_streams[1].stride == s1) ? reinterpret_cast<const uint8_t*>(g_streams[1].data) : nullptr;
-        if (!uploadStreamSlice(1, p1, s1, firstVert, numVerts)) return;
-        numStreams = 2u;
-    }
-
-    static ID3D11Buffer* s_dynIB    = nullptr;
-    static uint32_t      s_dynIBCap = 0;
-    static uint32_t      s_dynIBOff = 0;
-    uint32_t startIndex   = 0;
-    uint32_t drawIdxCount = (uint32_t)drawIndices.size();
-    if (useIB) {
-        if (drawIdxCount == 0) return;
-        if (!s_dynIB || drawIdxCount > s_dynIBCap) {
-            if (s_dynIB) { s_dynIB->Release(); s_dynIB = nullptr; }
-            s_dynIBCap = (drawIdxCount > 131072u) ? (drawIdxCount * 2u) : 131072u;
-            s_dynIBOff = 0;
+    auto uploadDynamicIb = [&](const uint16_t* idxSrc, uint32_t idxCount, uint32_t* outStartIdx) -> bool {
+        if (!idxSrc || idxCount == 0u) return false;
+        if (!s_dynIB || idxCount > s_dynIBCap) {
+            if (s_dynIB) { s_dynIB->Release(); s_dynIB = nullptr; InvalidateD3D11ShadowState(); }
+            s_dynIBCap = (idxCount > 131072u) ? (idxCount * 2u) : 131072u;
+            s_dynIBOff = 0u;
             D3D11_BUFFER_DESC ibd = {};
             ibd.ByteWidth      = s_dynIBCap * sizeof(uint16_t);
             ibd.Usage          = D3D11_USAGE_DYNAMIC;
             ibd.BindFlags      = D3D11_BIND_INDEX_BUFFER;
             ibd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            if (FAILED(g_d3dDevice->CreateBuffer(&ibd, nullptr, &s_dynIB))) return;
+            if (FAILED(g_d3dDevice->CreateBuffer(&ibd, nullptr, &s_dynIB))) return false;
         }
         D3D11_MAP ibMapMode = D3D11_MAP_WRITE_NO_OVERWRITE;
-        if (s_dynIBOff == 0 || (s_dynIBOff + drawIdxCount) > s_dynIBCap) {
+        if (s_dynIBOff == 0u || (s_dynIBOff + idxCount) > s_dynIBCap) {
             ibMapMode  = D3D11_MAP_WRITE_DISCARD;
-            s_dynIBOff = 0;
+            s_dynIBOff = 0u;
         }
         D3D11_MAPPED_SUBRESOURCE mappedIB = {};
-        if (FAILED(g_d3dCtx->Map(s_dynIB, 0, ibMapMode, 0, &mappedIB))) return;
-        memcpy(reinterpret_cast<uint16_t*>(mappedIB.pData) + s_dynIBOff, drawIndices.data(), drawIdxCount * sizeof(uint16_t));
+        if (FAILED(g_d3dCtx->Map(s_dynIB, 0, ibMapMode, 0, &mappedIB))) return false;
+        memcpy(reinterpret_cast<uint16_t*>(mappedIB.pData) + s_dynIBOff, idxSrc, idxCount * sizeof(uint16_t));
         g_d3dCtx->Unmap(s_dynIB, 0);
-        startIndex = s_dynIBOff;
-        s_dynIBOff += drawIdxCount;
+        *outStartIdx = s_dynIBOff;
+        s_dynIBOff  += idxCount;
+        return true;
+    };
+
+    // Attempt Optimization 1 zero-copy static GPU VB resolution on all active input streams
+    ID3D11Buffer* boundVBs[2]     = { nullptr, nullptr };
+    uint32_t      boundStrides[2] = { 0u, 0u };
+    uint32_t      boundOffsets[2] = { 0u, 0u };
+    uint32_t      numStreams       = 0u;
+    bool          useStaticVBs    = false;
+
+    if (allowStaticCache) {
+        if (decl.gpuInputLayout == nullptr) {
+            useStaticVBs = true;
+        } else {
+            uint32_t minVertexReach = (optIndices != nullptr || optCachedPb != nullptr)
+                ? (baseVertexIndex + 1u)
+                : (baseVertexIndex + vertexCount);
+            uint32_t s0 = (stream0Stride != 0u) ? stream0Stride : decl.streamStrides[0];
+            bool vb0Hit = false;
+            bool vb1Hit = false;
+            if (s0 > 0u && TryResolveStaticGpuVB(stream0Data, s0, minVertexReach, &boundVBs[0], &boundOffsets[0], &vb0Hit)) {
+                boundStrides[0] = s0;
+                numStreams       = 1u;
+                useStaticVBs    = true;
+                if (decl.usesStream[1]) {
+                    uint32_t minS1 = decl.streamStrides[1] ? decl.streamStrides[1] : 4u;
+                    uint32_t s1    = (g_streams[1].stride != 0u) ? g_streams[1].stride : minS1;
+                    const uint8_t* p1 = (g_streams[1].data != nullptr && s1 >= minS1)
+                        ? reinterpret_cast<const uint8_t*>(g_streams[1].data)
+                        : nullptr;
+                    if (s1 > 0u && p1 && TryResolveStaticGpuVB(p1, s1, minVertexReach, &boundVBs[1], &boundOffsets[1], &vb1Hit)) {
+                        boundStrides[1] = s1;
+                        numStreams       = 2u;
+                    } else {
+                        useStaticVBs = false;
+                        numStreams   = 0u;
+                    }
+                }
+                if (useStaticVBs) {
+                    if (vb0Hit) ++g_diagStaticVbCacheHitCount;
+                    if (vb1Hit) ++g_diagStaticVbCacheHitCount;
+                }
+            }
+        }
     }
 
-    // Update Xbox NV2A hardware viewport constants c[58] (scale) and c[59] (offset)
+    D3D11_PRIMITIVE_TOPOLOGY topo           = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    bool                     useIB          = false;
+    ID3D11Buffer*            boundIB        = nullptr;
+    uint32_t                 startIndex     = 0u;
+    uint32_t                 drawIdxCount   = 0u;
+    int32_t                  hwBaseVertLoc  = 0;
+    uint32_t                 hwStartVertLoc = 0u;
+
+    if (useStaticVBs) {
+        // Zero-copy static GPU VB path: no CPU [minIdx, maxIdx] scan, pass hardware BaseVertexLocation
+        if (optCachedPb && optCachedPb->ib && optCachedPb->device == g_d3dDevice) {
+            topo          = optCachedPb->d3dTopo;
+            useIB         = true;
+            boundIB       = optCachedPb->ib;
+            startIndex    = 0u;
+            drawIdxCount  = optCachedPb->drawIdxCount;
+            hwBaseVertLoc = static_cast<int32_t>(baseVertexIndex);
+            ++g_diagStaticPushBufferHitCount;
+        } else if (optIndices) {
+            useIB         = true;
+            hwBaseVertLoc = static_cast<int32_t>(baseVertexIndex);
+            bool isDirectHwTopo = (xboxPrim == 1u || xboxPrim == 2u || xboxPrim == 4u ||
+                                   xboxPrim == 5u || xboxPrim == 6u || xboxPrim == 9u);
+            if (isDirectHwTopo) {
+                if ((xboxPrim == 2u || xboxPrim == 4u) && vertexCount < 2u) return;
+                if ((xboxPrim == 5u || xboxPrim == 6u || xboxPrim == 9u) && vertexCount < 3u) return;
+                switch (xboxPrim) {
+                    case 1u: topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;     break;
+                    case 2u: topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;      break;
+                    case 4u: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;     break;
+                    case 5u: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;  break;
+                    default: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+                }
+                bool ibHit = false;
+                if (allowStaticCache && TryResolveStaticGpuIB(optIndices, vertexCount, &boundIB, &startIndex, &ibHit)) {
+                    drawIdxCount = vertexCount;
+                    if (ibHit) ++g_diagStaticIbCacheHitCount;
+                } else {
+                    if (!uploadDynamicIb(optIndices, vertexCount, &startIndex)) return;
+                    boundIB      = s_dynIB;
+                    drawIdxCount = vertexCount;
+                }
+            } else {
+                if (!ConvertXboxPrimIndices(xboxPrim, optIndices, vertexCount, 0u, &topo, drawIndices)) return;
+                drawIdxCount = static_cast<uint32_t>(drawIndices.size());
+                if (!uploadDynamicIb(drawIndices.data(), drawIdxCount, &startIndex)) return;
+                boundIB = s_dynIB;
+            }
+        } else {
+            bool isDirectHwTopo = (xboxPrim == 1u || xboxPrim == 2u || xboxPrim == 4u ||
+                                   xboxPrim == 5u || xboxPrim == 6u || xboxPrim == 9u);
+            if (isDirectHwTopo) {
+                if ((xboxPrim == 2u || xboxPrim == 4u) && vertexCount < 2u) return;
+                if ((xboxPrim == 5u || xboxPrim == 6u || xboxPrim == 9u) && vertexCount < 3u) return;
+                switch (xboxPrim) {
+                    case 1u: topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;     break;
+                    case 2u: topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;      break;
+                    case 4u: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;     break;
+                    case 5u: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;  break;
+                    default: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+                }
+                useIB          = false;
+                hwStartVertLoc = baseVertexIndex;
+            } else {
+                if (!ConvertXboxPrimIndices(xboxPrim, nullptr, vertexCount, 0u, &topo, drawIndices)) return;
+                useIB         = true;
+                drawIdxCount  = static_cast<uint32_t>(drawIndices.size());
+                hwBaseVertLoc = static_cast<int32_t>(baseVertexIndex);
+                if (!uploadDynamicIb(drawIndices.data(), drawIdxCount, &startIndex)) return;
+                boundIB = s_dynIB;
+            }
+        }
+    } else {
+        // Dynamic ring buffer / DrawVerticesUP slice path
+        uint32_t firstVert = baseVertexIndex;
+        uint32_t numVerts  = vertexCount;
+
+        if (optIndices) {
+            uint16_t minIdx = 0xFFFFu;
+            uint16_t maxIdx = 0u;
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+                uint16_t idx = optIndices[i];
+                if (idx < minIdx) minIdx = idx;
+                if (idx > maxIdx) maxIdx = idx;
+            }
+            if (minIdx > maxIdx) return;
+            firstVert = baseVertexIndex + minIdx;
+            numVerts  = static_cast<uint32_t>(maxIdx - minIdx) + 1u;
+            useIB     = true;
+            if (!ConvertXboxPrimIndices(xboxPrim, optIndices, vertexCount, minIdx, &topo, drawIndices)) return;
+            drawIdxCount = static_cast<uint32_t>(drawIndices.size());
+        } else {
+            bool isDirectHwTopo = (xboxPrim == 1u || xboxPrim == 2u || xboxPrim == 4u ||
+                                   xboxPrim == 5u || xboxPrim == 6u || xboxPrim == 9u);
+            if (isDirectHwTopo) {
+                if ((xboxPrim == 2u || xboxPrim == 4u) && numVerts < 2u) return;
+                if ((xboxPrim == 5u || xboxPrim == 6u || xboxPrim == 9u) && numVerts < 3u) return;
+                switch (xboxPrim) {
+                    case 1u: topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;     break;
+                    case 2u: topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;      break;
+                    case 4u: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;     break;
+                    case 5u: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;  break;
+                    default: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+                }
+            } else {
+                if (!ConvertXboxPrimIndices(xboxPrim, nullptr, numVerts, 0u, &topo, drawIndices)) return;
+                useIB        = true;
+                drawIdxCount = static_cast<uint32_t>(drawIndices.size());
+            }
+        }
+
+        auto uploadStreamSlice = [&](uint32_t slot, const uint8_t* basePtr, uint32_t stride, uint32_t firstV, uint32_t countV) -> bool {
+            if (stride == 0u || countV == 0u) return false;
+            uint32_t bytesNeeded  = countV * stride;
+            uint32_t alignedBytes = (bytesNeeded + 15u) & ~15u;
+            if (!s_dynStreamVB[slot] || alignedBytes > s_dynStreamCap[slot]) {
+                if (s_dynStreamVB[slot]) { s_dynStreamVB[slot]->Release(); s_dynStreamVB[slot] = nullptr; InvalidateD3D11ShadowState(); }
+                s_dynStreamCap[slot] = (alignedBytes > 2u * 1024u * 1024u) ? (alignedBytes * 2u) : (2u * 1024u * 1024u);
+                s_dynStreamOff[slot] = 0u;
+                D3D11_BUFFER_DESC bd = {};
+                bd.ByteWidth      = s_dynStreamCap[slot];
+                bd.Usage          = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &s_dynStreamVB[slot]))) return false;
+            }
+            D3D11_MAP mapMode = D3D11_MAP_WRITE_NO_OVERWRITE;
+            if (s_dynStreamOff[slot] == 0u || (s_dynStreamOff[slot] + alignedBytes) > s_dynStreamCap[slot]) {
+                mapMode              = D3D11_MAP_WRITE_DISCARD;
+                s_dynStreamOff[slot] = 0u;
+            }
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (FAILED(g_d3dCtx->Map(s_dynStreamVB[slot], 0, mapMode, 0, &mapped))) return false;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(mapped.pData) + s_dynStreamOff[slot];
+            if (basePtr) {
+                memcpy(dst, basePtr + firstV * stride, bytesNeeded);
+            } else {
+                memset(dst, 0, bytesNeeded);
+            }
+            g_d3dCtx->Unmap(s_dynStreamVB[slot], 0);
+            boundVBs[slot]     = s_dynStreamVB[slot];
+            boundStrides[slot] = stride;
+            boundOffsets[slot] = s_dynStreamOff[slot];
+            s_dynStreamOff[slot] += alignedBytes;
+            return true;
+        };
+
+        if (decl.gpuInputLayout != nullptr) {
+            uint32_t s0 = (stream0Stride != 0u) ? stream0Stride : decl.streamStrides[0];
+            if (s0 > 0u) {
+                if (!uploadStreamSlice(0u, stream0Data, s0, firstVert, numVerts)) return;
+                numStreams = 1u;
+            }
+            if (decl.usesStream[1]) {
+                uint32_t minS1 = decl.streamStrides[1] ? decl.streamStrides[1] : 4u;
+                uint32_t s1    = (g_streams[1].stride != 0u) ? g_streams[1].stride : minS1;
+                const uint8_t* p1 = (g_streams[1].data != nullptr && s1 >= minS1)
+                    ? reinterpret_cast<const uint8_t*>(g_streams[1].data)
+                    : nullptr;
+                uint32_t uploadS1 = p1 ? s1 : minS1;
+                if (!uploadStreamSlice(1u, p1, uploadS1, firstVert, numVerts)) return;
+                numStreams = 2u;
+            }
+        }
+
+        if (useIB) {
+            if (!uploadDynamicIb(drawIndices.data(), drawIdxCount, &startIndex)) return;
+            boundIB = s_dynIB;
+        }
+        vertexCount = numVerts;
+    }
+
+    // Update Xbox NV2A hardware viewport constants c[58] (scale) and c[59] (offset) on change
     float vpX    = (float)g_viewport.X;
     float vpY    = (float)g_viewport.Y;
     float vpW    = (float)(g_viewport.Width  ? g_viewport.Width  : 640);
     float vpH    = (float)(g_viewport.Height ? g_viewport.Height : 480);
     float vpMinZ = g_viewport.MinZ;
     float vpMaxZ = (g_viewport.MaxZ > g_viewport.MinZ) ? g_viewport.MaxZ : 1.0f;
-    float* vsConsts = reinterpret_cast<float*>(ADDR_D3D_VS_CONSTANTS);
-    vsConsts[58 * 4 + 0] =  vpW * 0.5f;
-    vsConsts[58 * 4 + 1] = -vpH * 0.5f;
-    vsConsts[58 * 4 + 2] =  vpMaxZ - vpMinZ;
-    vsConsts[58 * 4 + 3] =  1.0f;
-    vsConsts[59 * 4 + 0] =  vpX + vpW * 0.5f;
-    vsConsts[59 * 4 + 1] =  vpY + vpH * 0.5f;
-    vsConsts[59 * 4 + 2] =  vpMinZ;
-    vsConsts[59 * 4 + 3] =  0.0f;
-
-    D3D11_MAPPED_SUBRESOURCE mappedVS = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_cbVSConstants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVS))) {
-        memcpy(mappedVS.pData, reinterpret_cast<const void*>(ADDR_D3D_VS_CONSTANTS), 192 * 16);
-        g_d3dCtx->Unmap(g_cbVSConstants, 0);
-    }
-
-    float uScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    float vScale[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    bool  isCube[4] = { false, false, false, false };
-    bool  isVol[4]  = { false, false, false, false };
-    ID3D11ShaderResourceView* stageSrvs[4] = {
-        GetOrCreateD3D11SRV(g_boundTextures[0], &uScale[0], &vScale[0], &isCube[0], &isVol[0]),
-        GetOrCreateD3D11SRV(g_boundTextures[1], &uScale[1], &vScale[1], &isCube[1], &isVol[1]),
-        GetOrCreateD3D11SRV(g_boundTextures[2], &uScale[2], &vScale[2], &isCube[2], &isVol[2]),
-        GetOrCreateD3D11SRV(g_boundTextures[3], &uScale[3], &vScale[3], &isCube[3], &isVol[3])
+    float newC58_59[8] = {
+         vpW * 0.5f,
+        -vpH * 0.5f,
+         vpMaxZ - vpMinZ,
+         1.0f,
+         vpX + vpW * 0.5f + g_screenSpaceOffsetX,
+         vpY + vpH * 0.5f + g_screenSpaceOffsetY,
+         vpMinZ,
+         0.0f
     };
+    float* vsConsts = reinterpret_cast<float*>(ADDR_D3D_VS_CONSTANTS);
+    if (memcmp(&vsConsts[58 * 4], newC58_59, sizeof(newC58_59)) != 0) {
+        memcpy(&vsConsts[58 * 4], newC58_59, sizeof(newC58_59));
+        ++g_vsConstantsDirtyGen;
+    }
+    UploadVsConstantsCBIfChanged();
+
     ID3D11ShaderResourceView* srvs[13] = {};
-    for (int s = 0; s < 4; ++s) {
-        if (!stageSrvs[s]) continue;
-        if (isCube[s])     srvs[4 + s] = stageSrvs[s];
-        else if (isVol[s]) srvs[8 + s] = stageSrvs[s];
-        else               srvs[0 + s] = stageSrvs[s];
-    }
-    srvs[12] = g_gammaLutSRV;
-
+    bool hwScissor = false;
     PerDrawCBData cb = {};
-    Mat44 wvp = MulMat44(MulMat44(g_matWorld, g_matView), g_matProj);
-    for (int i = 0; i < 4; ++i) {
-        cb.wvpRow0[i] = wvp.m[0][i];
-        cb.wvpRow1[i] = wvp.m[1][i];
-        cb.wvpRow2[i] = wvp.m[2][i];
-        cb.wvpRow3[i] = wvp.m[3][i];
-    }
-    cb.viewport[0] = vpX;
-    cb.viewport[1] = vpY;
-    cb.viewport[2] = vpW;
-    cb.viewport[3] = vpH;
+    ID3D11PixelShader* activePS = PopulateCommonPerDrawCB(
+        cb, g_matWorld, decl.hasRhw, true, decl.writesOFog, 0u,
+        vpX, vpY, vpW, vpH, srvs, &hwScissor);
 
-    UnpackD3DColor(xboxRS[XBOX_D3DRS_TEXTUREFACTOR], &cb.tfactor[0], &cb.tfactor[1], &cb.tfactor[2], &cb.tfactor[3]);
-
-    const bool     hasProgPs        = (g_currentPsHandle != 0 && g_currentPsType >= 0);
-    const uint32_t psTexModes       = xboxRS[XBOX_D3DRS_PSTEXTUREMODES];
-    bool           ffCascadeActive  = true;
-    uint32_t*      stageOpsPtrs[4]   = { cb.stage0Ops,   cb.stage1Ops,   cb.stage2Ops,   cb.stage3Ops   };
-    uint32_t*      stageAlphaPtrs[4] = { cb.stage0Alpha, cb.stage1Alpha, cb.stage2Alpha, cb.stage3Alpha };
-    uint32_t       texMask          = 0;
-    uint32_t       cubeMask         = 0;
-    uint32_t       volMask          = 0;
-    uint32_t       projMask         = 0;
-    uint32_t       alphaKillMask    = 0;
-    uint32_t       tempResultMask   = 0;
-    for (int s = 0; s < 4; ++s) {
-        stageOpsPtrs[s][0]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLOROP];
-        stageOpsPtrs[s][1]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG1];
-        stageOpsPtrs[s][2]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG2];
-        stageOpsPtrs[s][3]   = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORARG0];
-        stageAlphaPtrs[s][0] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAOP];
-        stageAlphaPtrs[s][1] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG1];
-        stageAlphaPtrs[s][2] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG2];
-        stageAlphaPtrs[s][3] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAARG0];
-
-        if (!hasProgPs && stageOpsPtrs[s][0] <= 1u) {
-            ffCascadeActive = false;
-        }
-        const uint32_t stagePsMode    = (psTexModes >> (s * 5)) & 0x1Fu;
-        const bool     stageEnabled   = hasProgPs ? (stagePsMode != 0u) : ffCascadeActive;
-        const bool     stageTexActive = (stageSrvs[s] != nullptr) && stageEnabled;
-        if (stageTexActive) {
-            texMask |= (1u << s);
-            if (isCube[s]) cubeMask |= (1u << s);
-            if (isVol[s])  volMask  |= (1u << s);
-            const bool isStageProj = hasProgPs
-                ? (stagePsMode == 1u || stagePsMode == 2u)
-                : ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_TEXTURETRANSFORMFLAGS] & 0x0100u) != 0u);
-            if (isStageProj) {
-                projMask |= (1u << s);
-            }
-            if ((xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_ALPHAKILL] & 0x04u) != 0u) {
-                alphaKillMask |= (1u << s);
-            }
-        }
-        uint32_t resArg = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_RESULTARG] & 0x0Fu;
-        if (resArg == 0x05u || resArg == 0x0Du) { // D3DTA_TEMP
-            tempResultMask |= (1u << s);
-        }
-        cb.stageColorKeyOp[s] = stageTexActive ? (xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYOP] & 0x03u) : 0u;
-        UnpackD3DColor(
-            xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORKEYCOLOR],
-            &cb.stageColorKeyColor[s][0], &cb.stageColorKeyColor[s][1],
-            &cb.stageColorKeyColor[s][2], &cb.stageColorKeyColor[s][3]);
-        cb.stageColorSign[s] = xboxTSS[s * XBOX_D3DTSS_MAX + XBOX_D3DTSS_COLORSIGN];
-    }
-
-    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
-    uint32_t scCount = (g_scissorEnabled && !hwScissor) ? g_scissorCount : 0u;
-    if (scCount > 8u) scCount = 8u;
-    for (uint32_t si = 0; si < scCount; ++si) {
-        cb.scissorRects[si][0] = (float)g_scissorRects[si].left;
-        cb.scissorRects[si][1] = (float)g_scissorRects[si].top;
-        cb.scissorRects[si][2] = (float)g_scissorRects[si].right;
-        cb.scissorRects[si][3] = (float)g_scissorRects[si].bottom;
-    }
-
-    cb.flags[0] = (decl.hasRhw ? 1u : 0u)
-                | (g_hasGammaRamp ? 2u : 0u)
-                | ((g_scissorEnabled && g_scissorExclusive) ? 4u : 0u)
-                | ((!decl.hasRhw && xboxRS[XBOX_D3DRS_SPECULARENABLE] != 0u) ? 8u : 0u)
-                | ((scCount & 0x0Fu) << 4);
-    cb.flags[1] = texMask
-                | (cubeMask << 4)
-                | ((projMask & 0x0Fu) << 8)
-                | (volMask << 12)
-                | (alphaKillMask << 16)
-                | (tempResultMask << 20);
-    cb.flags[2] = xboxRS[XBOX_D3DRS_ALPHATESTENABLE] ? 1u : 0u;
-    cb.flags[3] = (g_currentPsHandle != 0 && g_currentPsType >= 0) ? (uint32_t)(g_currentPsType + 1) : 0u;
-
-    cb.alphaTest[0] = (float)MapXboxCmpFuncInt(xboxRS[XBOX_D3DRS_ALPHAFUNC]);
-    cb.alphaTest[1] = (float)(xboxRS[XBOX_D3DRS_ALPHAREF] & 0xFFu) * (1.0f / 255.0f);
-    cb.alphaTest[2] = g_gamma;
-    cb.alphaTest[3] = g_brightness;
-
-    cb.uvScale01[0] = uScale[0]; cb.uvScale01[1] = vScale[0];
-    cb.uvScale01[2] = uScale[1]; cb.uvScale01[3] = vScale[1];
-    cb.uvScale23[0] = uScale[2]; cb.uvScale23[1] = vScale[2];
-    cb.uvScale23[2] = uScale[3]; cb.uvScale23[3] = vScale[3];
-
-    const uint32_t* bumpMat1 = &xboxTSS[1 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT00];
-    const uint32_t* bumpMat0 = &xboxTSS[0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVMAT00];
-    bool useStage1Bump = (bumpMat1[0] || bumpMat1[1] || bumpMat1[2] || bumpMat1[3]);
-    const uint32_t* chosenBump = useStage1Bump ? bumpMat1 : bumpMat0;
-    memcpy(&cb.bumpParams[0], chosenBump, 16);
-    if (cb.bumpParams[0] == 0.0f && cb.bumpParams[1] == 0.0f && cb.bumpParams[2] == 0.0f && cb.bumpParams[3] == 0.0f) {
-        cb.bumpParams[0] = 0.04f;
-        cb.bumpParams[2] = 0.04f;
-    }
-    uint32_t bumpStage0 = useStage1Bump ? 1u : 0u;
-    memcpy(&cb.bumpLuminance[0], &xboxTSS[bumpStage0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLSCALE], 4);
-    memcpy(&cb.bumpLuminance[1], &xboxTSS[bumpStage0 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLOFFSET], 4);
-    memcpy(&cb.bumpLuminance[2], &xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLSCALE], 4);
-    memcpy(&cb.bumpLuminance[3], &xboxTSS[2 * XBOX_D3DTSS_MAX + XBOX_D3DTSS_BUMPENVLOFFSET], 4);
-
-    if (xboxRS[XBOX_D3DRS_FOGENABLE] != 0 && !decl.hasRhw) {
-        uint32_t fogMode = xboxRS[XBOX_D3DRS_FOGTABLEMODE];
-        if (fogMode == 0) {
-            fogMode = decl.writesOFog ? 4u : 3u;
-        }
-        cb.fogParams[0] = (float)fogMode;
-        memcpy(&cb.fogParams[1], &xboxRS[XBOX_D3DRS_FOGSTART], 4);
-        memcpy(&cb.fogParams[2], &xboxRS[XBOX_D3DRS_FOGEND], 4);
-        memcpy(&cb.fogParams[3], &xboxRS[XBOX_D3DRS_FOGDENSITY], 4);
-        float fA = 1.0f;
-        UnpackD3DColor(xboxRS[XBOX_D3DRS_FOGCOLOR], &cb.fogColor[0], &cb.fogColor[1], &cb.fogColor[2], &fA);
-        bool isAddBlend = (xboxRS[XBOX_D3DRS_ALPHABLENDENABLE] != 0) && (xboxRS[XBOX_D3DRS_DESTBLEND] == 1 || xboxRS[XBOX_D3DRS_DESTBLEND] == 0x302);
-        cb.fogColor[3] = isAddBlend ? 1.0f : 0.0f;
-    }
-
-    memcpy(cb.psConst0, g_psConstants[0], 16);
-    memcpy(cb.psConst1, g_psConstants[1], 16);
-    memcpy(cb.psConst2, g_psConstants[2], 16);
-    memcpy(cb.psConst3, g_psConstants[3], 16);
-    memcpy(cb.psConst4, g_psConstants[4], 16);
-    memcpy(cb.psConst5, g_psConstants[5], 16);
-    memcpy(cb.psConst6, g_psConstants[6], 16);
-    memcpy(cb.psConst7, g_psConstants[7], 16);
-
-    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
-        memcpy(mappedCB.pData, &cb, sizeof(cb));
-        g_d3dCtx->Unmap(g_cbPerDraw, 0);
-    }
+    UploadPerDrawCBIfChanged(cb);
 
     uint32_t cwRaw = xboxRS[XBOX_D3DRS_COLORWRITEENABLE];
     uint32_t cwMask = 0x0Fu;
@@ -1762,7 +2752,7 @@ static void SubmitXvuDrawD3D11(
         xboxRS[XBOX_D3DRS_STENCILENABLE], xboxRS[XBOX_D3DRS_STENCILFAIL],
         xboxRS[XBOX_D3DRS_STENCILZFAIL], xboxRS[XBOX_D3DRS_STENCILPASS],
         xboxRS[XBOX_D3DRS_STENCILFUNC], xboxRS[XBOX_D3DRS_STENCILMASK], xboxRS[XBOX_D3DRS_STENCILWRITEMASK]);
-    uint32_t cull = decl.hasRhw ? 0 : xboxRS[XBOX_D3DRS_CULLMODE];
+    uint32_t cull = xboxRS[XBOX_D3DRS_CULLMODE];
     ID3D11RasterizerState* rs = GetRastState(
         cull, xboxRS[XBOX_D3DRS_FILLMODE], xboxRS[XBOX_D3DRS_ZBIAS], hwScissor, xboxRS[XBOX_D3DRS_FRONTFACE]);
 
@@ -1773,7 +2763,6 @@ static void SubmitXvuDrawD3D11(
     vp11.Height   = vpH;
     vp11.MinDepth = decl.hasRhw ? 0.0f : vpMinZ;
     vp11.MaxDepth = decl.hasRhw ? 1.0f : vpMaxZ;
-    g_d3dCtx->RSSetViewports(1, &vp11);
 
     ID3D11SamplerState* smps[4] = {
         GetStageSamplerState(0),
@@ -1796,33 +2785,32 @@ static void SubmitXvuDrawD3D11(
             blendFactor[0] = blendFactor[1] = blendFactor[2] = blendFactor[3];
         }
     }
-    g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
-    g_d3dCtx->OMSetDepthStencilState(ds, xboxRS[XBOX_D3DRS_STENCILREF] & 0xFFu);
-    g_d3dCtx->RSSetState(rs);
-
-    g_d3dCtx->IASetInputLayout(decl.gpuInputLayout);
-    g_d3dCtx->IASetVertexBuffers(0, numStreams, s_dynStreamVB, strides, byteOff);
-    g_d3dCtx->IASetPrimitiveTopology(topo);
 
     ID3D11Buffer* cbVBs[2] = { g_cbPerDraw, g_cbVSConstants };
-    g_d3dCtx->VSSetShader(decl.gpuVS, nullptr, 0);
-    g_d3dCtx->VSSetConstantBuffers(0, 2, cbVBs);
-    ID3D11PixelShader* activePS = GetPixelShaderPermutation(cb.flags[3]);
-    g_d3dCtx->PSSetShader(activePS, nullptr, 0);
-    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
-
-    g_d3dCtx->PSSetShaderResources(0, 13, srvs);
-    g_d3dCtx->PSSetSamplers(0, 4, smps);
+    ApplyShadowedD3D11RenderPipeline(
+        &vp11,
+        bs, blendFactor, 0xFFFFFFFFu,
+        ds, xboxRS[XBOX_D3DRS_STENCILREF] & 0xFFu,
+        rs,
+        decl.gpuInputLayout, static_cast<uint32_t>(topo),
+        numStreams, boundVBs, boundStrides, boundOffsets,
+        useIB, boundIB, static_cast<uint32_t>(DXGI_FORMAT_R16_UINT), 0u,
+        decl.gpuVS, 2u, cbVBs,
+        activePS, g_cbPerDraw,
+        srvs, smps);
 
     if (useIB) {
-        g_d3dCtx->IASetIndexBuffer(s_dynIB, DXGI_FORMAT_R16_UINT, 0);
-        g_d3dCtx->DrawIndexed(drawIdxCount, startIndex, 0);
+        g_d3dCtx->DrawIndexed(drawIdxCount, startIndex, hwBaseVertLoc);
     } else {
-        g_d3dCtx->Draw(numVerts, 0);
+        g_d3dCtx->Draw(vertexCount, hwStartVertLoc);
     }
 
-    if (g_curOffscreenRT == nullptr) {
-        g_backBufferDirty = true;
+    MarkActiveRenderTargetGpuDirty();
+    if (g_curActiveDSV != nullptr &&
+        ((xboxRS[XBOX_D3DRS_ZENABLE] != 0u && xboxRS[XBOX_D3DRS_ZWRITEENABLE] != 0u) ||
+         xboxRS[XBOX_D3DRS_STENCILENABLE] != 0u))
+    {
+        MarkActiveDepthStencilGpuDirty();
     }
 }
 
@@ -1830,10 +2818,11 @@ static void __stdcall Bridge_D3DDevice_DrawVerticesUP(
     DWORD PrimitiveType, UINT VertexCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride)
 {
     g_curPrelitUseCustomBase = false;
-    if (!pVertexStreamZeroData || VertexCount == 0 || VertexStreamZeroStride == 0) return;
+    if (VertexCount == 0) return;
 
     XboxShaderDeclInfo decl = {};
-    if (GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS && decl.gpuInputLayout) {
+    if (GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS) {
+        if (decl.gpuInputLayout != nullptr && (!pVertexStreamZeroData || VertexStreamZeroStride == 0)) return;
         SubmitXvuDrawD3D11(
             decl, PrimitiveType,
             reinterpret_cast<const uint8_t*>(pVertexStreamZeroData),
@@ -1841,10 +2830,13 @@ static void __stdcall Bridge_D3DDevice_DrawVerticesUP(
         return;
     }
 
+    if (!pVertexStreamZeroData || VertexStreamZeroStride == 0) return;
+
     static std::vector<UnifiedVertex> verts;
     verts.clear();
     bool isRhw = false;
     DecodeVerticesToUnified(
+        PrimitiveType,
         reinterpret_cast<const uint8_t*>(pVertexStreamZeroData),
         VertexStreamZeroStride, VertexCount, nullptr, 0, verts, &isRhw);
     SubmitUnifiedVerticesD3D11(PrimitiveType, verts, isRhw);
@@ -1853,22 +2845,26 @@ static void __stdcall Bridge_D3DDevice_DrawVerticesUP(
 static void __stdcall Bridge_D3DDevice_DrawVertices(
     DWORD PrimitiveType, UINT StartVertex, UINT VertexCount)
 {
-    if (!g_streams[0].data || g_streams[0].stride == 0 || VertexCount == 0) return;
+    if (VertexCount == 0) return;
 
     XboxShaderDeclInfo decl = {};
-    if (GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS && decl.gpuInputLayout) {
+    if (GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS) {
+        if (decl.gpuInputLayout != nullptr && (!g_streams[0].data || g_streams[0].stride == 0)) return;
         SubmitXvuDrawD3D11(
             decl, PrimitiveType,
             reinterpret_cast<const uint8_t*>(g_streams[0].data),
-            g_streams[0].stride, VertexCount, nullptr, StartVertex);
+            g_streams[0].stride, VertexCount, nullptr, StartVertex, true);
         g_curPrelitUseCustomBase = false;
         return;
     }
+
+    if (!g_streams[0].data || g_streams[0].stride == 0) return;
 
     static std::vector<UnifiedVertex> verts;
     verts.clear();
     bool isRhw = false;
     DecodeVerticesToUnified(
+        PrimitiveType,
         reinterpret_cast<const uint8_t*>(g_streams[0].data),
         g_streams[0].stride, VertexCount, nullptr, StartVertex, verts, &isRhw);
     g_curPrelitUseCustomBase = false;
@@ -1878,23 +2874,27 @@ static void __stdcall Bridge_D3DDevice_DrawVertices(
 static void __stdcall Bridge_D3DDevice_DrawIndexedVertices(
     DWORD PrimitiveType, UINT VertexCount, const uint16_t* pIndexData)
 {
-    if (!g_streams[0].data || g_streams[0].stride == 0 || !pIndexData || VertexCount == 0) return;
+    if (!pIndexData || VertexCount == 0) return;
 
     XboxShaderDeclInfo decl = {};
     bool hasDecl = GetXboxVertexShaderDecl(g_currentVsHandle, &decl);
-    if (hasDecl && decl.isCompiledXvu && decl.gpuVS && decl.gpuInputLayout) {
+    if (hasDecl && decl.isCompiledXvu && decl.gpuVS) {
+        if (decl.gpuInputLayout != nullptr && (!g_streams[0].data || g_streams[0].stride == 0)) return;
         SubmitXvuDrawD3D11(
             decl, PrimitiveType,
             reinterpret_cast<const uint8_t*>(g_streams[0].data),
-            g_streams[0].stride, VertexCount, pIndexData, g_baseVertexIndex);
+            g_streams[0].stride, VertexCount, pIndexData, g_baseVertexIndex, true);
         g_curPrelitUseCustomBase = false;
         return;
     }
+
+    if (!g_streams[0].data || g_streams[0].stride == 0) return;
 
     static std::vector<UnifiedVertex> verts;
     verts.clear();
     bool isRhw = false;
     DecodeVerticesToUnified(
+        PrimitiveType,
         reinterpret_cast<const uint8_t*>(g_streams[0].data),
         g_streams[0].stride, VertexCount, pIndexData, g_baseVertexIndex, verts, &isRhw);
     g_curPrelitUseCustomBase = false;
@@ -1905,8 +2905,12 @@ static void __stdcall Bridge_D3DDevice_DrawIndexedVertices(
 static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer, void* pFixup) {
     if (!pPushBuffer || !pPushBuffer->Data || pPushBuffer->Size < 8) return;
 
-    const uint8_t* pbBytes = reinterpret_cast<const uint8_t*>(pPushBuffer->Data);
-    uint32_t       pbSize  = pPushBuffer->Size;
+    DrainPendingGpuBufferEvictions();
+
+    const uint8_t* pbBytes      = reinterpret_cast<const uint8_t*>(pPushBuffer->Data);
+    uint32_t       pbSize       = pPushBuffer->Size;
+    const bool     canCachePbIb = (pFixup == nullptr) && !IsEngineDynamicRingAddress(pPushBuffer->Data);
+    const uint32_t pbAllocSpan  = pPushBuffer->AllocationSize ? pPushBuffer->AllocationSize : pbSize;
 
     // Apply XboxPushBufferFixup patches (_D3DPushBuffer_Fixup@12 at 0x006BAC30)
     static std::vector<uint8_t> patchedPb;
@@ -1932,17 +2936,102 @@ static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer
         }
     }
 
-    const uint32_t* p    = reinterpret_cast<const uint32_t*>(pbBytes);
-    const uint32_t* pEnd = p + (pbSize / 4);
+    const uint32_t* pStart = reinterpret_cast<const uint32_t*>(pbBytes);
+    const uint32_t* p      = pStart;
+    const uint32_t* pEnd   = p + (pbSize / 4);
 
-    uint32_t curPrim      = 0;
-    uint32_t vsConstLoad  = 0;
-    uint32_t* xboxRS      = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
-    const uint32_t* rsEnc = reinterpret_cast<const uint32_t*>(ADDR_SIMPLE_RS_ENCODE);
+    uint32_t curPrim          = 0u;
+    uint32_t curBeginByteOff  = 0u;
+    const CachedPushBufferPacket* activeCachedPb = nullptr;
+    uint32_t vsConstLoad      = 0u;
+    uint32_t vsProgLoad       = 0u;
+    uint32_t curProgDwords[4] = {};
+    uint32_t* xboxRS          = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
     static std::vector<uint16_t> curIndices;
     static std::vector<uint32_t> curInlineDwords;
+    static std::vector<uint16_t> convertedPbIndices;
     curIndices.clear();
     curInlineDwords.clear();
+
+    auto flushPushBufferPrimitive = [&]() {
+        if (curPrim == 0u) return;
+        if (activeCachedPb != nullptr) {
+            XboxShaderDeclInfo decl = {};
+            if (GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS) {
+                if (decl.gpuInputLayout == nullptr || (g_streams[0].data && g_streams[0].stride > 0u)) {
+                    SubmitXvuDrawD3D11(
+                        decl, curPrim,
+                        reinterpret_cast<const uint8_t*>(g_streams[0].data),
+                        g_streams[0].stride,
+                        static_cast<uint32_t>(activeCachedPb->rawIndices.size()),
+                        activeCachedPb->rawIndices.data(),
+                        g_baseVertexIndex, true, activeCachedPb);
+                    g_curPrelitUseCustomBase = false;
+                }
+            } else if (!activeCachedPb->rawIndices.empty()) {
+                Bridge_D3DDevice_DrawIndexedVertices(
+                    curPrim, static_cast<UINT>(activeCachedPb->rawIndices.size()), activeCachedPb->rawIndices.data());
+            }
+            return;
+        }
+
+        if (!curIndices.empty()) {
+            const CachedPushBufferPacket* newlyCached = nullptr;
+            if (canCachePbIb && g_d3dDevice) {
+                D3D11_PRIMITIVE_TOPOLOGY pbTopo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                if (ConvertXboxPrimIndices(curPrim, curIndices.data(), static_cast<uint32_t>(curIndices.size()), 0u, &pbTopo, convertedPbIndices) &&
+                    !convertedPbIndices.empty())
+                {
+                    if (g_gpuBufOwnerThreadId == 0u) g_gpuBufOwnerThreadId = GetCurrentThreadId();
+                    ID3D11Buffer* pbIb = nullptr;
+                    D3D11_BUFFER_DESC ibd = {};
+                    ibd.ByteWidth      = static_cast<UINT>(convertedPbIndices.size() * sizeof(uint16_t));
+                    ibd.Usage          = D3D11_USAGE_DEFAULT;
+                    ibd.BindFlags      = D3D11_BIND_INDEX_BUFFER;
+                    ibd.CPUAccessFlags = 0u;
+                    D3D11_SUBRESOURCE_DATA initData = {};
+                    initData.pSysMem = convertedPbIndices.data();
+                    if (SUCCEEDED(g_d3dDevice->CreateBuffer(&ibd, &initData, &pbIb)) && pbIb) {
+                        PushBufferPacketKey key = { pPushBuffer->Data, curBeginByteOff, curPrim };
+                        CachedPushBufferPacket pkt = {};
+                        pkt.ib           = pbIb;
+                        pkt.device       = g_d3dDevice;
+                        pkt.d3dTopo      = pbTopo;
+                        pkt.drawIdxCount = static_cast<uint32_t>(convertedPbIndices.size());
+                        pkt.pbByteSpan   = pbAllocSpan;
+                        pkt.rawIndices   = curIndices;
+                        auto ins = g_staticPbCache.emplace(key, std::move(pkt));
+                        newlyCached = &ins.first->second;
+                        uint64_t end64 = static_cast<uint64_t>(pPushBuffer->Data) + static_cast<uint64_t>(pbAllocSpan);
+                        NoteTrackedGpuBufBounds(pPushBuffer->Data, (end64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : static_cast<uintptr_t>(end64));
+                    }
+                }
+            }
+            XboxShaderDeclInfo decl = {};
+            if (newlyCached && GetXboxVertexShaderDecl(g_currentVsHandle, &decl) && decl.isCompiledXvu && decl.gpuVS) {
+                if (decl.gpuInputLayout == nullptr || (g_streams[0].data && g_streams[0].stride > 0u)) {
+                    // First creation is a cache populate (not a hit), so pass newlyCached after recording without inflating hit count
+                    uint64_t savedHits = g_diagStaticPushBufferHitCount;
+                    SubmitXvuDrawD3D11(
+                        decl, curPrim,
+                        reinterpret_cast<const uint8_t*>(g_streams[0].data),
+                        g_streams[0].stride,
+                        static_cast<uint32_t>(curIndices.size()),
+                        curIndices.data(),
+                        g_baseVertexIndex, true, newlyCached);
+                    g_diagStaticPushBufferHitCount = savedHits;
+                    g_curPrelitUseCustomBase = false;
+                }
+            } else {
+                Bridge_D3DDevice_DrawIndexedVertices(curPrim, static_cast<UINT>(curIndices.size()), curIndices.data());
+            }
+        } else if (!curInlineDwords.empty() && g_streams[0].stride > 0u) {
+            uint32_t vCount = (static_cast<uint32_t>(curInlineDwords.size()) * 4u) / g_streams[0].stride;
+            if (vCount > 0u) {
+                Bridge_D3DDevice_DrawVerticesUP(curPrim, vCount, curInlineDwords.data(), g_streams[0].stride);
+            }
+        }
+    };
 
     while (p < pEnd) {
         uint32_t hdr = *p;
@@ -1962,14 +3051,18 @@ static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer
         if (p + 1 + dwordCount > pEnd) break;
 
         if (baseMethod == 0x1800u && nonInc) { // NV097_ARRAY_ELEMENT16
-            const uint16_t* idxPtr = reinterpret_cast<const uint16_t*>(p + 1);
-            curIndices.insert(curIndices.end(), idxPtr, idxPtr + dwordCount * 2);
+            if (!activeCachedPb) {
+                const uint16_t* idxPtr = reinterpret_cast<const uint16_t*>(p + 1);
+                curIndices.insert(curIndices.end(), idxPtr, idxPtr + dwordCount * 2);
+            }
             p += 1 + dwordCount;
             continue;
         }
         if (baseMethod == 0x1808u && nonInc) { // NV097_ARRAY_ELEMENT32
-            for (uint32_t i = 0; i < dwordCount; ++i) {
-                curIndices.push_back((uint16_t)(p[1 + i] & 0xFFFFu));
+            if (!activeCachedPb) {
+                for (uint32_t i = 0; i < dwordCount; ++i) {
+                    curIndices.push_back(static_cast<uint16_t>(p[1 + i] & 0xFFFFu));
+                }
             }
             p += 1 + dwordCount;
             continue;
@@ -1986,34 +3079,46 @@ static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer
 
             if (m == 0x17FCu) { // NV097_SET_BEGIN_END
                 if (val == 0u) {
-                    if (curPrim != 0u) {
-                        if (!curIndices.empty()) {
-                            Bridge_D3DDevice_DrawIndexedVertices(curPrim, (UINT)curIndices.size(), curIndices.data());
-                        } else if (!curInlineDwords.empty() && g_streams[0].stride > 0) {
-                            uint32_t vCount = ((uint32_t)curInlineDwords.size() * 4u) / g_streams[0].stride;
-                            if (vCount > 0) {
-                                Bridge_D3DDevice_DrawVerticesUP(curPrim, vCount, curInlineDwords.data(), g_streams[0].stride);
+                    flushPushBufferPrimitive();
+                    curIndices.clear();
+                    curInlineDwords.clear();
+                    curPrim        = 0u;
+                    activeCachedPb = nullptr;
+                } else {
+                    curPrim         = val;
+                    curBeginByteOff = static_cast<uint32_t>((p - pStart + 1 + i) * 4);
+                    curIndices.clear();
+                    curInlineDwords.clear();
+                    activeCachedPb  = nullptr;
+                    if (canCachePbIb && g_d3dDevice) {
+                        PushBufferPacketKey key = { pPushBuffer->Data, curBeginByteOff, curPrim };
+                        auto it = g_staticPbCache.find(key);
+                        if (it != g_staticPbCache.end()) {
+                            if (it->second.ib != nullptr && it->second.device == g_d3dDevice) {
+                                activeCachedPb = &it->second;
+                            } else {
+                                if (it->second.ib) it->second.ib->Release();
+                                g_staticPbCache.erase(it);
                             }
                         }
                     }
-                    curIndices.clear();
-                    curInlineDwords.clear();
-                    curPrim = 0u;
-                } else {
-                    curPrim = val;
-                    curIndices.clear();
-                    curInlineDwords.clear();
                 }
             } else if (m == 0x1800u) { // NV097_ARRAY_ELEMENT16 (Type 0 single dword)
-                curIndices.push_back((uint16_t)(val & 0xFFFFu));
-                curIndices.push_back((uint16_t)((val >> 16) & 0xFFFFu));
+                if (!activeCachedPb) {
+                    curIndices.push_back(static_cast<uint16_t>(val & 0xFFFFu));
+                    curIndices.push_back(static_cast<uint16_t>((val >> 16) & 0xFFFFu));
+                }
             } else if (m == 0x1808u) { // NV097_ARRAY_ELEMENT32 (Type 0 single dword)
-                curIndices.push_back((uint16_t)(val & 0xFFFFu));
+                if (!activeCachedPb) {
+                    curIndices.push_back(static_cast<uint16_t>(val & 0xFFFFu));
+                }
             } else if (m == 0x1810u) { // NV097_DRAW_ARRAYS
-                uint32_t startV = val & 0xFFFFFFu;
-                uint32_t countV = ((val >> 24) & 0xFFu) + 1u;
-                for (uint32_t v = 0; v < countV; ++v) {
-                    curIndices.push_back((uint16_t)(startV + v));
+                if (!activeCachedPb) {
+                    uint32_t startV = val & 0xFFFFFFu;
+                    uint32_t countV = ((val >> 24) & 0xFFu) + 1u;
+                    for (uint32_t v = 0; v < countV; ++v) {
+                        curIndices.push_back(static_cast<uint16_t>(startV + v));
+                    }
                 }
             } else if (m == 0x1818u) { // NV097_INLINE_ARRAY (Type 0)
                 curInlineDwords.push_back(val);
@@ -2036,17 +3141,34 @@ static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer
                 uint32_t chanIdx = compIdx & 3u;
                 if (regIdx < 192u) {
                     reinterpret_cast<uint32_t*>(ADDR_D3D_VS_CONSTANTS)[regIdx * 4u + chanIdx] = val;
+                    ++g_vsConstantsDirtyGen;
                 }
                 if (chanIdx == 3u && compIdx == 31u) {
                     vsConstLoad += 8u;
                 }
+            } else if (m == 0x1E9Cu) { // NV097_SET_TRANSFORM_PROGRAM_LOAD
+                vsProgLoad = val;
+            } else if (m >= 0x0B00u && m < 0x0B80u) { // NV097_SET_TRANSFORM_PROGRAM
+                uint32_t compIdx = (m - 0x0B00u) >> 2;
+                uint32_t slotOff = compIdx >> 2;
+                uint32_t chanIdx = compIdx & 3u;
+                curProgDwords[chanIdx] = val;
+                if (chanIdx == 3u) {
+                    LoadCheopsProgramSlots(vsProgLoad + slotOff, curProgDwords, 1u);
+                    if (compIdx == 31u) {
+                        vsProgLoad += 8u;
+                    }
+                }
+            } else if (m == 0x1E70u) { // NV097_SET_SHADER_STAGE_PROGRAM
+                xboxRS[XBOX_D3DRS_PSTEXTUREMODES] = val;
+                *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x790) = val;
+                NotifyXboxPsRenderStateChanged(XBOX_D3DRS_PSTEXTUREMODES, val);
             } else {
-                // Match against Xbox _D3D__SimpleRenderStateEncode[0..91] (0x007502A0)
-                uint32_t encodedHdr = 0x00040000u | m;
-                for (uint32_t rs = 0; rs < 92u; ++rs) {
-                    if (rsEnc[rs] == encodedHdr) {
-                        xboxRS[rs] = val;
-                        break;
+                uint32_t rs = DecodeSimpleRenderStateIndex(m);
+                if (rs < 92u) {
+                    xboxRS[rs] = val;
+                    if (rs <= XBOX_D3DRS_PSINPUTTEXTURE) {
+                        NotifyXboxPsRenderStateChanged(rs, val);
                     }
                 }
             }
@@ -2054,9 +3176,10 @@ static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer
         p += 1 + dwordCount;
     }
 
-    if (curPrim != 0u && !curIndices.empty()) {
-        Bridge_D3DDevice_DrawIndexedVertices(curPrim, (UINT)curIndices.size(), curIndices.data());
+    if (curPrim != 0u && (activeCachedPb != nullptr || !curIndices.empty())) {
+        flushPushBufferPrimitive();
         curIndices.clear();
+        activeCachedPb = nullptr;
     }
 }
 
@@ -2081,7 +3204,17 @@ static constexpr uint32_t kXboxTtffProjected         = 0x100u;
 static constexpr uint32_t kXboxDeviceTexMatrixOffset = 0xCE0u; // CDevice+0xC60 + 2*64 (D3DTS_TEXTURE0..3)
 
 static uint32_t                   g_immPrimType = 0;
-static UnifiedVertex              g_immCur      = { 0, 0, 0, 1.0f, 0, 0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0f };
+static UnifiedVertex              g_immCur      = {
+    0, 0, 0, 1.0f,
+    0, 0, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 1.0f,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    1.0f, 1.0f, 1.0f, 1.0f
+};
 static bool                       g_immHasUv1   = false;
 static bool                       g_immHasUv2   = false;
 static bool                       g_immHasUv3   = false;
@@ -2106,23 +3239,27 @@ static void __stdcall Bridge_D3DDevice_SetVertexData2f(int Register, float x, fl
         g_immCur.u0 = x;
         g_immCur.v0 = y;
         g_immCur.w0 = 0.0f;
-        if (!g_immHasUv1) { g_immCur.u1 = x; g_immCur.v1 = y; g_immCur.w1 = 0.0f; }
-        if (!g_immHasUv2) { g_immCur.u2 = x; g_immCur.v2 = y; g_immCur.w2 = 0.0f; }
-        if (!g_immHasUv3) { g_immCur.u3 = x; g_immCur.v3 = y; g_immCur.w3 = 0.0f; }
+        g_immCur.q0 = 1.0f;
+        if (!g_immHasUv1) { g_immCur.u1 = x; g_immCur.v1 = y; g_immCur.w1 = 0.0f; g_immCur.q1 = 1.0f; }
+        if (!g_immHasUv2) { g_immCur.u2 = x; g_immCur.v2 = y; g_immCur.w2 = 0.0f; g_immCur.q2 = 1.0f; }
+        if (!g_immHasUv3) { g_immCur.u3 = x; g_immCur.v3 = y; g_immCur.w3 = 0.0f; g_immCur.q3 = 1.0f; }
     } else if (Register == kXboxVsdeTexCoord1) {
         g_immCur.u1 = x;
         g_immCur.v1 = y;
         g_immCur.w1 = 0.0f;
+        g_immCur.q1 = 1.0f;
         g_immHasUv1 = true;
     } else if (Register == kXboxVsdeTexCoord2) {
         g_immCur.u2 = x;
         g_immCur.v2 = y;
         g_immCur.w2 = 0.0f;
+        g_immCur.q2 = 1.0f;
         g_immHasUv2 = true;
     } else if (Register == kXboxVsdeTexCoord3) {
         g_immCur.u3 = x;
         g_immCur.v3 = y;
         g_immCur.w3 = 0.0f;
+        g_immCur.q3 = 1.0f;
         g_immHasUv3 = true;
     }
 }
@@ -2152,23 +3289,27 @@ static void __stdcall Bridge_D3DDevice_SetVertexData4f(int Register, float x, fl
         g_immCur.u0 = x;
         g_immCur.v0 = y;
         g_immCur.w0 = z;
-        if (!g_immHasUv1) { g_immCur.u1 = x; g_immCur.v1 = y; g_immCur.w1 = z; }
-        if (!g_immHasUv2) { g_immCur.u2 = x; g_immCur.v2 = y; g_immCur.w2 = z; }
-        if (!g_immHasUv3) { g_immCur.u3 = x; g_immCur.v3 = y; g_immCur.w3 = z; }
+        g_immCur.q0 = w;
+        if (!g_immHasUv1) { g_immCur.u1 = x; g_immCur.v1 = y; g_immCur.w1 = z; g_immCur.q1 = w; }
+        if (!g_immHasUv2) { g_immCur.u2 = x; g_immCur.v2 = y; g_immCur.w2 = z; g_immCur.q2 = w; }
+        if (!g_immHasUv3) { g_immCur.u3 = x; g_immCur.v3 = y; g_immCur.w3 = z; g_immCur.q3 = w; }
     } else if (Register == kXboxVsdeTexCoord1) {
         g_immCur.u1 = x;
         g_immCur.v1 = y;
         g_immCur.w1 = z;
+        g_immCur.q1 = w;
         g_immHasUv1 = true;
     } else if (Register == kXboxVsdeTexCoord2) {
         g_immCur.u2 = x;
         g_immCur.v2 = y;
         g_immCur.w2 = z;
+        g_immCur.q2 = w;
         g_immHasUv2 = true;
     } else if (Register == kXboxVsdeTexCoord3) {
         g_immCur.u3 = x;
         g_immCur.v3 = y;
         g_immCur.w3 = z;
+        g_immCur.q3 = w;
         g_immHasUv3 = true;
     }
 }
@@ -2197,8 +3338,11 @@ static void __stdcall Bridge_D3DDevice_SetVertexDataColor(int Register, DWORD Co
 
 static void __stdcall Bridge_D3DDevice_End() {
     if (g_immVerts.empty()) return;
-    g_lastProjMask = 0;
-    g_gpuLightMode = 0;
+    g_lastProjMask        = 0;
+    g_gpuLightMode        = 0;
+    g_drawSkinWeightCount = 0;
+    g_drawBoneCount       = 0;
+    g_drawSkinIgnoreWorld = false;
     bool isRhw = ((g_currentVsHandle & 0x00010001u) == 0) && ((g_currentVsHandle & 0x004u) != 0);
 
     // Route Stage 0..3 UVs according to D3DTSS_TEXCOORDINDEX and D3DTSS_TEXTURETRANSFORMFLAGS
@@ -2209,9 +3353,11 @@ static void __stdcall Bridge_D3DDevice_End() {
         float rawU[kXboxTexStageCount] = { v.u0, v.u1, v.u2, v.u3 };
         float rawV[kXboxTexStageCount] = { v.v0, v.v1, v.v2, v.v3 };
         float rawW[kXboxTexStageCount] = { v.w0, v.w1, v.w2, v.w3 };
+        float rawQ[kXboxTexStageCount] = { v.q0, v.q1, v.q2, v.q3 };
         float finalU[kXboxTexStageCount];
         float finalV[kXboxTexStageCount];
         float finalW[kXboxTexStageCount];
+        float finalQ[kXboxTexStageCount];
 
         for (uint32_t s = 0; s < kXboxTexStageCount; ++s) {
             uint32_t tci    = xboxTSS[s * kXboxTssStride + kXboxTssTciOffset];
@@ -2220,32 +3366,40 @@ static void __stdcall Bridge_D3DDevice_End() {
             float tu = rawU[srcIdx];
             float tv = rawV[srcIdx];
             float tw = rawW[srcIdx];
+            float tq = rawQ[srcIdx];
 
             uint32_t dimCount = ttf & 0xFFu;
             if (!isRhw && dimCount > 0 && dimCount <= 4) {
                 const Mat44& tm = texMats[s];
                 float inZ  = (dimCount >= 3) ? tw : 1.0f;
-                float outU = tu * tm.m[0][0] + tv * tm.m[1][0] + inZ * tm.m[2][0] + tm.m[3][0];
-                float outV = tu * tm.m[0][1] + tv * tm.m[1][1] + inZ * tm.m[2][1] + tm.m[3][1];
-                float outZ = tu * tm.m[0][2] + tv * tm.m[1][2] + inZ * tm.m[2][2] + tm.m[3][2];
-                float outW = tu * tm.m[0][3] + tv * tm.m[1][3] + inZ * tm.m[2][3] + tm.m[3][3];
+                float inW  = (dimCount == 4) ? tq : 1.0f;
+                float outU = tu * tm.m[0][0] + tv * tm.m[1][0] + inZ * tm.m[2][0] + inW * tm.m[3][0];
+                float outV = tu * tm.m[0][1] + tv * tm.m[1][1] + inZ * tm.m[2][1] + inW * tm.m[3][1];
+                float outZ = tu * tm.m[0][2] + tv * tm.m[1][2] + inZ * tm.m[2][2] + inW * tm.m[3][2];
+                float outW = tu * tm.m[0][3] + tv * tm.m[1][3] + inZ * tm.m[2][3] + inW * tm.m[3][3];
                 if (ttf & kXboxTtffProjected) {
                     float denom = (dimCount == 3) ? outZ : outW;
-                    v.w = (fabsf(denom) > 0.0001f) ? denom : 1.0f;
+                    tq = (fabsf(denom) > 1e-6f) ? denom : 1.0f;
                     g_lastProjMask |= (1u << s);
+                } else {
+                    tq = outW;
                 }
                 tu = outU;
                 tv = outV;
                 tw = outZ;
+            } else if (ttf & kXboxTtffProjected) {
+                tq = (fabsf(tq) > 1e-6f) ? tq : 1.0f;
+                g_lastProjMask |= (1u << s);
             }
             finalU[s] = tu;
             finalV[s] = tv;
             finalW[s] = tw;
+            finalQ[s] = tq;
         }
-        v.u0 = finalU[0]; v.v0 = finalV[0]; v.w0 = finalW[0];
-        v.u1 = finalU[1]; v.v1 = finalV[1]; v.w1 = finalW[1];
-        v.u2 = finalU[2]; v.v2 = finalV[2]; v.w2 = finalW[2];
-        v.u3 = finalU[3]; v.v3 = finalV[3]; v.w3 = finalW[3];
+        v.u0 = finalU[0]; v.v0 = finalV[0]; v.w0 = finalW[0]; v.q0 = finalQ[0];
+        v.u1 = finalU[1]; v.v1 = finalV[1]; v.w1 = finalW[1]; v.q1 = finalQ[1];
+        v.u2 = finalU[2]; v.v2 = finalV[2]; v.w2 = finalW[2]; v.q2 = finalQ[2];
+        v.u3 = finalU[3]; v.v3 = finalV[3]; v.w3 = finalW[3]; v.q3 = finalQ[3];
     }
 
     SubmitUnifiedVerticesD3D11(g_immPrimType, g_immVerts, isRhw);
@@ -2253,13 +3407,25 @@ static void __stdcall Bridge_D3DDevice_End() {
 }
 
 void InitXboxD3D8DrawBridges() {
+    RegisterXboxMemoryFreeCallback(&OnXboxMemoryFreedBufferHook);
+
+    // 0. Bridge VB / IB / Resource / PushBuffer Creation, Lock & Destruction Lifecycle
+    InstallBridge(0x006B34C0, &Bridge_D3DDevice_CreateVertexBuffer2); // _D3DDevice_CreateVertexBuffer2@4
+    InstallBridge(0x006B3480, &Bridge_D3DDevice_CreateIndexBuffer2);  // _D3DDevice_CreateIndexBuffer2@4
+    InstallBridge(0x005F1990, &Thunk_XboxIndexBufferLock_LTCG);       // D3DIndexBuffer_Lock (LTCG stub 1)
+    InstallBridge(0x005FBBC0, &Thunk_XboxIndexBufferLock_LTCG);       // D3DIndexBuffer_Lock (LTCG stub 2)
+    InstallBridge(0x00604A60, &Thunk_XboxIndexBufferLock_LTCG);       // D3DIndexBuffer_Lock (LTCG stub 3)
+    InstallBridge(0x006B4210, &Bridge_D3D_DestroyResource);           // ?DestroyResource@D3D@@YGXPAUD3DResource@@@Z
+    InstallBridge(0x005FBE20, &Bridge_directBuffer_FreePushBuffer);   // ?directBuffer_FreePushBuffer@@YAXPAUD3DPushBuffer@@@Z
+
     // 1. Bridge _D3DDevice_RunPushBuffer@8 (0x006BACD0) to execute recorded terrain/world pushbuffers
     InstallBridge(0x006BACD0, &Bridge_D3DDevice_RunPushBuffer);      // _D3DDevice_RunPushBuffer@8
 
     // 2. Bridge Transforms, Viewport, Material, Lights, Scissors
-    InstallBridge(0x006B03E0, &Bridge_D3DDevice_SetTransform);       // _D3DDevice_SetTransform@8
-    InstallBridge(0x006B12B0, &Bridge_D3DDevice_SetViewport);        // _D3DDevice_SetViewport@4
-    InstallBridge(0x006B0500, &Bridge_D3DDevice_SetMaterial);        // _D3DDevice_SetMaterial@4
+    InstallBridge(0x006B03E0, &Bridge_D3DDevice_SetTransform);        // _D3DDevice_SetTransform@8
+    InstallBridge(0x006B12B0, &Bridge_D3DDevice_SetViewport);         // _D3DDevice_SetViewport@4
+    InstallBridge(0x006B2050, &Bridge_D3DDevice_SetScreenSpaceOffset);// _D3DDevice_SetScreenSpaceOffset@8
+    InstallBridge(0x006B0500, &Bridge_D3DDevice_SetMaterial);         // _D3DDevice_SetMaterial@4
     InstallBridge(0x006B14E0, &Bridge_D3DDevice_SetLight);           // _D3DDevice_SetLight@8
     InstallBridge(0x006B17A0, &Bridge_D3DDevice_LightEnable);        // _D3DDevice_LightEnable@8
     InstallBridge(0x006B1D50, &Bridge_D3DDevice_SetScissors);        // _D3DDevice_SetScissors@12

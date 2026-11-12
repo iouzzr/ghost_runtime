@@ -2,12 +2,15 @@
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
 #include <d3d11.h>
-#include <dxgi.h>
+#include <d3dcompiler.h>
+#include <dxgi1_5.h>
 #include <math.h>
 #include <stdio.h>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxgi.lib")
 
 // ============================================================================
@@ -17,16 +20,22 @@
 ID3D11Device*             g_d3dDevice         = nullptr;
 ID3D11DeviceContext*      g_d3dCtx            = nullptr;
 IDXGISwapChain*           g_swapChain         = nullptr;
+ID3D11Texture2D*          g_swapChainTex      = nullptr;
+ID3D11RenderTargetView*   g_swapChainRTV      = nullptr;
 ID3D11Texture2D*          g_backBufferTex     = nullptr;
+ID3D11ShaderResourceView* g_backBufferSRV     = nullptr;
 ID3D11Texture2D*          g_backBufferCopyTex = nullptr;
 ID3D11ShaderResourceView* g_backBufferCopySRV = nullptr;
 bool                      g_backBufferDirty   = true;
+bool                      g_backBufferCpuDirty= false;
 ID3D11RenderTargetView*   g_rtv               = nullptr;
 ID3D11Texture2D*          g_depthTex          = nullptr;
 ID3D11DepthStencilView*   g_dsv               = nullptr;
+ID3D11ShaderResourceView* g_depthSRV          = nullptr;
 ID3D11RenderTargetView*   g_curActiveRTV      = nullptr;
 ID3D11DepthStencilView*   g_curActiveDSV      = nullptr;
 void*                     g_curOffscreenRT    = nullptr;
+void*                     g_curOffscreenZS    = nullptr;
 float                     g_gamma             = 1.0f;
 float                     g_brightness        = 1.0f;
 ID3D11Texture2D*          g_gammaLutTex       = nullptr;
@@ -37,11 +46,366 @@ ID3D11VertexShader*       g_vs                = nullptr;
 ID3D11InputLayout*        g_inputLayout       = nullptr;
 ID3D11Buffer*             g_cbPerDraw         = nullptr;
 ID3D11Buffer*             g_cbVSConstants     = nullptr;
+ID3D11Buffer*             g_cbBonePalette     = nullptr;
 ID3D11Buffer*             g_dynVB             = nullptr;
 uint32_t                  g_dynVBCapacity     = 0;
 
-volatile uint32_t         g_swapFrameCount    = 0;
-static uint32_t*          g_dummyPushBuf      = nullptr;
+volatile uint32_t         g_swapFrameCount        = 0;
+static uint32_t*          g_dummyPushBuf          = nullptr;
+bool                      g_swapChainFlipModel    = false;
+bool                      g_swapChainAllowTearing = false;
+
+bool IsSwapChainFlipModel() {
+    return g_swapChainFlipModel;
+}
+
+bool DoesSwapChainAllowTearing() {
+    return g_swapChainAllowTearing;
+}
+
+// ============================================================================
+// [P1-3] D3D11 Immediate-Context Pipeline Shadow State
+// ============================================================================
+
+struct D3D11ShadowState {
+    ID3D11DeviceContext*      ctx;
+    bool                      valid;
+    bool                      vpValid;
+    D3D11_VIEWPORT            vp;
+    ID3D11BlendState*         bs;
+    float                     blendFactor[4];
+    uint32_t                  sampleMask;
+    ID3D11DepthStencilState*  ds;
+    uint32_t                  stencilRef;
+    ID3D11RasterizerState*    rs;
+    ID3D11InputLayout*        inputLayout;
+    uint32_t                  topo;
+    uint32_t                  numVbs;
+    ID3D11Buffer*             vbs[2];
+    uint32_t                  vbStrides[2];
+    uint32_t                  vbOffsets[2];
+    bool                      ibValid;
+    ID3D11Buffer*             ib;
+    uint32_t                  ibFormat;
+    uint32_t                  ibOffset;
+    ID3D11VertexShader*       vs;
+    uint32_t                  numVsCbs;
+    ID3D11Buffer*             vsCbs[3];
+    ID3D11PixelShader*        ps;
+    ID3D11Buffer*             psCb0;
+    bool                      srvsValid;
+    ID3D11ShaderResourceView* psSrvs[13];
+    bool                      smpsValid;
+    ID3D11SamplerState*       psSmps[4];
+};
+
+static D3D11ShadowState g_d3dShadow = {};
+
+void InvalidateD3D11ShadowState() {
+    g_d3dShadow.valid     = false;
+    g_d3dShadow.vpValid   = false;
+    g_d3dShadow.ibValid   = false;
+    g_d3dShadow.srvsValid = false;
+    g_d3dShadow.smpsValid = false;
+}
+
+void ApplyShadowedD3D11RenderPipeline(
+    const void* pViewport11,
+    ID3D11BlendState* bs, const float blendFactor[4], uint32_t sampleMask,
+    ID3D11DepthStencilState* ds, uint32_t stencilRef,
+    ID3D11RasterizerState* rs,
+    ID3D11InputLayout* inputLayout, uint32_t primitiveTopology,
+    uint32_t numStreams, ID3D11Buffer* const* vbs, const uint32_t* vbStrides, const uint32_t* vbOffsets,
+    bool bindIndexBuffer, ID3D11Buffer* ib, uint32_t ibFormat, uint32_t ibOffset,
+    ID3D11VertexShader* vs, uint32_t numVsCbs, ID3D11Buffer* const* vsCbs,
+    ID3D11PixelShader* ps, ID3D11Buffer* psCb0,
+    ID3D11ShaderResourceView* const srvs[13],
+    ID3D11SamplerState* const smps[4])
+{
+    if (!g_d3dCtx) return;
+    if (g_d3dShadow.ctx != g_d3dCtx) {
+        memset(&g_d3dShadow, 0, sizeof(g_d3dShadow));
+        g_d3dShadow.ctx = g_d3dCtx;
+    }
+
+    const bool wasValid = g_d3dShadow.valid;
+
+    if (pViewport11) {
+        const D3D11_VIEWPORT& vp = *static_cast<const D3D11_VIEWPORT*>(pViewport11);
+        if (!wasValid || !g_d3dShadow.vpValid || memcmp(&g_d3dShadow.vp, &vp, sizeof(D3D11_VIEWPORT)) != 0) {
+            g_d3dCtx->RSSetViewports(1, &vp);
+            g_d3dShadow.vp      = vp;
+            g_d3dShadow.vpValid = true;
+        }
+    }
+
+    if (!wasValid || g_d3dShadow.bs != bs || g_d3dShadow.sampleMask != sampleMask ||
+        memcmp(g_d3dShadow.blendFactor, blendFactor, sizeof(float) * 4u) != 0)
+    {
+        g_d3dCtx->OMSetBlendState(bs, blendFactor, sampleMask);
+        g_d3dShadow.bs         = bs;
+        g_d3dShadow.sampleMask = sampleMask;
+        memcpy(g_d3dShadow.blendFactor, blendFactor, sizeof(float) * 4u);
+    }
+
+    if (!wasValid || g_d3dShadow.ds != ds || g_d3dShadow.stencilRef != stencilRef) {
+        g_d3dCtx->OMSetDepthStencilState(ds, stencilRef);
+        g_d3dShadow.ds         = ds;
+        g_d3dShadow.stencilRef = stencilRef;
+    }
+
+    if (!wasValid || g_d3dShadow.rs != rs) {
+        g_d3dCtx->RSSetState(rs);
+        g_d3dShadow.rs = rs;
+    }
+
+    if (!wasValid || g_d3dShadow.inputLayout != inputLayout) {
+        g_d3dCtx->IASetInputLayout(inputLayout);
+        g_d3dShadow.inputLayout = inputLayout;
+    }
+
+    if (!wasValid || g_d3dShadow.topo != primitiveTopology) {
+        g_d3dCtx->IASetPrimitiveTopology(static_cast<D3D11_PRIMITIVE_TOPOLOGY>(primitiveTopology));
+        g_d3dShadow.topo = primitiveTopology;
+    }
+
+    if (numStreams > 0u && numStreams <= 2u && vbs && vbStrides && vbOffsets) {
+        bool vbSame = wasValid && (g_d3dShadow.numVbs >= numStreams);
+        if (vbSame) {
+            for (uint32_t i = 0; i < numStreams; ++i) {
+                if (g_d3dShadow.vbs[i] != vbs[i] ||
+                    g_d3dShadow.vbStrides[i] != vbStrides[i] ||
+                    g_d3dShadow.vbOffsets[i] != vbOffsets[i])
+                {
+                    vbSame = false;
+                    break;
+                }
+            }
+        }
+        if (!vbSame) {
+            UINT stridesU[2] = { vbStrides[0], (numStreams > 1u) ? vbStrides[1] : 0u };
+            UINT offsetsU[2] = { vbOffsets[0], (numStreams > 1u) ? vbOffsets[1] : 0u };
+            g_d3dCtx->IASetVertexBuffers(0, numStreams, vbs, stridesU, offsetsU);
+            g_d3dShadow.numVbs = numStreams;
+            for (uint32_t i = 0; i < numStreams; ++i) {
+                g_d3dShadow.vbs[i]       = vbs[i];
+                g_d3dShadow.vbStrides[i] = vbStrides[i];
+                g_d3dShadow.vbOffsets[i] = vbOffsets[i];
+            }
+        }
+    }
+
+    if (bindIndexBuffer) {
+        if (!wasValid || !g_d3dShadow.ibValid ||
+            g_d3dShadow.ib != ib || g_d3dShadow.ibFormat != ibFormat || g_d3dShadow.ibOffset != ibOffset)
+        {
+            g_d3dCtx->IASetIndexBuffer(ib, static_cast<DXGI_FORMAT>(ibFormat), ibOffset);
+            g_d3dShadow.ib       = ib;
+            g_d3dShadow.ibFormat = ibFormat;
+            g_d3dShadow.ibOffset = ibOffset;
+            g_d3dShadow.ibValid  = true;
+        }
+    }
+
+    if (!wasValid || g_d3dShadow.vs != vs) {
+        g_d3dCtx->VSSetShader(vs, nullptr, 0);
+        g_d3dShadow.vs = vs;
+    }
+
+    if (numVsCbs > 0u && numVsCbs <= 3u && vsCbs) {
+        bool vsCbSame = wasValid && (g_d3dShadow.numVsCbs >= numVsCbs);
+        if (vsCbSame) {
+            for (uint32_t i = 0; i < numVsCbs; ++i) {
+                if (g_d3dShadow.vsCbs[i] != vsCbs[i]) {
+                    vsCbSame = false;
+                    break;
+                }
+            }
+        }
+        if (!vsCbSame) {
+            g_d3dCtx->VSSetConstantBuffers(0, numVsCbs, vsCbs);
+            if (!wasValid || g_d3dShadow.numVsCbs < numVsCbs) {
+                g_d3dShadow.numVsCbs = numVsCbs;
+            }
+            for (uint32_t i = 0; i < numVsCbs; ++i) {
+                g_d3dShadow.vsCbs[i] = vsCbs[i];
+            }
+        }
+    }
+
+    if (!wasValid || g_d3dShadow.ps != ps) {
+        g_d3dCtx->PSSetShader(ps, nullptr, 0);
+        g_d3dShadow.ps = ps;
+    }
+
+    if (!wasValid || g_d3dShadow.psCb0 != psCb0) {
+        g_d3dCtx->PSSetConstantBuffers(0, 1, &psCb0);
+        g_d3dShadow.psCb0 = psCb0;
+    }
+
+    if (srvs) {
+        if (!wasValid || !g_d3dShadow.srvsValid) {
+            g_d3dCtx->PSSetShaderResources(0, 13, srvs);
+            memcpy(g_d3dShadow.psSrvs, srvs, sizeof(g_d3dShadow.psSrvs));
+            g_d3dShadow.srvsValid = true;
+        } else if (memcmp(g_d3dShadow.psSrvs, srvs, sizeof(g_d3dShadow.psSrvs)) != 0) {
+            uint32_t firstDiff = 13u;
+            uint32_t lastDiff  = 0u;
+            for (uint32_t i = 0; i < 13u; ++i) {
+                if (g_d3dShadow.psSrvs[i] != srvs[i]) {
+                    if (firstDiff == 13u) firstDiff = i;
+                    lastDiff = i;
+                    g_d3dShadow.psSrvs[i] = srvs[i];
+                }
+            }
+            if (firstDiff < 13u) {
+                g_d3dCtx->PSSetShaderResources(firstDiff, lastDiff - firstDiff + 1u, &srvs[firstDiff]);
+            }
+        }
+    }
+
+    if (smps) {
+        if (!wasValid || !g_d3dShadow.smpsValid || memcmp(g_d3dShadow.psSmps, smps, sizeof(g_d3dShadow.psSmps)) != 0) {
+            g_d3dCtx->PSSetSamplers(0, 4, smps);
+            memcpy(g_d3dShadow.psSmps, smps, sizeof(g_d3dShadow.psSmps));
+            g_d3dShadow.smpsValid = true;
+        }
+    }
+
+    g_d3dShadow.valid = true;
+}
+
+static ID3D11VertexShader* g_presentVS             = nullptr;
+static ID3D11PixelShader*  g_presentPS             = nullptr;
+static ID3D11Buffer*       g_presentCB             = nullptr;
+static ID3D11SamplerState* g_presentPointClampSmp  = nullptr;
+static ID3D11SamplerState* g_presentLinearClampSmp = nullptr;
+
+// ============================================================================
+// RAII D3D11 Pipeline State Backup & Restore
+// ============================================================================
+
+D3D11StateBackup::D3D11StateBackup() {
+    memset(this, 0, sizeof(*this));
+}
+
+D3D11StateBackup::D3D11StateBackup(ID3D11DeviceContext* deviceCtx) {
+    memset(this, 0, sizeof(*this));
+    Capture(deviceCtx);
+}
+
+D3D11StateBackup::~D3D11StateBackup() {
+    if (captured) {
+        Restore();
+    }
+    ReleaseRefs();
+}
+
+void D3D11StateBackup::ReleaseRefs() {
+    if (inputLayout) { inputLayout->Release(); inputLayout = nullptr; }
+    for (int i = 0; i < 2; ++i) {
+        if (vb[i])   { vb[i]->Release();   vb[i]   = nullptr; }
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (vsCB[i]) { vsCB[i]->Release(); vsCB[i] = nullptr; }
+    }
+    if (ib)     { ib->Release();     ib     = nullptr; }
+    if (vs)     { vs->Release();     vs     = nullptr; }
+    if (ps)     { ps->Release();     ps     = nullptr; }
+    if (psCB[0]){ psCB[0]->Release();psCB[0]= nullptr; }
+    for (int i = 0; i < 13; ++i) {
+        if (psSRV[i]) { psSRV[i]->Release(); psSRV[i] = nullptr; }
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (psSmp[i]) { psSmp[i]->Release(); psSmp[i] = nullptr; }
+    }
+    if (rs)  { rs->Release();  rs  = nullptr; }
+    if (bs)  { bs->Release();  bs  = nullptr; }
+    if (ds)  { ds->Release();  ds  = nullptr; }
+    if (rtv) { rtv->Release(); rtv = nullptr; }
+    if (dsv) { dsv->Release(); dsv = nullptr; }
+    captured = false;
+    ctx      = nullptr;
+}
+
+void D3D11StateBackup::Capture(ID3D11DeviceContext* deviceCtx) {
+    ReleaseRefs();
+    if (!deviceCtx) return;
+    ctx = deviceCtx;
+
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    deviceCtx->IAGetInputLayout(&inputLayout);
+    deviceCtx->IAGetPrimitiveTopology(&topo);
+    topology = static_cast<uint32_t>(topo);
+    deviceCtx->IAGetVertexBuffers(0, 2, vb, vbStrides, vbOffsets);
+
+    DXGI_FORMAT idxFmt = DXGI_FORMAT_UNKNOWN;
+    deviceCtx->IAGetIndexBuffer(&ib, &idxFmt, &ibOffset);
+    ibFormat = static_cast<uint32_t>(idxFmt);
+
+    deviceCtx->VSGetShader(&vs, nullptr, nullptr);
+    deviceCtx->VSGetConstantBuffers(0, 3, vsCB);
+
+    deviceCtx->PSGetShader(&ps, nullptr, nullptr);
+    deviceCtx->PSGetConstantBuffers(0, 1, psCB);
+    deviceCtx->PSGetShaderResources(0, 13, psSRV);
+    deviceCtx->PSGetSamplers(0, 4, psSmp);
+
+    deviceCtx->RSGetState(&rs);
+
+    UINT vpCnt = 0;
+    deviceCtx->RSGetViewports(&vpCnt, nullptr);
+    if (vpCnt > 4u) vpCnt = 4u;
+    numViewports = vpCnt;
+    if (vpCnt > 0u) {
+        deviceCtx->RSGetViewports(&vpCnt, reinterpret_cast<D3D11_VIEWPORT*>(viewports));
+    }
+
+    UINT scCnt = 0;
+    deviceCtx->RSGetScissorRects(&scCnt, nullptr);
+    if (scCnt > 4u) scCnt = 4u;
+    numScissors = scCnt;
+    if (scCnt > 0u) {
+        deviceCtx->RSGetScissorRects(&scCnt, scissors);
+    }
+
+    deviceCtx->OMGetBlendState(&bs, blendFactor, &sampleMask);
+    deviceCtx->OMGetDepthStencilState(&ds, &stencilRef);
+    deviceCtx->OMGetRenderTargets(1, &rtv, &dsv);
+    captured = true;
+}
+
+void D3D11StateBackup::Restore() {
+    if (!captured || !ctx) return;
+
+    ID3D11ShaderResourceView* nullSrvs[13] = {};
+    ctx->PSSetShaderResources(0, 13, nullSrvs);
+
+    ctx->OMSetRenderTargets(rtv ? 1u : 0u, rtv ? &rtv : nullptr, dsv);
+    ctx->OMSetBlendState(bs, blendFactor, sampleMask);
+    ctx->OMSetDepthStencilState(ds, stencilRef);
+
+    ctx->RSSetState(rs);
+    ctx->RSSetViewports(numViewports, numViewports ? reinterpret_cast<const D3D11_VIEWPORT*>(viewports) : nullptr);
+    ctx->RSSetScissorRects(numScissors, numScissors ? scissors : nullptr);
+
+    ctx->IASetInputLayout(inputLayout);
+    ctx->IASetPrimitiveTopology(static_cast<D3D11_PRIMITIVE_TOPOLOGY>(topology));
+    ctx->IASetVertexBuffers(0, 2, vb, vbStrides, vbOffsets);
+    DXGI_FORMAT idxFmt = ibFormat ? static_cast<DXGI_FORMAT>(ibFormat) : DXGI_FORMAT_R16_UINT;
+    ctx->IASetIndexBuffer(ib, idxFmt, ibOffset);
+
+    ctx->VSSetShader(vs, nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 3, vsCB);
+
+    ctx->PSSetShader(ps, nullptr, 0);
+    ctx->PSSetConstantBuffers(0, 1, psCB);
+    ctx->PSSetSamplers(0, 4, psSmp);
+    ctx->PSSetShaderResources(0, 13, psSRV);
+
+    InvalidateD3D11ShadowState();
+    ReleaseRefs();
+}
 
 // ============================================================================
 // Dummy PushBuffer Management
@@ -118,11 +482,9 @@ static D3D11_BLEND_OP MapXboxBlendOpD3D11(uint32_t v) {
     }
 }
 
-struct CachedBlendState {
-    uint64_t           key;
-    ID3D11BlendState*  state;
-};
-static std::vector<CachedBlendState> g_blendCache;
+static std::unordered_map<uint64_t, ID3D11BlendState*> g_blendCache;
+static uint64_t          g_mruBlendKey   = ~0ULL;
+static ID3D11BlendState* g_mruBlendState = nullptr;
 
 ID3D11BlendState* GetBlendState(uint32_t alphaBlendEnable, uint32_t srcBlend, uint32_t dstBlend, uint32_t blendOp, uint32_t colorWrite) {
     uint64_t key = ((uint64_t)(alphaBlendEnable ? 1 : 0)) |
@@ -130,8 +492,12 @@ ID3D11BlendState* GetBlendState(uint32_t alphaBlendEnable, uint32_t srcBlend, ui
                    ((uint64_t)(dstBlend & 0xFFFF) << 17) |
                    ((uint64_t)(blendOp & 0xFFFF) << 33) |
                    ((uint64_t)(colorWrite & 0xFF) << 49);
-    for (size_t i = 0; i < g_blendCache.size(); ++i) {
-        if (g_blendCache[i].key == key) return g_blendCache[i].state;
+    if (key == g_mruBlendKey && g_mruBlendState) return g_mruBlendState;
+    auto it = g_blendCache.find(key);
+    if (it != g_blendCache.end()) {
+        g_mruBlendKey   = key;
+        g_mruBlendState = it->second;
+        return it->second;
     }
     D3D11_BLEND_DESC desc = {};
     desc.RenderTarget[0].BlendEnable = alphaBlendEnable ? TRUE : FALSE;
@@ -145,15 +511,15 @@ ID3D11BlendState* GetBlendState(uint32_t alphaBlendEnable, uint32_t srcBlend, ui
 
     ID3D11BlendState* st = nullptr;
     g_d3dDevice->CreateBlendState(&desc, &st);
-    g_blendCache.push_back({ key, st });
+    g_blendCache.emplace(key, st);
+    g_mruBlendKey   = key;
+    g_mruBlendState = st;
     return st;
 }
 
-struct CachedDepthState {
-    uint64_t                 key;
-    ID3D11DepthStencilState* state;
-};
-static std::vector<CachedDepthState> g_depthCache;
+static std::unordered_map<uint64_t, ID3D11DepthStencilState*> g_depthCache;
+static uint64_t                 g_mruDepthKey   = ~0ULL;
+static ID3D11DepthStencilState* g_mruDepthState = nullptr;
 
 static D3D11_STENCIL_OP MapXboxStencilOpD3D11(uint32_t v) {
     switch (v) {
@@ -194,8 +560,12 @@ ID3D11DepthStencilState* GetDepthState(
         ((uint64_t)sRMask << 24) |
         ((uint64_t)sWMask << 32);
 
-    for (size_t i = 0; i < g_depthCache.size(); ++i) {
-        if (g_depthCache[i].key == key) return g_depthCache[i].state;
+    if (key == g_mruDepthKey && g_mruDepthState) return g_mruDepthState;
+    auto it = g_depthCache.find(key);
+    if (it != g_depthCache.end()) {
+        g_mruDepthKey   = key;
+        g_mruDepthState = it->second;
+        return it->second;
     }
     D3D11_DEPTH_STENCIL_DESC desc = {};
     desc.DepthEnable      = zEnable ? TRUE : FALSE;
@@ -212,15 +582,15 @@ ID3D11DepthStencilState* GetDepthState(
 
     ID3D11DepthStencilState* st = nullptr;
     g_d3dDevice->CreateDepthStencilState(&desc, &st);
-    g_depthCache.push_back({ key, st });
+    g_depthCache.emplace(key, st);
+    g_mruDepthKey   = key;
+    g_mruDepthState = st;
     return st;
 }
 
-struct CachedRastState {
-    uint64_t               key;
-    ID3D11RasterizerState* state;
-};
-static std::vector<CachedRastState> g_rastCache;
+static std::unordered_map<uint64_t, ID3D11RasterizerState*> g_rastCache;
+static uint64_t               g_mruRastKey   = ~0ULL;
+static ID3D11RasterizerState* g_mruRastState = nullptr;
 bool g_scissorEnabled = false;
 
 ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32_t zBias, bool scissor, uint32_t frontFace) {
@@ -230,8 +600,12 @@ ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32
                    ((uint64_t)(zBias & 0xFFu) << 32) |
                    (scissor ? (1ULL << 40) : 0ULL) |
                    (frontCCW ? (1ULL << 41) : 0ULL);
-    for (size_t i = 0; i < g_rastCache.size(); ++i) {
-        if (g_rastCache[i].key == key) return g_rastCache[i].state;
+    if (key == g_mruRastKey && g_mruRastState) return g_mruRastState;
+    auto it = g_rastCache.find(key);
+    if (it != g_rastCache.end()) {
+        g_mruRastKey   = key;
+        g_mruRastState = it->second;
+        return it->second;
     }
     D3D11_RASTERIZER_DESC desc = {};
     desc.FillMode = (fillMode == 0x1B01u || fillMode == 2u) ? D3D11_FILL_WIREFRAME : D3D11_FILL_SOLID;
@@ -254,7 +628,9 @@ ID3D11RasterizerState* GetRastState(uint32_t cullMode, uint32_t fillMode, uint32
 
     ID3D11RasterizerState* st = nullptr;
     g_d3dDevice->CreateRasterizerState(&desc, &st);
-    g_rastCache.push_back({ key, st });
+    g_rastCache.emplace(key, st);
+    g_mruRastKey   = key;
+    g_mruRastState = st;
     return st;
 }
 
@@ -375,14 +751,87 @@ ID3D11SamplerState* GetStageSamplerState(uint32_t stage) {
 // RenderState Bridges (Xbox NV2A -> _D3D__RenderState)
 // ============================================================================
 
+// Canonical Xbox XDK _D3D__SimpleRenderStateEncode[0..91] (0x007502A0 in Ghost.exe),
+// used as fallback when .xbox .rdata has not been loaded (e.g. standalone unit tests).
+static const uint32_t kDefaultSimpleRsEncode[92] = {
+    0x00040260u, 0x00040264u, 0x00040268u, 0x0004026Cu,
+    0x00040270u, 0x00040274u, 0x00040278u, 0x0004027Cu,
+    0x00040288u, 0x0004028Cu, 0x00040A60u, 0x00040A64u,
+    0x00040A68u, 0x00040A6Cu, 0x00040A70u, 0x00040A74u,
+    0x00040A78u, 0x00040A7Cu, 0x00040A80u, 0x00040A84u,
+    0x00040A88u, 0x00040A8Cu, 0x00040A90u, 0x00040A94u,
+    0x00040A98u, 0x00040A9Cu, 0x00040AA0u, 0x00040AA4u,
+    0x00040AA8u, 0x00040AACu, 0x00040AB0u, 0x00040AB4u,
+    0x00040AB8u, 0x00040ABCu, 0x00040AC0u, 0x00040AC4u,
+    0x00040AC8u, 0x00040ACCu, 0x00040AD0u, 0x00040AD4u,
+    0x00040AD8u, 0x00040ADCu, 0x000417F8u, 0x00041E20u,
+    0x00041E24u, 0x00041E40u, 0x00041E44u, 0x00041E48u,
+    0x00041E4Cu, 0x00041E50u, 0x00041E54u, 0x00041E58u,
+    0x00041E5Cu, 0x00041E60u, 0x00041D90u, 0x00041E74u,
+    0x00041E78u, 0x00040354u, 0x0004033Cu, 0x00040304u,
+    0x00040300u, 0x00040340u, 0x00040344u, 0x00040348u,
+    0x0004035Cu, 0x00040310u, 0x0004037Cu, 0x00040358u,
+    0x00040374u, 0x00040378u, 0x00040364u, 0x00040368u,
+    0x0004036Cu, 0x00040360u, 0x00040350u, 0x0004034Cu,
+    0x000409F8u, 0x00040384u, 0x00040388u, 0x00040330u,
+    0x00040334u, 0x00040338u, 0x00041D78u, 0x0004147Cu,
+    0x00041D90u, 0x00041D90u, 0x00041D90u, 0x00041D90u,
+    0x00041D90u, 0x00041D90u, 0x00041D90u, 0x00041D90u
+};
+
+// [P1-3] O(1) NV097 method-offset -> XboxRenderState index (0..91) lookup table
+uint32_t DecodeSimpleRenderStateIndex(uint32_t hwMethodOffset) {
+    uint32_t encoded = (hwMethodOffset < 0x2000u) ? (0x00040000u | hwMethodOffset) : hwMethodOffset;
+    if ((encoded & 0xFFFFE003u) != 0x00040000u) {
+        return 0xFFFFFFFFu;
+    }
+
+    const uint32_t* liveTable = reinterpret_cast<const uint32_t*>(ADDR_SIMPLE_RS_ENCODE);
+    const bool useLiveTable = (liveTable[0] != 0u || liveTable[1] != 0u || liveTable[59] != 0u);
+    const uint32_t* activeTable = useLiveTable ? liveTable : kDefaultSimpleRsEncode;
+
+    static bool     s_lutInitialized = false;
+    static bool     s_lutFromLive    = false;
+    static uint32_t s_lutSig0        = 0u;
+    static uint32_t s_lutSig53       = 0u;
+    static uint32_t s_lutSig83       = 0u;
+    static uint8_t  s_nv097ToRs[2048];
+
+    if (!s_lutInitialized ||
+        s_lutFromLive != useLiveTable ||
+        s_lutSig0  != activeTable[0]  ||
+        s_lutSig53 != activeTable[53] ||
+        s_lutSig83 != activeTable[83])
+    {
+        memset(s_nv097ToRs, 0xFF, sizeof(s_nv097ToRs));
+        // Populate in reverse so lowest index wins on duplicate NV097_NO_OPERATION (0x00041D90) entries
+        for (int i = 91; i >= 0; --i) {
+            uint32_t e = activeTable[i];
+            if ((e & 0xFFFFE003u) == 0x00040000u) {
+                s_nv097ToRs[(e & 0x1FFFCu) >> 2u] = static_cast<uint8_t>(i);
+            }
+        }
+        s_lutFromLive    = useLiveTable;
+        s_lutSig0        = activeTable[0];
+        s_lutSig53       = activeTable[53];
+        s_lutSig83       = activeTable[83];
+        s_lutInitialized = true;
+    }
+
+    uint8_t rsIdx = s_nv097ToRs[(encoded & 0x1FFFCu) >> 2u];
+    if (rsIdx < 92u && activeTable[rsIdx] == encoded) {
+        return static_cast<uint32_t>(rsIdx);
+    }
+    return 0xFFFFFFFFu;
+}
+
 // @D3DDevice_SetRenderState_Simple@8 (0x006AEC10)
 static void __fastcall Bridge_D3DDevice_SetRenderState_Simple(uint32_t encodedReg, uint32_t val) {
-    const uint32_t* table = reinterpret_cast<const uint32_t*>(ADDR_SIMPLE_RS_ENCODE);
-    uint32_t* xboxRS = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
-    for (uint32_t i = 0; i < 92; ++i) {
-        if (table[i] == encodedReg) {
-            xboxRS[i] = val;
-            return;
+    uint32_t rsIdx = DecodeSimpleRenderStateIndex(encodedReg);
+    if (rsIdx < 92u) {
+        reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[rsIdx] = val;
+        if (rsIdx <= XBOX_D3DRS_PSINPUTTEXTURE) {
+            NotifyXboxPsRenderStateChanged(rsIdx, val);
         }
     }
 }
@@ -390,9 +839,14 @@ static void __fastcall Bridge_D3DDevice_SetRenderState_Simple(uint32_t encodedRe
 static void __stdcall Bridge_D3DDevice_SetRenderStateNotInline(uint32_t State, uint32_t Value) {
     if (State < XBOX_D3DRS_MAX) {
         reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[State] = Value;
-        if (State == XBOX_D3DRS_PSTEXTUREMODES) {
+        if (State <= XBOX_D3DRS_PSINPUTTEXTURE) {
+            NotifyXboxPsRenderStateChanged(State, Value);
+        } else if (State == XBOX_D3DRS_PSTEXTUREMODES) {
             *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x790) = Value;
             *reinterpret_cast<uint32_t*>(ADDR_D3D_DIRTYFLAGS) |= 0x4000u;
+            NotifyXboxPsRenderStateChanged(XBOX_D3DRS_PSTEXTUREMODES, Value);
+        } else if (State == XBOX_D3DRS_TEXTUREFACTOR) {
+            NotifyXboxTextureFactorChanged(Value);
         } else if (State == XBOX_D3DRS_ZBIAS) {
             uint32_t* rs = reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE);
             float fBias = -static_cast<float>(static_cast<int32_t>(Value));
@@ -410,6 +864,9 @@ static void __stdcall Bridge_D3DDevice_SetRenderStateNotInline(uint32_t State, u
 static void __stdcall Bridge_D3DDevice_SetTextureStageStateNotInline(uint32_t Stage, uint32_t Type, uint32_t Value) {
     if (Stage < 4 && Type < XBOX_D3DTSS_MAX) {
         reinterpret_cast<uint32_t*>(ADDR_D3D_TEXTURESTATE)[Stage * XBOX_D3DTSS_MAX + Type] = Value;
+        if (g_currentPsHandle == 0u && Type >= XBOX_D3DTSS_COLOROP && Type <= XBOX_D3DTSS_RESULTARG) {
+            reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_PSCOMBINERCOUNT] = 0u;
+        }
     }
 }
 
@@ -444,6 +901,9 @@ static void __stdcall Bridge_D3DDevice_SetRenderState_Complex(uint32_t Value) {
     if (StateIdx == XBOX_D3DRS_VERTEXBLEND || StateIdx == XBOX_D3DRS_TWOSIDEDLIGHTING || StateIdx == XBOX_D3DRS_NORMALIZENORMALS) {
         *reinterpret_cast<uint32_t*>(ADDR_D3D_DIRTYFLAGS) |= 0x200u;
     }
+    if (StateIdx == XBOX_D3DRS_TEXTUREFACTOR) {
+        NotifyXboxTextureFactorChanged(Value);
+    }
 }
 
 // RS 136: _D3DDevice_SetRenderState_PSTextureModes@4 (0x006AEBE0)
@@ -451,6 +911,7 @@ static void __stdcall Bridge_D3DDevice_SetRenderState_PSTextureModes(uint32_t Va
     *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x790) = Value;
     *reinterpret_cast<uint32_t*>(ADDR_D3D_DIRTYFLAGS) |= 0x4000u;
     reinterpret_cast<uint32_t*>(ADDR_D3D_RENDERSTATE)[XBOX_D3DRS_PSTEXTUREMODES] = Value;
+    NotifyXboxPsRenderStateChanged(XBOX_D3DRS_PSTEXTUREMODES, Value);
 }
 
 // RS 149: _D3DDevice_SetRenderState_ZBias@4 (0x006AF220)
@@ -586,10 +1047,237 @@ static HRESULT __stdcall Bridge_D3DDevice_GetVisibilityTestResult(
 }
 
 // ============================================================================
-// Clear, Top-Right In-Game OSD Overlay (FPS), Swap (Present) & Gamma
+// Clear, Present Composite (Video Overlay + Single-Pass Gamma), OSD & Swap
 // ============================================================================
 
 static ID3D11Buffer* g_clearVB = nullptr;
+static ID3D11Buffer* g_clearCB = nullptr;
+
+struct alignas(16) PresentCBData {
+    float    targetSize[4];      // x=640, y=480, z=1/640, w=1/480
+    float    overlayDstRect[4];  // x=left, y=top, z=right, w=bottom
+    float    overlayColorKey[4]; // r, g, b, tolerance
+    uint32_t presentFlags[4];    // x=overlayActive, y=overlayUseColorKey, z=useGammaLut, w=applyScalarGamma
+    float    gammaParams[4];     // x=invGamma, y=brightness, z=0, w=0
+};
+static_assert(sizeof(PresentCBData) == 80, "PresentCBData must be 80 bytes");
+
+static const char kPresentCompositeVS[] = R"(
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+VSOut main(uint vid : SV_VertexID) {
+    VSOut o;
+    o.uv  = float2((vid << 1) & 2u, vid & 2u);
+    o.pos = float4(o.uv.x * 2.0f - 1.0f, 1.0f - o.uv.y * 2.0f, 0.0f, 1.0f);
+    return o;
+}
+)";
+
+static const char kPresentCompositePS[] = R"(
+cbuffer PresentCB : register(b0) {
+    float4 uTargetSize;
+    float4 uOverlayDstRect;
+    float4 uOverlayColorKey;
+    uint4  uPresentFlags;
+    float4 uGammaParams;
+};
+Texture2D backBufferTex   : register(t0);
+Texture2D videoOverlayTex : register(t1);
+Texture2D gammaLutTex     : register(t2);
+SamplerState smpPointClamp  : register(s0);
+SamplerState smpLinearClamp : register(s1);
+
+struct PSIn {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+float4 main(PSIn i) : SV_Target {
+    float3 rgb = backBufferTex.SampleLevel(smpPointClamp, i.uv, 0.0f).rgb;
+
+    if (uPresentFlags.x != 0u) {
+        float2 px = i.pos.xy;
+        if (px.x >= uOverlayDstRect.x && px.x < uOverlayDstRect.z &&
+            px.y >= uOverlayDstRect.y && px.y < uOverlayDstRect.w)
+        {
+            float2 ovSize = max(uOverlayDstRect.zw - uOverlayDstRect.xy, float2(1.0f, 1.0f));
+            float2 ovUv   = (px - uOverlayDstRect.xy) / ovSize;
+            float3 ovRgb  = videoOverlayTex.SampleLevel(smpLinearClamp, ovUv, 0.0f).rgb;
+            if (uPresentFlags.y != 0u) {
+                float3 diff = abs(rgb - uOverlayColorKey.rgb);
+                if (all(diff <= uOverlayColorKey.www)) {
+                    rgb = ovRgb;
+                }
+            } else {
+                rgb = ovRgb;
+            }
+        }
+    }
+
+    if (uPresentFlags.z != 0u) {
+        float3 lutCoord = saturate(rgb) * (255.0f / 256.0f) + (0.5f / 256.0f);
+        rgb.r = gammaLutTex.SampleLevel(smpLinearClamp, float2(lutCoord.r, 0.5f), 0.0f).r;
+        rgb.g = gammaLutTex.SampleLevel(smpLinearClamp, float2(lutCoord.g, 0.5f), 0.0f).g;
+        rgb.b = gammaLutTex.SampleLevel(smpLinearClamp, float2(lutCoord.b, 0.5f), 0.0f).b;
+    } else if (uPresentFlags.w != 0u) {
+        rgb = saturate(pow(max(rgb, 0.0f), uGammaParams.x) * uGammaParams.y);
+    }
+
+    return float4(rgb, 1.0f);
+}
+)";
+
+static void InitPresentCompositePipeline() {
+    if (!g_d3dDevice) return;
+
+    if (!g_presentVS) {
+        ID3DBlob* vsBlob = nullptr;
+        ID3DBlob* errBlob = nullptr;
+        if (SUCCEEDED(D3DCompile(
+                kPresentCompositeVS, sizeof(kPresentCompositeVS) - 1,
+                "present_vs.hlsl", nullptr, nullptr, "main", "vs_4_0",
+                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob)) && vsBlob)
+        {
+            g_d3dDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_presentVS);
+        }
+        if (vsBlob)  vsBlob->Release();
+        if (errBlob) errBlob->Release();
+    }
+
+    if (!g_presentPS) {
+        ID3DBlob* psBlob = nullptr;
+        ID3DBlob* errBlob = nullptr;
+        if (SUCCEEDED(D3DCompile(
+                kPresentCompositePS, sizeof(kPresentCompositePS) - 1,
+                "present_ps.hlsl", nullptr, nullptr, "main", "ps_4_0",
+                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob)) && psBlob)
+        {
+            g_d3dDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_presentPS);
+        }
+        if (psBlob)  psBlob->Release();
+        if (errBlob) errBlob->Release();
+    }
+
+    if (!g_presentCB) {
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth      = sizeof(PresentCBData);
+        cbd.Usage          = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        g_d3dDevice->CreateBuffer(&cbd, nullptr, &g_presentCB);
+    }
+
+    if (!g_presentPointClampSmp) {
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxAnisotropy  = 1u;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD         = 0.0f;
+        sd.MaxLOD         = D3D11_FLOAT32_MAX;
+        g_d3dDevice->CreateSamplerState(&sd, &g_presentPointClampSmp);
+    }
+
+    if (!g_presentLinearClampSmp) {
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxAnisotropy  = 1u;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD         = 0.0f;
+        sd.MaxLOD         = D3D11_FLOAT32_MAX;
+        g_d3dDevice->CreateSamplerState(&sd, &g_presentLinearClampSmp);
+    }
+}
+
+static void CompositePresentToSwapChain() {
+    if (!g_d3dDevice || !g_d3dCtx || !g_swapChainRTV || !g_backBufferSRV) return;
+    if (!g_presentVS || !g_presentPS || !g_presentCB || !g_presentPointClampSmp || !g_presentLinearClampSmp) {
+        InitPresentCompositePipeline();
+        if (!g_presentVS || !g_presentPS || !g_presentCB || !g_presentPointClampSmp || !g_presentLinearClampSmp) {
+            if (g_swapChainTex && g_backBufferTex) {
+                g_d3dCtx->CopyResource(g_swapChainTex, g_backBufferTex);
+            }
+            return;
+        }
+    }
+
+    ID3D11ShaderResourceView* clearSrvs[13] = {};
+    g_d3dCtx->PSSetShaderResources(0, 13, clearSrvs);
+    g_d3dCtx->OMSetRenderTargets(1, &g_swapChainRTV, nullptr);
+
+    D3D11_VIEWPORT vp11 = { 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f };
+    g_d3dCtx->RSSetViewports(1, &vp11);
+
+    XboxVideoOverlayState ov = {};
+    bool ovActive = GetActiveXboxVideoOverlay(&ov);
+    bool useLut = (g_hasGammaRamp && g_gammaLutSRV != nullptr);
+    bool useScalarGamma = (!useLut && (fabsf(g_gamma - 1.0f) > 0.001f || fabsf(g_brightness - 1.0f) > 0.001f));
+
+    PresentCBData pcb = {};
+    pcb.targetSize[0] = 640.0f;
+    pcb.targetSize[1] = 480.0f;
+    pcb.targetSize[2] = 1.0f / 640.0f;
+    pcb.targetSize[3] = 1.0f / 480.0f;
+    if (ovActive) {
+        pcb.overlayDstRect[0] = static_cast<float>(ov.dstRect.left);
+        pcb.overlayDstRect[1] = static_cast<float>(ov.dstRect.top);
+        pcb.overlayDstRect[2] = static_cast<float>(ov.dstRect.right);
+        pcb.overlayDstRect[3] = static_cast<float>(ov.dstRect.bottom);
+        float unusedA = 1.0f;
+        UnpackD3DColor(ov.colorKey, &pcb.overlayColorKey[0], &pcb.overlayColorKey[1], &pcb.overlayColorKey[2], &unusedA);
+        pcb.overlayColorKey[3] = 0.5f / 255.0f;
+    }
+    pcb.presentFlags[0] = ovActive ? 1u : 0u;
+    pcb.presentFlags[1] = (ovActive && ov.useColorKey) ? 1u : 0u;
+    pcb.presentFlags[2] = useLut ? 1u : 0u;
+    pcb.presentFlags[3] = useScalarGamma ? 1u : 0u;
+    pcb.gammaParams[0]  = (g_gamma > 0.001f) ? (1.0f / g_gamma) : 1.0f;
+    pcb.gammaParams[1]  = g_brightness;
+
+    D3D11_MAPPED_SUBRESOURCE mappedCB = {};
+    if (SUCCEEDED(g_d3dCtx->Map(g_presentCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
+        memcpy(mappedCB.pData, &pcb, sizeof(pcb));
+        g_d3dCtx->Unmap(g_presentCB, 0);
+    }
+
+    ID3D11BlendState*        bs = GetBlendState(0u, 2u, 1u, 1u, 0x0Fu);
+    ID3D11DepthStencilState* ds = GetDepthState(0u, 0u, 8u, 0u, 1u, 1u, 1u, 8u, 0xFFu, 0x00u);
+    ID3D11RasterizerState*   rs = GetRastState(0u, 3u, 0u, false, 0x0900u);
+
+    float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
+    g_d3dCtx->OMSetDepthStencilState(ds, 0);
+    g_d3dCtx->RSSetState(rs);
+
+    g_d3dCtx->IASetInputLayout(nullptr);
+    g_d3dCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    g_d3dCtx->VSSetShader(g_presentVS, nullptr, 0);
+    g_d3dCtx->PSSetShader(g_presentPS, nullptr, 0);
+    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_presentCB);
+
+    ID3D11SamplerState* smps[2] = { g_presentPointClampSmp, g_presentLinearClampSmp };
+    g_d3dCtx->PSSetSamplers(0, 2, smps);
+
+    ID3D11ShaderResourceView* srvs[3] = {
+        g_backBufferSRV,
+        (ovActive && ov.srv) ? ov.srv : g_backBufferSRV,
+        g_gammaLutSRV ? g_gammaLutSRV : g_backBufferSRV
+    };
+    g_d3dCtx->PSSetShaderResources(0, 3, srvs);
+
+    g_d3dCtx->Draw(3, 0);
+
+    ID3D11ShaderResourceView* unbindSrvs[3] = { nullptr, nullptr, nullptr };
+    g_d3dCtx->PSSetShaderResources(0, 3, unbindSrvs);
+}
 
 static void __stdcall Bridge_D3DDevice_Clear(
     DWORD Count, const void* pRects, DWORD Flags, DWORD Color, float Z, DWORD Stencil)
@@ -600,22 +1288,41 @@ static void __stdcall Bridge_D3DDevice_Clear(
     if (clearFlags == 0) clearFlags = 0xF1u;
 
     ID3D11RenderTargetView* rtv = g_curActiveRTV ? g_curActiveRTV : g_rtv;
-    ID3D11DepthStencilView* dsv = g_curActiveDSV ? g_curActiveDSV : g_dsv;
+    ID3D11DepthStencilView* dsv = g_curActiveDSV;
 
     float vpW = 640.0f, vpH = 480.0f;
     if (g_curOffscreenRT) {
         uint32_t rw = 0, rh = 0, rlev = 1, rfmt = 0, rpitch = 0;
         bool rswiz = false;
         DecodeXboxTextureFormat(reinterpret_cast<const XboxPixelContainer*>(g_curOffscreenRT), &rw, &rh, &rlev, &rfmt, &rswiz, &rpitch);
-        if (rw > 0 && rh > 0) { vpW = (float)rw; vpH = (float)rh; }
+        if (rw > 0 && rh > 0) { vpW = static_cast<float>(rw); vpH = static_cast<float>(rh); }
     }
 
+    // Matching _D3DDevice_Clear@24 (0x006B79A3..0x006B7A36):
+    // Default clear rect (Count == 0) is the active Xbox viewport, and all clear rects are clipped to it.
+    LONG vpLeft   = (g_viewport.Width > 0 && g_viewport.Height > 0) ? static_cast<LONG>(g_viewport.X) : 0;
+    LONG vpTop    = (g_viewport.Width > 0 && g_viewport.Height > 0) ? static_cast<LONG>(g_viewport.Y) : 0;
+    LONG vpRight  = (g_viewport.Width > 0 && g_viewport.Height > 0) ? static_cast<LONG>(g_viewport.X + g_viewport.Width)  : static_cast<LONG>(vpW);
+    LONG vpBottom = (g_viewport.Width > 0 && g_viewport.Height > 0) ? static_cast<LONG>(g_viewport.Y + g_viewport.Height) : static_cast<LONG>(vpH);
+    if (vpLeft   < 0) vpLeft   = 0;
+    if (vpTop    < 0) vpTop    = 0;
+    if (vpRight  > static_cast<LONG>(vpW)) vpRight  = static_cast<LONG>(vpW);
+    if (vpBottom > static_cast<LONG>(vpH)) vpBottom = static_cast<LONG>(vpH);
+    if (vpRight <= vpLeft || vpBottom <= vpTop) return;
+
+    RECT vpDefaultRect = { vpLeft, vpTop, vpRight, vpBottom };
     const RECT* rects = reinterpret_cast<const RECT*>(pRects);
-    bool isFullRect = (Count == 0 || !rects);
-    if (!isFullRect && Count == 1) {
-        if (rects[0].left <= 0 && rects[0].top <= 0 &&
-            rects[0].right >= (LONG)vpW && rects[0].bottom >= (LONG)vpH) {
+    bool vpCoversFullSurface = (vpLeft <= 0 && vpTop <= 0 &&
+                                vpRight >= static_cast<LONG>(vpW) && vpBottom >= static_cast<LONG>(vpH));
+    bool isFullRect = false;
+    if (!g_scissorEnabled && vpCoversFullSurface) {
+        if (Count == 0 || !rects) {
             isFullRect = true;
+        } else if (Count == 1) {
+            if (rects[0].left <= 0 && rects[0].top <= 0 &&
+                rects[0].right >= static_cast<LONG>(vpW) && rects[0].bottom >= static_cast<LONG>(vpH)) {
+                isFullRect = true;
+            }
         }
     }
 
@@ -627,24 +1334,24 @@ static void __stdcall Bridge_D3DDevice_Clear(
             float rgba[4];
             UnpackD3DColor(Color, &rgba[0], &rgba[1], &rgba[2], &rgba[3]);
             g_d3dCtx->ClearRenderTargetView(rtv, rgba);
-            if (rtv == g_rtv) g_backBufferDirty = true;
+            MarkActiveRenderTargetGpuDirty();
         }
         if ((clearFlags & 0x00000003u) && dsv) {
             UINT dsFlags = 0;
             if (clearFlags & 0x01u) dsFlags |= D3D11_CLEAR_DEPTH;
             if (clearFlags & 0x02u) dsFlags |= D3D11_CLEAR_STENCIL;
-            g_d3dCtx->ClearDepthStencilView(dsv, dsFlags, Z, (UINT8)(Stencil & 0xFF));
+            g_d3dCtx->ClearDepthStencilView(dsv, dsFlags, Z, static_cast<UINT8>(Stencil & 0xFF));
+            MarkActiveDepthStencilGpuDirty();
         }
         return;
     }
 
-    // Sub-rectangle or partial-channel clear via screen-space quad draw
+    // Sub-rectangle, sub-viewport, scissored, or partial-channel clear via screen-space quad draw
     ID3D11PixelShader* clearPS = GetPixelShaderPermutation(0u);
-    if (!g_vs || !clearPS || !g_cbPerDraw || !g_inputLayout) return;
+    if (!g_vs || !clearPS || !g_inputLayout) return;
 
-    RECT fullDefaultRect = { 0, 0, (LONG)vpW, (LONG)vpH };
     if (Count == 0 || !rects) {
-        rects = &fullDefaultRect;
+        rects = &vpDefaultRect;
         Count = 1;
     }
 
@@ -669,23 +1376,47 @@ static void __stdcall Bridge_D3DDevice_Clear(
         if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &g_clearVB))) return;
     }
 
+    if (!g_clearCB) {
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth      = sizeof(PerDrawCBData);
+        cbd.Usage          = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_d3dDevice->CreateBuffer(&cbd, nullptr, &g_clearCB))) return;
+    }
+
+    D3D11StateBackup stateBackup(g_d3dCtx);
+
+    bool hwScissor = g_scissorEnabled && !g_scissorExclusive && (g_scissorCount == 1u);
+    uint32_t scCount = (g_scissorEnabled && !hwScissor) ? g_scissorCount : 0u;
+    if (scCount > 8u) scCount = 8u;
+
     PerDrawCBData cb = {};
-    cb.viewport[0]    = 0.0f;
-    cb.viewport[1]    = 0.0f;
-    cb.viewport[2]    = vpW;
-    cb.viewport[3]    = vpH;
-    cb.stage0Ops[0]   = 2u; // D3DTOP_SELECTARG1
-    cb.stage0Ops[1]   = 0u; // D3DTA_DIFFUSE
-    cb.stage0Alpha[0] = 2u; // D3DTOP_SELECTARG1
-    cb.stage0Alpha[1] = 0u; // D3DTA_DIFFUSE
-    cb.flags[0]       = 1u; // isRhw = 1
-    cb.alphaTest[2]   = 1.0f;
-    cb.alphaTest[3]   = 1.0f;
+    cb.viewport[0]          = 0.0f;
+    cb.viewport[1]          = 0.0f;
+    cb.viewport[2]          = vpW;
+    cb.viewport[3]          = vpH;
+    cb.stage0Ops[0]         = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Ops[1]         = 0u; // D3DTA_DIFFUSE
+    cb.stage0Alpha[0]       = 2u; // D3DTOP_SELECTARG1
+    cb.stage0Alpha[1]       = 0u; // D3DTA_DIFFUSE
+    for (uint32_t si = 0; si < scCount; ++si) {
+        cb.scissorRects[si][0] = static_cast<float>(g_scissorRects[si].left);
+        cb.scissorRects[si][1] = static_cast<float>(g_scissorRects[si].top);
+        cb.scissorRects[si][2] = static_cast<float>(g_scissorRects[si].right);
+        cb.scissorRects[si][3] = static_cast<float>(g_scissorRects[si].bottom);
+    }
+    cb.flags[0]             = 1u // isRhw = 1
+                            | ((g_scissorEnabled && g_scissorExclusive) ? 4u : 0u)
+                            | ((scCount & 0x0Fu) << 4);
+    cb.alphaTest[2]         = 1.0f;
+    cb.alphaTest[3]         = 1.0f;
+    cb.screenSpaceParams[2] = 16777215.0f;
 
     D3D11_MAPPED_SUBRESOURCE mappedCB = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_cbPerDraw, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
+    if (SUCCEEDED(g_d3dCtx->Map(g_clearCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB))) {
         memcpy(mappedCB.pData, &cb, sizeof(cb));
-        g_d3dCtx->Unmap(g_cbPerDraw, 0);
+        g_d3dCtx->Unmap(g_clearCB, 0);
     }
 
     ID3D11BlendState*        bs = GetBlendState(0u, 2u, 1u, 1u, writeMask);
@@ -693,13 +1424,16 @@ static void __stdcall Bridge_D3DDevice_Clear(
         clearZ ? 1u : 0u, clearZ ? 1u : 0u, 8u /* ALWAYS */,
         clearS ? 1u : 0u, 3u /* REPLACE */, 3u /* REPLACE */, 3u /* REPLACE */,
         8u /* ALWAYS */, 0xFFu, clearS ? 0xFFu : 0x00u);
-    ID3D11RasterizerState*   rs = GetRastState(0u, 3u, 0u, false, 0x0900u);
+    ID3D11RasterizerState*   rs = GetRastState(0u, 3u, 0u, hwScissor, 0x0900u);
 
     float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    g_d3dCtx->OMSetRenderTargets(1, rtv ? &rtv : nullptr, dsv);
+    g_d3dCtx->OMSetRenderTargets(rtv ? 1u : 0u, rtv ? &rtv : nullptr, dsv);
     g_d3dCtx->OMSetBlendState(bs, blendFactor, 0xFFFFFFFFu);
     g_d3dCtx->OMSetDepthStencilState(ds, Stencil & 0xFFu);
     g_d3dCtx->RSSetState(rs);
+    if (hwScissor) {
+        g_d3dCtx->RSSetScissorRects(1, &g_scissorRects[0]);
+    }
 
     D3D11_VIEWPORT vp11 = { 0.0f, 0.0f, vpW, vpH, 0.0f, 1.0f };
     g_d3dCtx->RSSetViewports(1, &vp11);
@@ -711,22 +1445,29 @@ static void __stdcall Bridge_D3DDevice_Clear(
     g_d3dCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
     g_d3dCtx->VSSetShader(g_vs, nullptr, 0);
-    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_cbPerDraw);
+    g_d3dCtx->VSSetConstantBuffers(0, 1, &g_clearCB);
     g_d3dCtx->PSSetShader(clearPS, nullptr, 0);
-    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_cbPerDraw);
+    g_d3dCtx->PSSetConstantBuffers(0, 1, &g_clearCB);
+
+    float clampedZ = Z < 0.0f ? 0.0f : (Z > 1.0f ? 1.0f : Z);
 
     for (DWORD i = 0; i < Count; ++i) {
-        float x0 = (float)rects[i].left;
-        float y0 = (float)rects[i].top;
-        float x1 = (float)rects[i].right;
-        float y1 = (float)rects[i].bottom;
-        if (x1 <= x0 || y1 <= y0) continue;
+        LONG clLeft   = rects[i].left   > vpLeft   ? rects[i].left   : vpLeft;
+        LONG clTop    = rects[i].top    > vpTop    ? rects[i].top    : vpTop;
+        LONG clRight  = rects[i].right  < vpRight  ? rects[i].right  : vpRight;
+        LONG clBottom = rects[i].bottom < vpBottom ? rects[i].bottom : vpBottom;
+        if (clRight <= clLeft || clBottom <= clTop) continue;
+
+        float x0 = static_cast<float>(clLeft);
+        float y0 = static_cast<float>(clTop);
+        float x1 = static_cast<float>(clRight);
+        float y1 = static_cast<float>(clBottom);
 
         UnifiedVertex quad[4] = {};
-        quad[0] = { x0, y0, Z, 1.0f, 0,0,1, r,g,b,a };
-        quad[1] = { x1, y0, Z, 1.0f, 0,0,1, r,g,b,a };
-        quad[2] = { x0, y1, Z, 1.0f, 0,0,1, r,g,b,a };
-        quad[3] = { x1, y1, Z, 1.0f, 0,0,1, r,g,b,a };
+        quad[0] = { x0, y0, clampedZ, 1.0f, 0,0,1, r,g,b,a };
+        quad[1] = { x1, y0, clampedZ, 1.0f, 0,0,1, r,g,b,a };
+        quad[2] = { x0, y1, clampedZ, 1.0f, 0,0,1, r,g,b,a };
+        quad[3] = { x1, y1, clampedZ, 1.0f, 0,0,1, r,g,b,a };
 
         D3D11_MAPPED_SUBRESOURCE mappedVB = {};
         if (SUCCEEDED(g_d3dCtx->Map(g_clearVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
@@ -736,28 +1477,138 @@ static void __stdcall Bridge_D3DDevice_Clear(
         }
     }
 
-    if (writeMask && rtv == g_rtv) g_backBufferDirty = true;
+    if (writeMask && rtv) MarkActiveRenderTargetGpuDirty();
+    if ((clearZ || clearS) && dsv) MarkActiveDepthStencilGpuDirty();
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+static void PaceSwapToXbox60Hz() {
+    // Original Xbox runs D3DDevice_Swap synchronized to NTSC 60 Hz VBlank (16.6667 ms/frame),
+    // matching simPhysics_Update's fixed 1/60s Havok step (0x00492436) and preventing
+    // tStdTime::Tick (0x005A7930) from hitting its 1.0 ms minimum frame-delta clamp (>1000 FPS),
+    // which otherwise accelerates m_gameTimeMs (0x00880404) and drains Cloak Psi 2x-4x too fast.
+    static bool    s_initialized  = false;
+    static int64_t s_qpcFreq      = 0;
+    static int64_t s_nextDeadline = 0;
+    static int64_t s_tickRem      = 0;
+    static HANDLE  s_hWaitTimer   = nullptr;
+
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+
+    if (!s_initialized) {
+        LARGE_INTEGER freq = {};
+        QueryPerformanceFrequency(&freq);
+        s_qpcFreq      = (freq.QuadPart > 0) ? freq.QuadPart : 10000000LL;
+        s_nextDeadline = now.QuadPart;
+        s_tickRem      = 0;
+        s_hWaitTimer   = CreateWaitableTimerExW(
+            nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!s_hWaitTimer) {
+            s_hWaitTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        }
+        s_initialized = true;
+    }
+
+    int64_t totalTicks = s_qpcFreq + s_tickRem;
+    s_nextDeadline += totalTicks / 60LL;
+    s_tickRem       = totalTicks % 60LL;
+
+    if (now.QuadPart >= s_nextDeadline) {
+        // Frame already took >= 16.67 ms (e.g., level load, shader compile, or window drag):
+        // resync deadline so subsequent frames never burst uncapped catch-up frames.
+        s_nextDeadline = now.QuadPart;
+        s_tickRem      = 0;
+        return;
+    }
+
+    int64_t remTicks = s_nextDeadline - now.QuadPart;
+    int64_t rem100ns = (remTicks * 10000000LL) / s_qpcFreq;
+    if (s_hWaitTimer && rem100ns > 20000LL) {
+        LARGE_INTEGER dueTime = {};
+        dueTime.QuadPart = -(rem100ns - 15000LL);
+        if (SetWaitableTimer(s_hWaitTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(s_hWaitTimer, 20);
+        }
+    }
+
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= s_nextDeadline) {
+            break;
+        }
+        YieldProcessor();
+    }
+
+    // If an OS scheduler stall during WaitForSingleObject woke >2 ms past s_nextDeadline,
+    // resync s_nextDeadline so the immediately following frame keeps a full 16.67 ms budget.
+    if ((now.QuadPart - s_nextDeadline) > (s_qpcFreq / 500LL)) {
+        s_nextDeadline = now.QuadPart;
+        s_tickRem      = 0;
+    }
 }
 
 static DWORD __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
-    (void)Flags;
+    // Match Xbox D3D8 _D3DDevice_Swap@4 (0x006BD855: if (Flags == 0) Flags = 5):
+    // Flags bitmask: 1 = D3DSWAP_COPY, 2 = D3DSWAP_BYPASSCOPY, 4 = D3DSWAP_FINISH.
+    // SwapBlur (0x005F4130, active during Nova's Psi Speed Power) calls Swap(2) before
+    // CopyRects and Swap(4) at frame end; non-finishing swaps must not Present, double-advance
+    // frame/input counters, or block on 60 Hz VBlank twice per engine frame.
+    uint32_t effectiveFlags = (Flags == 0u) ? 5u : Flags;
+    if ((effectiveFlags & 4u) == 0u) {
+        Bridge_D3DDevice_MakeSpace();
+        return *reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x2478);
+    }
+
     g_swapFrameCount++;
     (*reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x1DE8))++;
     uint32_t swapIdx = ++(*reinterpret_cast<uint32_t*>(ADDR_D3D_DEVICE + 0x2478));
-    g_curOffscreenRT = nullptr;
-    g_curActiveRTV   = g_rtv;
-    g_curActiveDSV   = g_dsv;
-    g_backBufferDirty = true;
+    g_curOffscreenRT     = nullptr;
+    g_curOffscreenZS     = nullptr;
+    g_curActiveRTV       = g_rtv;
+    g_curActiveDSV       = g_dsv;
+    g_backBufferDirty    = true;
+    g_backBufferCpuDirty = true;
 
-    FlushXboxOverlayToBackbuffer();
-    DrawOsdOverlayOnBackbuffer();
+    DrainPendingTextureEvictions();
+    DrainPendingGpuBufferEvictions();
 
-    if (g_swapChain) {
-        g_swapChain->Present(0, 0);
+    if (g_d3dCtx) {
+        D3D11StateBackup stateBackup(g_d3dCtx);
+        CompositePresentToSwapChain();
+        // [P2-2] Pass backupState = false to avoid a redundant nested D3D11StateBackup
+        DrawOsdOverlayOnTarget(g_swapChainRTV ? g_swapChainRTV : g_rtv, 640.0f, 480.0f, false);
+        if (g_swapChain) {
+            BOOL isFullscreen = FALSE;
+            if (g_swapChainFlipModel && g_swapChainAllowTearing) {
+                g_swapChain->GetFullscreenState(&isFullscreen, nullptr);
+            }
+            UINT presentFlags = (g_swapChainFlipModel && g_swapChainAllowTearing && !isFullscreen)
+                                ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+            g_swapChain->Present(0u, presentFlags);
+        }
+        if (g_rtv && g_dsv) {
+            if (stateBackup.rtv) { stateBackup.rtv->Release(); stateBackup.rtv = nullptr; }
+            if (stateBackup.dsv) { stateBackup.dsv->Release(); stateBackup.dsv = nullptr; }
+            stateBackup.rtv = g_rtv; stateBackup.rtv->AddRef();
+            stateBackup.dsv = g_dsv; stateBackup.dsv->AddRef();
+        }
+        stateBackup.Restore();
+        InvalidateD3D11ShadowState();
+    } else if (g_swapChain) {
+        BOOL isFullscreen = FALSE;
+        if (g_swapChainFlipModel && g_swapChainAllowTearing) {
+            g_swapChain->GetFullscreenState(&isFullscreen, nullptr);
+        }
+        UINT presentFlags = (g_swapChainFlipModel && g_swapChainAllowTearing && !isFullscreen)
+                            ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        g_swapChain->Present(0u, presentFlags);
     }
-    if (g_d3dCtx && g_rtv && g_dsv) {
-        g_d3dCtx->OMSetRenderTargets(1, &g_rtv, g_dsv);
-    }
+
+    PaceSwapToXbox60Hz();
     Bridge_D3DDevice_MakeSpace();
     UpdateXboxKernelTick();
     UpdateXboxInputTick();
@@ -841,35 +1692,24 @@ static void __cdecl Bridge_rlMain_SetGamma(float gamma, float brightness) {
 // Device Creation (_Direct3D_CreateDevice@24 at 0x006BCD20)
 // ============================================================================
 
-static constexpr uint32_t kNumPsPermutations = 29u; // 0 = fixed-function, 1..28 = aPixelShaders[0..27]
-static ID3D11PixelShader* g_psPermutations[kNumPsPermutations] = {};
+static ID3D11PixelShader* g_fixedPs = nullptr;
 
 ID3D11PixelShader* GetPixelShaderPermutation(uint32_t psMode) {
     if (!g_d3dDevice) return nullptr;
-    if (psMode >= kNumPsPermutations) psMode = 0u;
-    if (g_psPermutations[psMode]) return g_psPermutations[psMode];
-
-    const char* baseName = "fixed_ps";
     if (psMode > 0u) {
-        uint32_t pt = psMode - 1u;
-        if (pt == 13u) pt = 12u; // gaussBlur_ms.xpu -> gaussBlur.xpu
-        if (pt == 14u) pt = 11u; // gaussBlur_Source_ms.xpu -> gaussBlurSource.xpu
-        const char* relPath = *reinterpret_cast<const char* const*>(0x007D1210u + pt * 8u);
-        if (relPath && reinterpret_cast<uintptr_t>(relPath) >= kMinValidXboxAddress) {
-            const char* s1 = strrchr(relPath, '\\');
-            const char* s2 = strrchr(relPath, '/');
-            const char* s  = (s1 > s2) ? s1 : s2;
-            baseName = s ? (s + 1) : relPath;
-        }
+        bool isProg = false;
+        ID3D11PixelShader* progPs = GetActiveProgramPixelShader(&isProg);
+        if (progPs) return progPs;
     }
+    if (g_fixedPs) return g_fixedPs;
 
     void*  csoData = nullptr;
     size_t csoSize = 0;
-    if (LoadShaderCsoFromDisk(baseName, &csoData, &csoSize) && csoData && csoSize > 0) {
-        g_d3dDevice->CreatePixelShader(csoData, csoSize, nullptr, &g_psPermutations[psMode]);
+    if (LoadShaderCsoFromDisk("fixed_ps", &csoData, &csoSize) && csoData && csoSize > 0) {
+        g_d3dDevice->CreatePixelShader(csoData, csoSize, nullptr, &g_fixedPs);
         free(csoData);
     }
-    return g_psPermutations[psMode];
+    return g_fixedPs;
 }
 
 static void* __stdcall Bridge_Direct3DCreate8(UINT SDKVersion) {
@@ -880,18 +1720,8 @@ static void* __stdcall Bridge_Direct3DCreate8(UINT SDKVersion) {
 bool InitD3D11HostDevice() {
     if (g_d3dDevice) return true;
 
-    DXGI_SWAP_CHAIN_DESC sd = {};
-    sd.BufferCount = 1;
-    sd.BufferDesc.Width = 640;
-    sd.BufferDesc.Height = 480;
-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = g_hWnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    g_swapChainFlipModel    = false;
+    g_swapChainAllowTearing = false;
 
     D3D_FEATURE_LEVEL featureLevels[] = {
         D3D_FEATURE_LEVEL_11_0,
@@ -900,42 +1730,159 @@ bool InitD3D11HostDevice() {
     };
     D3D_FEATURE_LEVEL flOut = D3D_FEATURE_LEVEL_11_0;
 
-    IDXGIFactory* pFactory = nullptr;
-    IDXGIAdapter* pSelectedAdapter = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&pFactory))) && pFactory) {
-        pFactory->EnumAdapters((UINT)g_selectedAdapterIndex, &pSelectedAdapter);
+    IDXGIFactory1* pFactory1        = nullptr;
+    IDXGIAdapter1* pSelectedAdapter = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&pFactory1))) && pFactory1) {
+        pFactory1->EnumAdapters1(static_cast<UINT>(g_selectedAdapterIndex), &pSelectedAdapter);
     }
 
-    HRESULT hr = E_FAIL;
+    bool    isSoftwareAdapter = false;
+    HRESULT hr                = E_FAIL;
     if (pSelectedAdapter) {
-        // Note: D3D11 requires D3D_DRIVER_TYPE_UNKNOWN when a non-null IDXGIAdapter* is passed!
-        hr = D3D11CreateDeviceAndSwapChain(
+        DXGI_ADAPTER_DESC1 ad1 = {};
+        if (SUCCEEDED(pSelectedAdapter->GetDesc1(&ad1))) {
+            if ((ad1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u ||
+                (ad1.VendorId == 0x1414u && ad1.DeviceId == 0x008Cu))
+            {
+                isSoftwareAdapter = true;
+            }
+        }
+        // D3D11 requires D3D_DRIVER_TYPE_UNKNOWN when a non-null IDXGIAdapter* is passed
+        hr = D3D11CreateDevice(
             pSelectedAdapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-            featureLevels, 3, D3D11_SDK_VERSION, &sd,
-            &g_swapChain, &g_d3dDevice, &flOut, &g_d3dCtx);
+            featureLevels, 3, D3D11_SDK_VERSION,
+            &g_d3dDevice, &flOut, &g_d3dCtx);
         pSelectedAdapter->Release();
         pSelectedAdapter = nullptr;
     }
-    if (pFactory) {
-        pFactory->Release();
-        pFactory = nullptr;
-    }
 
     if (FAILED(hr)) {
-        hr = D3D11CreateDeviceAndSwapChain(
+        isSoftwareAdapter = false;
+        hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-            featureLevels, 3, D3D11_SDK_VERSION, &sd,
-            &g_swapChain, &g_d3dDevice, &flOut, &g_d3dCtx);
+            featureLevels, 3, D3D11_SDK_VERSION,
+            &g_d3dDevice, &flOut, &g_d3dCtx);
     }
 
     if (FAILED(hr)) {
-        hr = D3D11CreateDeviceAndSwapChain(
+        isSoftwareAdapter = true;
+        hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
-            featureLevels, 3, D3D11_SDK_VERSION, &sd,
-            &g_swapChain, &g_d3dDevice, &flOut, &g_d3dCtx);
+            featureLevels, 3, D3D11_SDK_VERSION,
+            &g_d3dDevice, &flOut, &g_d3dCtx);
     }
 
-    if (FAILED(hr) || !g_d3dDevice || !g_d3dCtx || !g_swapChain) {
+    if (pFactory1) {
+        pFactory1->Release();
+        pFactory1 = nullptr;
+    }
+
+    if (FAILED(hr) || !g_d3dDevice || !g_d3dCtx) {
+        return false;
+    }
+
+    // Inspect the actual adapter bound to g_d3dDevice and obtain its parent DXGI factory
+    IDXGIDevice*  pDxgiDevice  = nullptr;
+    IDXGIAdapter* pDxgiAdapter = nullptr;
+    IDXGIFactory* pDevFactory  = nullptr;
+    if (SUCCEEDED(g_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&pDxgiDevice))) && pDxgiDevice) {
+        if (SUCCEEDED(pDxgiDevice->GetAdapter(&pDxgiAdapter)) && pDxgiAdapter) {
+            DXGI_ADAPTER_DESC ad = {};
+            if (SUCCEEDED(pDxgiAdapter->GetDesc(&ad))) {
+                if (ad.VendorId == 0x1414u && ad.DeviceId == 0x008Cu) {
+                    isSoftwareAdapter = true;
+                }
+            }
+            IDXGIAdapter1* pAdapter1 = nullptr;
+            if (SUCCEEDED(pDxgiAdapter->QueryInterface(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&pAdapter1))) && pAdapter1) {
+                DXGI_ADAPTER_DESC1 ad1 = {};
+                if (SUCCEEDED(pAdapter1->GetDesc1(&ad1)) && (ad1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u) {
+                    isSoftwareAdapter = true;
+                }
+                pAdapter1->Release();
+            }
+            pDxgiAdapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&pDevFactory));
+            pDxgiAdapter->Release();
+        }
+        pDxgiDevice->Release();
+    }
+
+    // Optimization 3: Prefer DXGI_SWAP_EFFECT_FLIP_DISCARD + DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+    // with explicit DXGI_SCALING_STRETCH on hardware adapters; omit ALLOW_TEARING on WARP/software.
+    if (pDevFactory && g_hWnd && IsWindow(g_hWnd) && !isSoftwareAdapter) {
+        IDXGIFactory2* pFactory2 = nullptr;
+        if (SUCCEEDED(pDevFactory->QueryInterface(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&pFactory2))) && pFactory2) {
+            BOOL allowTearing = FALSE;
+            IDXGIFactory5* pFactory5 = nullptr;
+            if (SUCCEEDED(pFactory2->QueryInterface(__uuidof(IDXGIFactory5), reinterpret_cast<void**>(&pFactory5))) && pFactory5) {
+                if (FAILED(pFactory5->CheckFeatureSupport(
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing))))
+                {
+                    allowTearing = FALSE;
+                }
+                pFactory5->Release();
+            }
+
+            DXGI_SWAP_CHAIN_DESC1 sd1 = {};
+            sd1.Width              = 640;
+            sd1.Height             = 480;
+            sd1.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+            sd1.Stereo             = FALSE;
+            sd1.SampleDesc.Count   = 1;
+            sd1.SampleDesc.Quality = 0;
+            sd1.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            sd1.BufferCount        = 2;
+            sd1.Scaling            = DXGI_SCALING_STRETCH;
+            sd1.SwapEffect         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            sd1.AlphaMode          = DXGI_ALPHA_MODE_IGNORE;
+            sd1.Flags              = allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+
+            IDXGISwapChain1* pSwapChain1 = nullptr;
+            HRESULT hrSwap = pFactory2->CreateSwapChainForHwnd(
+                g_d3dDevice, g_hWnd, &sd1, nullptr, nullptr, &pSwapChain1);
+            if (FAILED(hrSwap) && sd1.Flags != 0u) {
+                sd1.Flags    = 0u;
+                allowTearing = FALSE;
+                hrSwap = pFactory2->CreateSwapChainForHwnd(
+                    g_d3dDevice, g_hWnd, &sd1, nullptr, nullptr, &pSwapChain1);
+            }
+            if (SUCCEEDED(hrSwap) && pSwapChain1) {
+                g_swapChain             = pSwapChain1;
+                g_swapChainFlipModel    = true;
+                g_swapChainAllowTearing = (allowTearing != FALSE) && ((sd1.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0u);
+            }
+            pFactory2->Release();
+        }
+    }
+
+    // Fallback to legacy DXGI_SWAP_EFFECT_DISCARD (e.g. WARP software adapter or older DXGI)
+    if (!g_swapChain && pDevFactory) {
+        DXGI_SWAP_CHAIN_DESC sd = {};
+        sd.BufferCount                        = 1;
+        sd.BufferDesc.Width                   = 640;
+        sd.BufferDesc.Height                  = 480;
+        sd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.BufferDesc.RefreshRate.Numerator   = 60;
+        sd.BufferDesc.RefreshRate.Denominator = 1;
+        sd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.OutputWindow                       = g_hWnd;
+        sd.SampleDesc.Count                   = 1;
+        sd.Windowed                           = TRUE;
+        sd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+        sd.Flags                              = 0u;
+        pDevFactory->CreateSwapChain(g_d3dDevice, &sd, &g_swapChain);
+        g_swapChainFlipModel    = false;
+        g_swapChainAllowTearing = false;
+    }
+
+    if (pDevFactory) {
+        pDevFactory->Release();
+        pDevFactory = nullptr;
+    }
+
+    if (!g_swapChain) {
+        if (g_d3dCtx)    { g_d3dCtx->Release();    g_d3dCtx    = nullptr; }
+        if (g_d3dDevice) { g_d3dDevice->Release(); g_d3dDevice = nullptr; }
         return false;
     }
 
@@ -946,20 +1893,53 @@ bool InitD3D11HostDevice() {
         pSwapFactory->Release();
     }
 
-    g_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&g_backBufferTex));
-    g_d3dDevice->CreateRenderTargetView(g_backBufferTex, nullptr, &g_rtv);
+    // Wrap DXGI swapchain presentation target into g_swapChainTex + g_swapChainRTV
+    g_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&g_swapChainTex));
+    if (g_swapChainTex) {
+        g_d3dDevice->CreateRenderTargetView(g_swapChainTex, nullptr, &g_swapChainRTV);
+    }
+
+    // Create dedicated linear 640x480 Xbox backbuffer (RTV + SRV) so post-processing,
+    // CopyRects, video overlays, gamma LUT, and host OSD never corrupt scene pixels
+    D3D11_TEXTURE2D_DESC bbd = {};
+    bbd.Width            = 640;
+    bbd.Height           = 480;
+    bbd.MipLevels        = 1;
+    bbd.ArraySize        = 1;
+    bbd.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bbd.SampleDesc.Count = 1;
+    bbd.Usage            = D3D11_USAGE_DEFAULT;
+    bbd.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&bbd, nullptr, &g_backBufferTex)) && g_backBufferTex) {
+        g_d3dDevice->CreateRenderTargetView(g_backBufferTex, nullptr, &g_rtv);
+        g_d3dDevice->CreateShaderResourceView(g_backBufferTex, nullptr, &g_backBufferSRV);
+        float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        if (g_rtv) g_d3dCtx->ClearRenderTargetView(g_rtv, black);
+    }
+
+    InitPresentCompositePipeline();
 
     D3D11_TEXTURE2D_DESC dd = {};
     dd.Width = 640;
     dd.Height = 480;
     dd.MipLevels = 1;
     dd.ArraySize = 1;
-    dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dd.Format = DXGI_FORMAT_R24G8_TYPELESS;
     dd.SampleDesc.Count = 1;
     dd.Usage = D3D11_USAGE_DEFAULT;
-    dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    g_d3dDevice->CreateTexture2D(&dd, nullptr, &g_depthTex);
-    g_d3dDevice->CreateDepthStencilView(g_depthTex, nullptr, &g_dsv);
+    dd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&dd, nullptr, &g_depthTex)) && g_depthTex) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsvd = {};
+        dsvd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        g_d3dDevice->CreateDepthStencilView(g_depthTex, &dsvd, &g_dsv);
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC dsrvd = {};
+        dsrvd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        dsrvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        dsrvd.Texture2D.MipLevels = 1;
+        g_d3dDevice->CreateShaderResourceView(g_depthTex, &dsrvd, &g_depthSRV);
+    }
 
     g_curActiveRTV = g_rtv;
     g_curActiveDSV = g_dsv;
@@ -978,23 +1958,26 @@ bool InitD3D11HostDevice() {
     UpdateGammaLutTexture(identRamp);
     g_hasGammaRamp = false;
 
-    // Load fixed-function Vertex & Pixel Shaders from disk cache (GhostWin11_Data\shaders\*.cso)
+    // Load fixed-function Vertex & Pixel Shaders from disk cache (GhostXR_Data\shaders\*.cso)
     void*  vsData = nullptr;
     size_t vsSize = 0;
     if (LoadShaderCsoFromDisk("fixed_vs", &vsData, &vsSize) && vsData && vsSize > 0) {
         g_d3dDevice->CreateVertexShader(vsData, vsSize, nullptr, &g_vs);
         D3D11_INPUT_ELEMENT_DESC ied[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 44, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,       0, 52, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT,       0, 60, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT,       0, 68, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 76, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "COLOR",    1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 92, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "POSITION",     0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,   D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "NORMAL",       0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 16,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "COLOR",        0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 28,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD",     0, DXGI_FORMAT_R32G32_FLOAT,       0, 44,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD",     1, DXGI_FORMAT_R32G32_FLOAT,       0, 52,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD",     2, DXGI_FORMAT_R32G32_FLOAT,       0, 60,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD",     3, DXGI_FORMAT_R32G32_FLOAT,       0, 68,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD",     4, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 76,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "COLOR",        1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 92,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "BLENDWEIGHT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 108, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "BLENDINDICES", 0, DXGI_FORMAT_R32G32B32A32_UINT,  0, 124, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD",     5, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 140, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         };
-        g_d3dDevice->CreateInputLayout(ied, 9, vsData, vsSize, &g_inputLayout);
+        g_d3dDevice->CreateInputLayout(ied, 12, vsData, vsSize, &g_inputLayout);
         free(vsData);
     }
 
@@ -1013,6 +1996,13 @@ bool InitD3D11HostDevice() {
     vscbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     vscbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_d3dDevice->CreateBuffer(&vscbd, nullptr, &g_cbVSConstants);
+
+    D3D11_BUFFER_DESC bpcbd = {};
+    bpcbd.ByteWidth = sizeof(BonePaletteCBData);
+    bpcbd.Usage = D3D11_USAGE_DYNAMIC;
+    bpcbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bpcbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    g_d3dDevice->CreateBuffer(&bpcbd, nullptr, &g_cbBonePalette);
 
     return true;
 }
@@ -1104,9 +2094,8 @@ void InitXboxD3D8() {
     PatchRet(0x006B4A20, 0, 0, false); // KickOff@CDevice@D3D
     PatchRet(0x006B4AD0, 0, 0, false); // ReentrantKickOffAndWait@CDevice@D3D
 
-    // _D3DVertexBuffer_Lock2@8 (0x006B3510): mov eax, [esp+4]; mov eax, [eax+4]; ret 8
-    static const uint8_t kVbLock2[10] = { 0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x04, 0xC2, 0x08, 0x00 };
-    PatchBytes(0x006B3510, kVbLock2, sizeof(kVbLock2));
+    // _D3DVertexBuffer_Lock2@8 (0x006B3510): bridged to track dirty static GPU VBs while ignoring D3DLOCK_READONLY (0x80)
+    InstallBridge(0x006B3510, &Bridge_D3DVertexBuffer_Lock2);
 
     // 3. Bridge Dummy PushBuffer space functions
     InstallBridge(0x006B4E80, &Bridge_D3DDevice_MakeSpace);                 // _D3DDevice_MakeSpace@0

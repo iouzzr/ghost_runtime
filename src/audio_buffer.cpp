@@ -1,17 +1,8 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
-#include <mmsystem.h>
-#include <dsound.h>
 #include <math.h>
+#include <float.h>
 #include <vector>
-
-#pragma comment(lib, "dsound.lib")
-#pragma comment(lib, "winmm.lib")
-
-void DecodeXboxAdpcmToPcm16(
-    const uint8_t* src, uint32_t srcBytes, uint32_t channels, std::vector<int16_t>& outPcm);
-void DecimatePcm16By2(
-    const int16_t* srcPcm, size_t srcFrames, uint32_t channels, std::vector<int16_t>& outPcm);
 
 // ============================================================================
 // Xbox DirectSoundBuffer Structures & Constants
@@ -26,11 +17,12 @@ struct XBOX_DSBUFFERDESC {
     const void*         lpMixBins;
     uint32_t            dwInputMixBin;
 };
-
 #pragma pack(pop)
 
 static constexpr uint32_t kDefaultStreamBytesPerSec = 192000u;
-static constexpr uint32_t kXboxMixBinI3DL2          = 10u;
+static constexpr DWORD    kXboxDsbStatusPlaying     = 0x00000001u; // DSBSTATUS_PLAYING
+static constexpr DWORD    kXboxDsbStatusLooping     = 0x00000004u; // DSBSTATUS_LOOPING (verified at 0x006E81D3)
+static constexpr float    kMillibelsPerTwentyDb     = 2000.0f;
 
 static XBOX_DSI3DL2LISTENER g_i3dl2Listener = {
     -10000, 0, 0.0f, 1.49f, 0.83f, -2602, 0.007f, 200, 0.011f, 100.0f, 100.0f, 5000.0f
@@ -42,29 +34,28 @@ const XBOX_DSI3DL2LISTENER& GetXboxI3DL2ListenerState() {
     return g_i3dl2Listener;
 }
 
-// ============================================================================
-// Windows IDirectSound8 Host Backend & Buffer Pool
-// ============================================================================
+CRITICAL_SECTION g_audioCs;
+volatile LONG    g_audioCsInitState = 0;
 
-static IDirectSound8* g_hostDS = nullptr;
-
-static void EnsureHostDirectSound() {
-    if (g_hostDS || !g_hWnd) return;
-    if (SUCCEEDED(DirectSoundCreate8(nullptr, &g_hostDS, nullptr))) {
-        g_hostDS->SetCooperativeLevel(g_hWnd, DSSCL_PRIORITY);
+void EnsureXboxAudioCsInitialized() {
+    if (InterlockedCompareExchange(&g_audioCsInitState, 0, 0) == 2) return;
+    if (InterlockedCompareExchange(&g_audioCsInitState, 1, 0) == 0) {
+        InitializeCriticalSection(&g_audioCs);
+        InterlockedExchange(&g_audioCsInitState, 2);
+    } else {
+        while (InterlockedCompareExchange(&g_audioCsInitState, 0, 0) != 2) {
+            SwitchToThread();
+        }
     }
 }
 
-enum XboxBufferSubLoopPhase : uint8_t {
-    kSubLoopPhaseNone    = 0,
-    kSubLoopPhaseAttack  = 1,
-    kSubLoopPhaseSustain = 2,
-    kSubLoopPhaseRelease = 3,
-};
+static inline void EnsureAudioLockInitialized() {
+    EnsureXboxAudioCsInitialized();
+}
 
 struct XboxDSBufferObject {
-    void**                  vtable;
-    LONG                    refCount;
+    void**                  vtable;   // +0x00: 4-entry Xbox IDirectSoundBuffer vtable
+    LONG                    refCount; // +0x04
     WAVEFORMATEX            wfx;
     bool                    isAdpcm;
     uint8_t*                rawBuf;
@@ -74,23 +65,26 @@ struct XboxDSBufferObject {
     uint32_t                playLength;
     uint32_t                loopStart;
     uint32_t                loopLength;
+    double                  playFramePos;
+    bool                    hasExplicitStartPos;
     LONG                    volume;
     LONG                    headroomMb;
     LONG                    pan;
+    LONG                    mixBinAttenMb;
     LONG                    atten3D;
     LONG                    lPitch;
     DWORD                   freq;
     DWORD                   status;
-    IDirectSoundBuffer*     hostBuf;
-    uint32_t                hostBufBytes;
-    uint64_t                hostCacheKey;
-    bool                    dirty;
+    uint32_t                lockCount;
     bool                    isStreamingLockBuf;
     bool                    isLooping;
-    bool                    isDecimated2x;
-    uint8_t                 subLoopPhase;
+    bool                    isReleasing;
+    bool                    releaseOnlyEnvelope;
+    bool                    use3DVoiceData;
     bool                    hasI3DL2Send;
     int32_t                 i3dl2SendMb;
+    uint32_t                fxSendBinMask; // Bits [0..20] correspond to MixBins 11..31
+    uint32_t                inputMixBin;   // 0xFFFFFFFFu unless configured as FXIN/submix target
     XBOX_DSMIXBINVOLUMEPAIR mixBinPairs[8];
     uint32_t                mixBinCount;
     Xbox3DVoiceMetrics      voice3D;
@@ -102,635 +96,562 @@ struct XboxDSBufferObject {
     XBOX_DSENVELOPEDESC     eg[2];
     bool                    egActive[2];
     XboxDSBufferObject*     outputBuffer;
-    DWORD                   playStartTickMs;
-    bool                    isReleasing;
-    DWORD                   releaseStartTickMs;
-    int32_t                 lfoEgVolModMb;
-    float                   lfoEgPitchRatio;
-    float                   lfoEgCutoffRatio;
-};
+    uint64_t                activeSamples48k;
+    uint64_t                releaseSamples48k;
 
-struct PooledHostBuffer {
-    IDirectSoundBuffer* hostBuf;
-    uint32_t            hostBufBytes;
-    uint64_t            cacheKey;
-    uint16_t            nChannels;
-    uint16_t            wBitsPerSample;
+    // Zero-allocation 64-frame decoded block cache for Xbox IMA ADPCM voices
+    uint32_t                cachedAdpcmBlockIdx;
+    float                   cachedAdpcmL[64];
+    float                   cachedAdpcmR[64];
+
+    // Pre-allocated submix stereo bus (allocated lazily on API call, never on mixer thread)
+    std::vector<float>      submixL;
+    std::vector<float>      submixR;
+    bool                    submixHasAudio;
 };
 
 static std::vector<XboxDSBufferObject*> g_activeBuffers;
-static std::vector<PooledHostBuffer>    g_hostBufPool;
-CRITICAL_SECTION                        g_audioCs;
-bool                                    g_audioCsInit = false;
 
-static void ExtractMixBinPairsI3DL2Send(
-    const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count, bool* outHasSend, int32_t* outSendMb)
-{
-    if (!outHasSend || !outSendMb || !pairs) return;
+static uint32_t ExtractFxSendBinMask(const XBOX_DSMIXBINVOLUMEPAIR pairs[8], uint32_t count) {
+    if (!pairs) return 0u;
     if (count > 8u) count = 8u;
-    for (uint32_t i = 0; i < count; ++i) {
-        if (pairs[i].dwMixBin == kXboxMixBinI3DL2) {
-            int32_t v = pairs[i].lVolume;
-            if (v > -9000) {
-                *outHasSend = true;
-                *outSendMb  = (v > 0) ? 0 : v;
-            } else {
-                *outHasSend = false;
-                *outSendMb  = kMinDirectSoundVolumeMb;
-            }
-            return;
+    uint32_t mask = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        uint32_t bin = pairs[i].dwMixBin;
+        if (bin >= 11u && bin <= 31u && pairs[i].lVolume > -9000) {
+            mask |= (1u << (bin - 11u));
+        }
+    }
+    return mask;
+}
+
+static void EnsureSubmixBusAllocatedLocked(XboxDSBufferObject* submix) {
+    if (!submix) return;
+    if (submix->submixL.size() < kAudioMaxQuantumFrames) {
+        submix->submixL.assign(kAudioMaxQuantumFrames, 0.0f);
+        submix->submixR.assign(kAudioMaxQuantumFrames, 0.0f);
+    }
+}
+
+void EnsureXboxBufferSubmixReadyLocked(XboxDSBufferObject* submix) {
+    EnsureSubmixBusAllocatedLocked(submix);
+}
+
+void EnsureXboxFxSendTargetsAllocatedLocked(uint32_t fxSendBinMask) {
+    if (fxSendBinMask == 0u) return;
+    for (size_t i = 0u; i < g_activeBuffers.size(); ++i) {
+        XboxDSBufferObject* sb = g_activeBuffers[i];
+        if (!sb || sb->inputMixBin < 11u || sb->inputMixBin > 31u) continue;
+        if ((fxSendBinMask & (1u << (sb->inputMixBin - 11u))) != 0u) {
+            EnsureSubmixBusAllocatedLocked(sb);
         }
     }
 }
 
-void ApplyXboxOutputBufferRouting(
-    XboxDSBufferObject* outBuf, LONG* ioVolMb, LONG* ioPanMb, bool* ioHasI3DL2, int32_t* ioI3DL2SendMb)
-{
-    if (!outBuf) return;
-    if (ioVolMb) {
-        int32_t v = *ioVolMb + (outBuf->volume - outBuf->headroomMb) + outBuf->atten3D;
-        if (v < kMinDirectSoundVolumeMb) v = kMinDirectSoundVolumeMb;
-        if (v > kMaxDirectSoundVolumeMb) v = kMaxDirectSoundVolumeMb;
-        *ioVolMb = v;
-    }
-    if (ioPanMb && outBuf->pan != 0) {
-        int32_t p = *ioPanMb + outBuf->pan;
-        if (p < kMinDirectSoundPanMb) p = kMinDirectSoundPanMb;
-        if (p > kMaxDirectSoundPanMb) p = kMaxDirectSoundPanMb;
-        *ioPanMb = p;
-    }
-    if (outBuf->hasI3DL2Send) {
-        if (ioHasI3DL2)   *ioHasI3DL2   = true;
-        if (ioI3DL2SendMb && outBuf->i3dl2SendMb > *ioI3DL2SendMb) {
-            *ioI3DL2SendMb = outBuf->i3dl2SendMb;
+static bool HasActiveFxSendTargetLocked(uint32_t fxSendBinMask, const XboxDSBufferObject* excludeSelf) {
+    if (fxSendBinMask == 0u) return false;
+    for (size_t i = 0u; i < g_activeBuffers.size(); ++i) {
+        const XboxDSBufferObject* sb = g_activeBuffers[i];
+        if (!sb || sb == excludeSelf || sb->inputMixBin < 11u || sb->inputMixBin > 31u) continue;
+        if ((fxSendBinMask & (1u << (sb->inputMixBin - 11u))) != 0u) {
+            return true;
         }
     }
+    return false;
 }
 
-static DWORD GetBufferEffectiveFreqHz(const XboxDSBufferObject* b) {
-    if (!b) return kDefaultSampleRateHz;
-    DWORD eff = b->freq ? b->freq : kDefaultSampleRateHz;
-    if (b->voice3D.active3D && b->voice3D.dopplerPitch != 0) {
-        eff = XboxPitchToFrequencyHz(b->lPitch + b->voice3D.dopplerPitch);
-    }
-    if (b->lfoEgPitchRatio > 0.01f && fabsf(b->lfoEgPitchRatio - 1.0f) > 0.001f) {
-        eff = static_cast<DWORD>(static_cast<float>(eff) * b->lfoEgPitchRatio + 0.5f);
-    }
-    if (eff < kMinDirectSoundFreqHz) eff = kMinDirectSoundFreqHz;
-    if (eff > kMaxXboxPitchFreqHz)   eff = kMaxXboxPitchFreqHz;
-    return eff;
-}
-
-static uint32_t GetQuantizedI3DL2StateHash(const XboxDSBufferObject* b) {
-    if (!b || g_i3dl2Listener.lRoom <= -9000) return 0u;
-    bool hasSend = b->hasI3DL2Send;
-    int32_t sendMb = b->i3dl2SendMb;
-    if (b->outputBuffer && b->outputBuffer->hasI3DL2Send) {
-        hasSend = true;
-        if (b->outputBuffer->i3dl2SendMb > sendMb) sendMb = b->outputBuffer->i3dl2SendMb;
-    }
-    if (!hasSend) return 0u;
-    int32_t roomBucket = (g_i3dl2Listener.lRoom + 10000) / 250;
-    int32_t revBucket  = (g_i3dl2Listener.lReverb + 10000) / 250;
-    int32_t decBucket  = static_cast<int32_t>(g_i3dl2Listener.flDecayTime * 4.0f);
-    int32_t sendBucket = (sendMb + 10000) / 500;
-    return static_cast<uint32_t>(
-        ((roomBucket & 0x3Fu) << 18) |
-        ((revBucket  & 0x3Fu) << 12) |
-        ((decBucket  & 0x3Fu) << 6)  |
-        (sendBucket  & 0x3Fu) | 0x80000000u);
-}
-
-static uint32_t GetQuantizedFilterStateHash(const XboxDSBufferObject* b) {
-    if (!b) return 0u;
-    uint32_t h = 0u;
-    if (b->hasActiveFilter && (b->filterDesc.dwMode & 3u) != 0u) {
-        uint32_t mode = b->filterDesc.dwMode & 3u;
-        int16_t  fc0  = static_cast<int16_t>(b->filterDesc.adwCoefficients[0] & 0xFFFFu);
-        uint16_t q0   = static_cast<uint16_t>(b->filterDesc.adwCoefficients[1] & 0xFFFFu);
-        int16_t  fc1  = static_cast<int16_t>(b->filterDesc.adwCoefficients[2] & 0xFFFFu);
-        uint16_t q1   = static_cast<uint16_t>(b->filterDesc.adwCoefficients[3] & 0xFFFFu);
-        bool s0 = !(fc0 == 0 && (q0 == 0u || q0 == 0x8000u));
-        bool s1 = !(fc1 == 0 && (q1 == 0u || q1 == 0x8000u));
-        if (s0 || s1) {
-            uint32_t fc0B = static_cast<uint32_t>((static_cast<int32_t>(fc0) + 32768) >> 9) & 0x7Fu;
-            uint32_t q0B  = static_cast<uint32_t>(q0 >> 12) & 0x0Fu;
-            uint32_t fc1B = static_cast<uint32_t>((static_cast<int32_t>(fc1) + 32768) >> 10) & 0x3Fu;
-            uint32_t q1B  = static_cast<uint32_t>(q1 >> 13) & 0x07u;
-            h |= (mode << 28) | (fc0B << 17) | (q0B << 13) | (fc1B << 7) | (q1B << 4);
-        }
-    }
-    if (b->voice3D.active3D && b->voice3D.hrtfFilterCoeff > 0.0f && b->voice3D.hrtfFilterCoeff < 0.92f) {
-        uint32_t hrtfB = static_cast<uint32_t>(b->voice3D.hrtfFilterCoeff * 15.0f) & 0x0Fu;
-        h |= 0x08000000u | hrtfB;
-    }
-    return h;
-}
-
-static void ApplyI3DL2ReverbToPcm16(
-    std::vector<int16_t>& pcm, uint32_t channels, uint32_t sampleRate, int32_t sendMb)
-{
-    if (pcm.empty() || channels == 0 || channels > 2 || g_i3dl2Listener.lRoom <= -9000) return;
-
-    float roomLin = powf(10.0f, static_cast<float>(g_i3dl2Listener.lRoom) / 2000.0f);
-    float sendLin = powf(10.0f, static_cast<float>(sendMb) / 2000.0f);
-    if (roomLin > 1.0f) roomLin = 1.0f;
-    if (sendLin > 1.0f) sendLin = 1.0f;
-
-    float reflLin = roomLin * sendLin * powf(10.0f, static_cast<float>(g_i3dl2Listener.lReflections) / 2000.0f);
-    float revLin  = roomLin * sendLin * powf(10.0f, static_cast<float>(g_i3dl2Listener.lReverb) / 2000.0f);
-    if (reflLin > 0.35f) reflLin = 0.35f;
-    if (revLin  > 0.35f) revLin  = 0.35f;
-    if (reflLin < 0.002f && revLin < 0.002f) return;
-
-    float decaySec = g_i3dl2Listener.flDecayTime;
-    if (!_finite(decaySec) || decaySec < 0.1f) decaySec = 0.1f;
-    if (decaySec > 10.0f) decaySec = 10.0f;
-
-    float hfRatio = g_i3dl2Listener.flDecayHFRatio;
-    if (!_finite(hfRatio) || hfRatio < 0.1f) hfRatio = 0.1f;
-    if (hfRatio > 2.0f) hfRatio = 2.0f;
-
-    float hfGain = powf(10.0f, static_cast<float>(g_i3dl2Listener.lRoomHF) / 4000.0f);
-    if (!_finite(hfGain) || hfGain < 0.05f) hfGain = 0.05f;
-    if (hfGain > 1.0f) hfGain = 1.0f;
-
-    float damp = 1.0f - (0.45f * hfGain * hfRatio);
-    if (damp < 0.10f) damp = 0.10f;
-    if (damp > 0.75f) damp = 0.75f;
-
-    if (sampleRate < 8000u) sampleRate = 22050u;
-    float rateScale = static_cast<float>(sampleRate) / 22050.0f;
-
-    // Zero-allocation scratch delay lines (eliminates 5 heap allocations per SyncBufferToHost call).
-    static thread_local float s_combBuf[4][8192];
-    static thread_local float s_reflBuf[6600];
-
-    static const int kBaseCombDelays[4] = { 659, 751, 853, 967 };
-    int combDelays[4];
-    float combFb[4];
-    float combLp[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    int combIdx[4]  = { 0, 0, 0, 0 };
-
-    for (int i = 0; i < 4; ++i) {
-        int d = static_cast<int>(kBaseCombDelays[i] * rateScale + 0.5f);
-        if (d < 64)   d = 64;
-        if (d > 8192) d = 8192;
-        combDelays[i] = d;
-        float fb = powf(0.001f, static_cast<float>(d) / (decaySec * static_cast<float>(sampleRate)));
-        if (fb < 0.0f)  fb = 0.0f;
-        if (fb > 0.84f) fb = 0.84f;
-        combFb[i] = fb;
-        memset(s_combBuf[i], 0, static_cast<size_t>(d) * sizeof(float));
-    }
-
-    float reflDelaySec = g_i3dl2Listener.flReflectionsDelay;
-    if (!_finite(reflDelaySec) || reflDelaySec < 0.002f) reflDelaySec = 0.007f;
-    if (reflDelaySec > 0.25f) reflDelaySec = 0.25f;
-    int reflDelay = static_cast<int>(reflDelaySec * static_cast<float>(sampleRate) + 0.5f);
-    if (reflDelay < 16)   reflDelay = 16;
-    if (reflDelay > 6600) reflDelay = 6600;
-    memset(s_reflBuf, 0, static_cast<size_t>(reflDelay) * sizeof(float));
-    int reflIdx = 0;
-
-    size_t numFrames = pcm.size() / channels;
-    for (size_t f = 0; f < numFrames; ++f) {
-        float dryL = static_cast<float>(pcm[f * channels]);
-        float dryR = (channels == 2) ? static_cast<float>(pcm[f * channels + 1]) : dryL;
-        float mono = 0.5f * (dryL + dryR);
-
-        float early = s_reflBuf[reflIdx];
-        s_reflBuf[reflIdx] = mono;
-        if (++reflIdx >= reflDelay) reflIdx = 0;
-
-        float combSum = 0.0f;
-        for (int i = 0; i < 4; ++i) {
-            float cOut = s_combBuf[i][combIdx[i]];
-            combLp[i] = cOut * (1.0f - damp) + combLp[i] * damp;
-            s_combBuf[i][combIdx[i]] = mono + combLp[i] * combFb[i];
-            if (++combIdx[i] >= combDelays[i]) combIdx[i] = 0;
-            combSum += cOut;
-        }
-
-        float wet = early * reflLin + (0.25f * combSum) * revLin;
-        int32_t outL = static_cast<int32_t>(dryL + wet);
-        if (outL >  32767) outL =  32767;
-        if (outL < -32768) outL = -32768;
-        pcm[f * channels] = static_cast<int16_t>(outL);
-
-        if (channels == 2) {
-            int32_t outR = static_cast<int32_t>(dryR + wet);
-            if (outR >  32767) outR =  32767;
-            if (outR < -32768) outR = -32768;
-            pcm[f * channels + 1] = static_cast<int16_t>(outR);
-        }
-    }
-}
-
-static uint64_t ComputeWaveRegionCacheKey(
-    const uint8_t* regionPtr, uint32_t regionBytes, uint16_t nChannels, uint16_t wBitsPerSample,
-    uint8_t subLoopPhase, uint32_t i3dl2Hash, uint32_t filterHash, bool decimated2x)
-{
-    if (!regionPtr || regionBytes == 0) return 0;
-    uint64_t h = 14695981039346656037ULL;
-    auto mix = [&](uint64_t v) {
-        h ^= v;
-        h *= 1099511628211ULL;
-    };
-    mix(reinterpret_cast<uintptr_t>(regionPtr));
-    mix(regionBytes);
-    mix((static_cast<uint64_t>(nChannels) << 16) |
-        wBitsPerSample |
-        (static_cast<uint64_t>(subLoopPhase) << 24) |
-        (decimated2x ? (1ULL << 32) : 0ULL));
-    mix(i3dl2Hash);
-    mix(filterHash);
-    uint32_t sampleBytes = (regionBytes < 64u) ? regionBytes : 64u;
-    for (uint32_t i = 0; i < sampleBytes; ++i) {
-        h ^= regionPtr[i];
-        h *= 1099511628211ULL;
-    }
-    return h ? h : 1ULL;
-}
-
-static void ReturnHostBufferToPool(XboxDSBufferObject* b) {
-    if (!b || !b->hostBuf) return;
-    b->hostBuf->Stop();
-    if (!b->isStreamingLockBuf && b->hostCacheKey != 0 && b->hostBufBytes > 0) {
-        if (g_hostBufPool.size() >= 192) {
-            if (g_hostBufPool[0].hostBuf) {
-                g_hostBufPool[0].hostBuf->Release();
-            }
-            g_hostBufPool.erase(g_hostBufPool.begin());
-        }
-        PooledHostBuffer p = {};
-        p.hostBuf        = b->hostBuf;
-        p.hostBufBytes   = b->hostBufBytes;
-        p.cacheKey       = b->hostCacheKey;
-        p.nChannels      = b->wfx.nChannels ? b->wfx.nChannels : 1;
-        p.wBitsPerSample = (b->wfx.wBitsPerSample == 8 && !b->isAdpcm && !b->isDecimated2x && !b->hasActiveFilter) ? 8 : 16;
-        g_hostBufPool.push_back(p);
-    } else {
-        b->hostBuf->Release();
-    }
-    b->hostBuf      = nullptr;
-    b->hostBufBytes = 0;
-    b->hostCacheKey = 0;
-}
-
-static void ApplyBufferVolumeAndPan(XboxDSBufferObject* b) {
-    if (!b || !b->hostBuf) return;
-    LONG baseVol = b->volume - b->headroomMb;
-    LONG vol = baseVol + b->atten3D + b->lfoEgVolModMb;
-    LONG pan = b->pan;
-    if (b->outputBuffer) {
-        ApplyXboxOutputBufferRouting(b->outputBuffer, &vol, &pan, nullptr, nullptr);
-    }
-    if (vol < kMinDirectSoundVolumeMb) vol = kMinDirectSoundVolumeMb;
-    if (vol > kMaxDirectSoundVolumeMb) vol = kMaxDirectSoundVolumeMb;
-    b->hostBuf->SetVolume(vol);
-
-    if (pan < kMinDirectSoundPanMb) pan = kMinDirectSoundPanMb;
-    if (pan > kMaxDirectSoundPanMb) pan = kMaxDirectSoundPanMb;
-    b->hostBuf->SetPan(pan);
-
-    DWORD effectiveFreq = GetBufferEffectiveFreqHz(b);
-    DWORD hostFreq      = b->isDecimated2x ? ((effectiveFreq + 1u) / 2u) : effectiveFreq;
-    if (hostFreq < kMinDirectSoundFreqHz) hostFreq = kMinDirectSoundFreqHz;
-    if (hostFreq > kMaxDirectSoundFreqHz) hostFreq = kMaxDirectSoundFreqHz;
-    b->hostBuf->SetFrequency(hostFreq);
-}
-
-struct BufferSubLoopGeometry {
-    uint32_t playStartOff;
-    uint32_t playRegionBytes;
-    uint32_t alignedLoopStart;
-    uint32_t alignedLoopLength;
+struct BufferRegionFrameGeometry {
+    uint32_t regionStartByte;
+    uint32_t regionLengthBytes;
     uint32_t rawBlockAlign;
-    bool     hasSubLoop;
-    bool     hasAttack;
-    bool     hasRelease;
+    uint32_t totalFrames;
+    uint32_t loopStartFrame;
+    uint32_t loopEndFrame;
+    bool     hasCustomLoop;
 };
 
-static BufferSubLoopGeometry GetBufferSubLoopGeometry(const XboxDSBufferObject* b) {
-    BufferSubLoopGeometry g = {};
-    if (!b || !b->rawBuf || b->rawSize == 0) return g;
+static BufferRegionFrameGeometry ComputeBufferFrameGeometry(const XboxDSBufferObject* b) {
+    BufferRegionFrameGeometry g = {};
+    if (!b || !b->rawBuf || b->rawSize == 0u) return g;
 
-    uint16_t nCh = b->wfx.nChannels ? b->wfx.nChannels : 1u;
-    uint16_t bits = (!b->isAdpcm && b->wfx.wBitsPerSample == 8) ? 8u : 16u;
-    uint32_t pcmBlockAlign = (nCh * bits) / 8u;
-    if (pcmBlockAlign == 0) pcmBlockAlign = 1u;
-    g.rawBlockAlign = b->isAdpcm ? (36u * nCh) : pcmBlockAlign;
-    if (g.rawBlockAlign == 0) g.rawBlockAlign = 1u;
+    uint32_t nCh  = b->wfx.nChannels ? b->wfx.nChannels : 1u;
+    uint32_t bits = (!b->isAdpcm && b->wfx.wBitsPerSample == 8u) ? 8u : 16u;
+    g.rawBlockAlign = b->isAdpcm ? (36u * nCh) : ((nCh * bits) / 8u);
+    if (g.rawBlockAlign == 0u) g.rawBlockAlign = 1u;
 
-    g.playStartOff = (!b->isStreamingLockBuf && b->playStart < b->rawSize) ? b->playStart : 0u;
-    g.playRegionBytes = (!b->isStreamingLockBuf && b->playLength > 0 && g.playStartOff + b->playLength <= b->rawSize)
-                        ? b->playLength
-                        : (b->rawSize - g.playStartOff);
+    g.regionStartByte = (!b->isStreamingLockBuf && b->playStart < b->rawSize) ? b->playStart : 0u;
+    g.regionLengthBytes = (!b->isStreamingLockBuf && b->playLength > 0u && g.regionStartByte + b->playLength <= b->rawSize)
+                          ? b->playLength
+                          : (b->rawSize - g.regionStartByte);
 
-    if (!b->isStreamingLockBuf && b->loopLength >= g.rawBlockAlign) {
-        g.alignedLoopStart  = (b->loopStart / g.rawBlockAlign) * g.rawBlockAlign;
-        g.alignedLoopLength = (b->loopLength / g.rawBlockAlign) * g.rawBlockAlign;
-        if (g.alignedLoopLength >= g.rawBlockAlign &&
-            g.alignedLoopStart + g.alignedLoopLength <= g.playRegionBytes &&
-            (g.alignedLoopStart > 0 || g.alignedLoopLength < g.playRegionBytes))
-        {
-            g.hasSubLoop = true;
-            g.hasAttack  = (g.alignedLoopStart >= g.rawBlockAlign);
-            g.hasRelease = (g.alignedLoopStart + g.alignedLoopLength + g.rawBlockAlign <= g.playRegionBytes);
+    if (b->isAdpcm) {
+        g.totalFrames = (g.regionLengthBytes / g.rawBlockAlign) * 64u;
+    } else {
+        g.totalFrames = g.regionLengthBytes / g.rawBlockAlign;
+    }
+
+    g.loopStartFrame = 0u;
+    g.loopEndFrame   = g.totalFrames;
+
+    if (!b->isStreamingLockBuf && b->loopLength >= g.rawBlockAlign && g.totalFrames > 0u) {
+        uint32_t alignedStart  = (b->loopStart / g.rawBlockAlign) * g.rawBlockAlign;
+        uint32_t alignedLength = (b->loopLength / g.rawBlockAlign) * g.rawBlockAlign;
+        if (alignedLength >= g.rawBlockAlign && alignedStart + alignedLength <= g.regionLengthBytes) {
+            uint32_t lsFrame = b->isAdpcm
+                ? ((alignedStart / g.rawBlockAlign) * 64u)
+                : (alignedStart / g.rawBlockAlign);
+            uint32_t leFrame = b->isAdpcm
+                ? (((alignedStart + alignedLength) / g.rawBlockAlign) * 64u)
+                : ((alignedStart + alignedLength) / g.rawBlockAlign);
+            if (leFrame > g.totalFrames) leFrame = g.totalFrames;
+            if (leFrame > lsFrame) {
+                g.loopStartFrame = lsFrame;
+                g.loopEndFrame   = leFrame;
+                g.hasCustomLoop  = (lsFrame > 0u || leFrame < g.totalFrames);
+            }
         }
     }
     return g;
 }
 
-static void SyncBufferToHost(XboxDSBufferObject* b, uint8_t targetPhase = kSubLoopPhaseNone, bool preservePlaybackInPlace = false) {
-    EnsureHostDirectSound();
-    if (!g_hostDS || !b || !b->rawBuf || b->rawSize == 0) return;
-
-    WAVEFORMATEX pcmWfx = {};
-    pcmWfx.wFormatTag = WAVE_FORMAT_PCM;
-    pcmWfx.nChannels = b->wfx.nChannels ? b->wfx.nChannels : 1;
-    pcmWfx.nSamplesPerSec = b->wfx.nSamplesPerSec ? b->wfx.nSamplesPerSec : 22050;
-    pcmWfx.wBitsPerSample = 16;
-    pcmWfx.nBlockAlign = (pcmWfx.nChannels * pcmWfx.wBitsPerSample) / 8;
-    pcmWfx.nAvgBytesPerSec = pcmWfx.nSamplesPerSec * pcmWfx.nBlockAlign;
-
-    // Respect SetPlayRegion (b->playStart, b->playLength) used by CWaveBank::SetBufferData (0x007030DF)
-    // and Xbox MCPX 3-stage SetLoopRegion (Attack [0..loopStart) -> Sustain [loopStart..loopStart+loopLength)
-    // -> Release [loopStart+loopLength..playLength)) used by XACT::CSoundCue::PlayWave (0x00708830)
-    // and CMcpxBuffer::StopEx(DSBSTOPEX_RELEASEWAVEFORM) (0x006E8981).
-    BufferSubLoopGeometry g = GetBufferSubLoopGeometry(b);
-    uint32_t startOff    = g.playStartOff;
-    uint32_t regionBytes = g.playRegionBytes;
-    uint8_t  actualPhase = kSubLoopPhaseNone;
-
-    if (targetPhase == kSubLoopPhaseAttack && g.hasSubLoop && g.hasAttack) {
-        startOff    = g.playStartOff;
-        regionBytes = g.alignedLoopStart;
-        actualPhase = kSubLoopPhaseAttack;
-    } else if (targetPhase == kSubLoopPhaseSustain && g.hasSubLoop) {
-        startOff    = g.playStartOff + g.alignedLoopStart;
-        regionBytes = g.alignedLoopLength;
-        actualPhase = kSubLoopPhaseSustain;
-    } else if (targetPhase == kSubLoopPhaseRelease && g.hasSubLoop && g.hasRelease) {
-        startOff    = g.playStartOff + g.alignedLoopStart + g.alignedLoopLength;
-        regionBytes = g.playRegionBytes - (g.alignedLoopStart + g.alignedLoopLength);
-        actualPhase = kSubLoopPhaseRelease;
+static inline void ReadBufferFrameStereoFloat(
+    XboxDSBufferObject* b, const BufferRegionFrameGeometry& g, uint32_t frameIdx,
+    float* outL, float* outR)
+{
+    if (!b || !b->rawBuf || g.totalFrames == 0u) {
+        *outL = 0.0f;
+        *outR = 0.0f;
+        return;
     }
-
-    DWORD effectiveFreq   = GetBufferEffectiveFreqHz(b);
-    bool  needDecimate2x  = (!b->isStreamingLockBuf && effectiveFreq > kMaxDirectSoundFreqHz);
-    float filterF = 1.0f, filterD = 1.0f, filterF2 = 1.0f, filterD2 = 1.0f;
-    uint32_t filterMode = 0u;
-    bool  needFilter      = (!b->isStreamingLockBuf && b->hasActiveFilter &&
-                             ComputeDls2FilterCoeffs(&b->filterDesc, pcmWfx.nSamplesPerSec, &filterF, &filterD, &filterMode, &filterF2, &filterD2));
-    if (!b->isStreamingLockBuf && b->voice3D.active3D && b->voice3D.hrtfFilterCoeff > 0.0f && b->voice3D.hrtfFilterCoeff < 0.92f) {
-        if (!needFilter) {
-            needFilter = true;
-            filterMode = 1u;
-            filterF    = b->voice3D.hrtfFilterCoeff;
-            filterD    = 1.0f;
-        } else {
-            filterF   *= b->voice3D.hrtfFilterCoeff;
-            if (filterF < 0.004f) filterF = 0.004f;
-        }
+    if (frameIdx >= g.totalFrames) {
+        frameIdx = g.totalFrames - 1u;
     }
-    if (needFilter && b->lfoEgCutoffRatio > 0.01f && fabsf(b->lfoEgCutoffRatio - 1.0f) > 0.01f) {
-        filterF *= b->lfoEgCutoffRatio;
-        if (filterF < 0.004f) filterF = 0.004f;
-        if (filterF > 1.40f)  filterF = 1.40f;
-    }
+    const uint8_t* regionBase = b->rawBuf + g.regionStartByte;
+    uint32_t nCh = b->wfx.nChannels ? b->wfx.nChannels : 1u;
 
-    bool hasI3dl2Send = b->hasI3DL2Send;
-    int32_t i3dl2SendMb = b->i3dl2SendMb;
-    if (b->outputBuffer && b->outputBuffer->hasI3DL2Send) {
-        hasI3dl2Send = true;
-        if (b->outputBuffer->i3dl2SendMb > i3dl2SendMb) i3dl2SendMb = b->outputBuffer->i3dl2SendMb;
-    }
-    bool  needReverb      = (!b->isStreamingLockBuf && hasI3dl2Send && g_i3dl2Listener.lRoom > -9000);
-    bool  needPcm16Dsp    = (needDecimate2x || needFilter || needReverb);
-
-    const uint8_t* regionPtr = b->rawBuf + startOff;
-    uint16_t targetBits = (!b->isAdpcm && b->wfx.wBitsPerSample == 8 && !needPcm16Dsp) ? 8 : 16;
-    uint32_t i3dl2Hash  = needReverb ? GetQuantizedI3DL2StateHash(b) : 0u;
-    uint32_t filterHash = needFilter ? GetQuantizedFilterStateHash(b) : 0u;
-    uint64_t cacheKey   = (!b->isStreamingLockBuf)
-        ? ComputeWaveRegionCacheKey(regionPtr, regionBytes, pcmWfx.nChannels, targetBits, actualPhase, i3dl2Hash, filterHash, needDecimate2x)
-        : 0ULL;
-
-    if (!b->isStreamingLockBuf && cacheKey != 0 && !preservePlaybackInPlace) {
-        if (b->hostBuf && b->hostCacheKey == cacheKey) {
-            b->isDecimated2x = needDecimate2x;
-            b->dirty         = false;
-            b->subLoopPhase  = actualPhase;
-            ApplyBufferVolumeAndPan(b);
-            return;
-        }
-        for (size_t i = 0; i < g_hostBufPool.size(); ++i) {
-            if (g_hostBufPool[i].cacheKey == cacheKey && g_hostBufPool[i].hostBuf != nullptr) {
-                PooledHostBuffer hit = g_hostBufPool[i];
-                g_hostBufPool.erase(g_hostBufPool.begin() + i);
-                if (b->hostBuf) {
-                    ReturnHostBufferToPool(b);
-                }
-                b->hostBuf       = hit.hostBuf;
-                b->hostBufBytes  = hit.hostBufBytes;
-                b->hostCacheKey  = hit.cacheKey;
-                b->isDecimated2x = needDecimate2x;
-                b->dirty         = false;
-                b->subLoopPhase  = actualPhase;
-                ApplyBufferVolumeAndPan(b);
+    if (b->isAdpcm) {
+        uint32_t blockIdx   = frameIdx >> 6u;
+        uint32_t inBlockIdx = frameIdx & 63u;
+        if (b->cachedAdpcmBlockIdx != blockIdx) {
+            uint32_t byteOff = blockIdx * g.rawBlockAlign;
+            if (byteOff + g.rawBlockAlign <= g.regionLengthBytes) {
+                DecodeXboxAdpcmBlockToStereoFloat(regionBase + byteOff, nCh, b->cachedAdpcmL, b->cachedAdpcmR);
+                b->cachedAdpcmBlockIdx = blockIdx;
+            } else {
+                *outL = 0.0f;
+                *outR = 0.0f;
                 return;
             }
         }
-    }
-
-    std::vector<int16_t> decodedPcm;
-    std::vector<int16_t> decimatedPcm;
-    const void* srcPcm   = regionPtr;
-    uint32_t srcPcmBytes = regionBytes;
-
-    if (b->isAdpcm) {
-        DecodeXboxAdpcmToPcm16(regionPtr, regionBytes, pcmWfx.nChannels, decodedPcm);
-    } else if (b->wfx.wBitsPerSample == 8) {
-        if (needPcm16Dsp) {
-            decodedPcm.resize(regionBytes);
-            for (uint32_t i = 0; i < regionBytes; ++i) {
-                decodedPcm[i] = static_cast<int16_t>((static_cast<int32_t>(regionPtr[i]) - 128) << 8);
-            }
-        } else {
-            pcmWfx.wBitsPerSample  = 8;
-            pcmWfx.nBlockAlign     = pcmWfx.nChannels;
-            pcmWfx.nAvgBytesPerSec = pcmWfx.nSamplesPerSec * pcmWfx.nBlockAlign;
-        }
-    } else if (needPcm16Dsp && regionBytes >= sizeof(int16_t)) {
-        size_t numSamples = regionBytes / sizeof(int16_t);
-        decodedPcm.resize(numSamples);
-        memcpy(decodedPcm.data(), regionPtr, numSamples * sizeof(int16_t));
-    }
-
-    if (!decodedPcm.empty()) {
-        if (needFilter) {
-            float svfLow[2]  = { 0.0f, 0.0f };
-            float svfBand[2] = { 0.0f, 0.0f };
-            XboxVoiceFilterState state2 = {};
-            ApplyDls2FilterToPcm16(
-                decodedPcm.data(), decodedPcm.size() / pcmWfx.nChannels, pcmWfx.nChannels,
-                filterF, filterD, svfLow, svfBand,
-                filterMode, filterF2, filterD2, &state2);
-        }
-        if (needReverb) {
-            ApplyI3DL2ReverbToPcm16(decodedPcm, pcmWfx.nChannels, pcmWfx.nSamplesPerSec, i3dl2SendMb);
-        }
-        if (needDecimate2x) {
-            DecimatePcm16By2(
-                decodedPcm.data(), decodedPcm.size() / pcmWfx.nChannels, pcmWfx.nChannels, decimatedPcm);
-            srcPcm      = decimatedPcm.data();
-            srcPcmBytes = static_cast<uint32_t>(decimatedPcm.size() * sizeof(int16_t));
-        } else {
-            srcPcm      = decodedPcm.data();
-            srcPcmBytes = static_cast<uint32_t>(decodedPcm.size() * sizeof(int16_t));
-        }
-    }
-
-    if (srcPcmBytes < 64) return;
-
-    DWORD savedPlayPos = 0;
-    bool  wasPlayingBeforeRebake = false;
-    if (preservePlaybackInPlace && b->hostBuf) {
-        DWORD st = 0;
-        b->hostBuf->GetStatus(&st);
-        if ((st & DSBSTATUS_PLAYING) != 0) {
-            wasPlayingBeforeRebake = true;
-            b->hostBuf->GetCurrentPosition(&savedPlayPos, nullptr);
-        }
-    }
-
-    bool recreatedBuf = false;
-    if (!b->hostBuf || b->hostBufBytes != srcPcmBytes) {
-        if (b->hostBuf) {
-            ReturnHostBufferToPool(b);
-        }
-        DSBUFFERDESC dsbd = {};
-        dsbd.dwSize = sizeof(dsbd);
-        dsbd.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2;
-        dsbd.dwBufferBytes = srcPcmBytes;
-        dsbd.lpwfxFormat = &pcmWfx;
-        if (FAILED(g_hostDS->CreateSoundBuffer(&dsbd, &b->hostBuf, nullptr))) {
-            return;
-        }
-        b->hostBufBytes = srcPcmBytes;
-        recreatedBuf    = true;
-    }
-
-    void* ptr1 = nullptr;
-    DWORD bytes1 = 0;
-    if (SUCCEEDED(b->hostBuf->Lock(0, srcPcmBytes, &ptr1, &bytes1, nullptr, nullptr, 0))) {
-        memcpy(ptr1, srcPcm, bytes1);
-        b->hostBuf->Unlock(ptr1, bytes1, nullptr, 0);
-    }
-    b->hostCacheKey  = cacheKey;
-    b->isDecimated2x = needDecimate2x;
-    b->dirty         = false;
-    b->subLoopPhase  = actualPhase;
-    ApplyBufferVolumeAndPan(b);
-
-    if (wasPlayingBeforeRebake && recreatedBuf && b->hostBuf) {
-        if (savedPlayPos >= srcPcmBytes) savedPlayPos = 0;
-        bool loopNow = b->isLooping && (actualPhase == kSubLoopPhaseNone || actualPhase == kSubLoopPhaseSustain);
-        b->hostBuf->SetCurrentPosition(savedPlayPos);
-        b->hostBuf->Play(0, 0, loopNow ? DSBPLAY_LOOPING : 0);
-    }
-}
-
-static void RebakeBufferOnParameterChange(XboxDSBufferObject* b) {
-    if (!b) return;
-    if (b->status == 0 || !b->hostBuf) {
-        b->dirty = true;
-    } else if (!b->isStreamingLockBuf) {
-        DWORD st = 0;
-        b->hostBuf->GetStatus(&st);
-        if ((st & DSBSTATUS_PLAYING) != 0) {
-            SyncBufferToHost(b, b->subLoopPhase, true);
-        } else {
-            b->dirty = true;
-        }
-    }
-}
-
-static void RefreshBufferPitchAndFrequency(XboxDSBufferObject* b) {
-    if (!b) return;
-    DWORD effectiveFreq  = GetBufferEffectiveFreqHz(b);
-    bool  needDecimate2x = (!b->isStreamingLockBuf && effectiveFreq > kMaxDirectSoundFreqHz);
-    if (b->hostBuf && !b->isStreamingLockBuf && needDecimate2x != b->isDecimated2x) {
-        bool wasPlaying = (b->status == 1);
-        if (wasPlaying) {
-            DWORD st = 0;
-            b->hostBuf->GetStatus(&st);
-            wasPlaying = ((st & DSBSTATUS_PLAYING) != 0);
-        }
-        SyncBufferToHost(b, b->subLoopPhase, wasPlaying);
+        *outL = b->cachedAdpcmL[inBlockIdx];
+        *outR = b->cachedAdpcmR[inBlockIdx];
     } else {
-        ApplyBufferVolumeAndPan(b);
+        uint16_t bits = (b->wfx.wBitsPerSample == 8u) ? 8u : 16u;
+        SamplePcmFrameToStereoFloat(regionBase, frameIdx, nCh, bits, outL, outR);
     }
 }
 
-static void UpdateBufferLfoAndEg(XboxDSBufferObject* b) {
-    if (!b) return;
-    if (!b->lfoActive[0] && !b->lfoActive[1] && !b->egActive[0] && !b->egActive[1]) {
-        b->lfoEgVolModMb    = 0;
-        b->lfoEgPitchRatio  = 1.0f;
-        b->lfoEgCutoffRatio = 1.0f;
-        return;
+static inline void ComputeVoiceStereoAndWetGains(
+    LONG volumeMb, LONG headroomMb, int32_t lfoEgVolModMb,
+    bool active3D, LONG atten3DMb, const Xbox3DVoiceMetrics& voice3D,
+    LONG mixBinAttenMb, LONG panMb,
+    bool hasI3DL2Send, int32_t i3dl2SendMb,
+    float* outDryGainL, float* outDryGainR,
+    float* outWetGainL, float* outWetGainR)
+{
+    LONG baseMb      = volumeMb - headroomMb + lfoEgVolModMb;
+    LONG drySpatial  = active3D ? atten3DMb : mixBinAttenMb;
+    LONG totalDryMb  = baseMb + drySpatial;
+    if (totalDryMb < kMinDirectSoundVolumeMb) totalDryMb = kMinDirectSoundVolumeMb;
+    if (totalDryMb > kMaxDirectSoundVolumeMb) totalDryMb = kMaxDirectSoundVolumeMb;
+
+    float dryGain = (totalDryMb <= kMinDirectSoundVolumeMb)
+        ? 0.0f
+        : ((totalDryMb < 0) ? powf(10.0f, static_cast<float>(totalDryMb) / kMillibelsPerTwentyDb) : 1.0f);
+
+    if (panMb < kMinDirectSoundPanMb) panMb = kMinDirectSoundPanMb;
+    if (panMb > kMaxDirectSoundPanMb) panMb = kMaxDirectSoundPanMb;
+    float panScaleL = (panMb > 0) ? powf(10.0f, -static_cast<float>(panMb) / kMillibelsPerTwentyDb) : 1.0f;
+    float panScaleR = (panMb < 0) ? powf(10.0f,  static_cast<float>(panMb) / kMillibelsPerTwentyDb) : 1.0f;
+
+    *outDryGainL = dryGain * panScaleL;
+    *outDryGainR = dryGain * panScaleR;
+
+    if (hasI3DL2Send && i3dl2SendMb > -9500) {
+        // On Xbox MCPX + I3DL2, direct obstruction attenuates the dry path while the wet room path
+        // uses distance + cone + room occlusion + MixBin 10 send level (so occluded/obstructed sounds keep room tail).
+        int32_t wetSpatialMb = active3D
+            ? (voice3D.distanceVol + voice3D.coneVol + voice3D.i3dl2RoomVol + i3dl2SendMb)
+            : (mixBinAttenMb + i3dl2SendMb);
+        int32_t totalWetMb = baseMb + wetSpatialMb;
+        if (totalWetMb < kMinDirectSoundVolumeMb) totalWetMb = kMinDirectSoundVolumeMb;
+        if (totalWetMb > kMaxDirectSoundVolumeMb) totalWetMb = kMaxDirectSoundVolumeMb;
+        float wetGain = (totalWetMb <= -9500)
+            ? 0.0f
+            : powf(10.0f, static_cast<float>(totalWetMb) / kMillibelsPerTwentyDb);
+        *outWetGainL = wetGain * (0.72f * panScaleL + 0.28f * panScaleR);
+        *outWetGainR = wetGain * (0.72f * panScaleR + 0.28f * panScaleL);
+    } else {
+        *outWetGainL = 0.0f;
+        *outWetGainR = 0.0f;
     }
-    DWORD now = GetTickCount();
-    uint32_t elapsedMs = (b->playStartTickMs != 0 && now >= b->playStartTickMs) ? (now - b->playStartTickMs) : 0u;
-    uint32_t relElapsedMs = (b->isReleasing && b->releaseStartTickMs != 0 && now >= b->releaseStartTickMs)
-                            ? (now - b->releaseStartTickMs) : 0u;
-    EvaluateXboxVoiceLfoAndEg(
-        b->lfo, b->lfoActive, b->eg, b->egActive,
-        elapsedMs, b->isReleasing, relElapsedMs,
-        &b->lfoEgVolModMb, &b->lfoEgPitchRatio, &b->lfoEgCutoffRatio);
 }
 
-static void AdvanceBufferSubLoopIfNeeded(XboxDSBufferObject* b) {
-    if (!b || b->status == 0 || !b->hostBuf) return;
-    if (b->lfoActive[0] || b->lfoActive[1] || b->egActive[0] || b->egActive[1]) {
-        UpdateBufferLfoAndEg(b);
-        ApplyBufferVolumeAndPan(b);
+bool AccumulateToXboxSubmixBufferLocked(
+    XboxDSBufferObject* targetBuf, uint32_t fxSendBinMask,
+    const float* inL, const float* inR, uint32_t frameOffset, uint32_t numFrames)
+{
+    if (!inL || !inR || numFrames == 0u || frameOffset + numFrames > kAudioMaxQuantumFrames) return false;
+    bool routed = false;
+
+    if (targetBuf &&
+        targetBuf->submixL.size() >= frameOffset + numFrames &&
+        targetBuf->submixR.size() >= frameOffset + numFrames)
+    {
+        float* dstL = targetBuf->submixL.data() + frameOffset;
+        float* dstR = targetBuf->submixR.data() + frameOffset;
+        for (uint32_t i = 0u; i < numFrames; ++i) {
+            dstL[i] += inL[i];
+            dstR[i] += inR[i];
+        }
+        targetBuf->submixHasAudio = true;
+        routed = true;
     }
-    if (b->subLoopPhase == kSubLoopPhaseAttack) {
-        DWORD st = 0;
-        b->hostBuf->GetStatus(&st);
-        if ((st & DSBSTATUS_PLAYING) == 0) {
-            SyncBufferToHost(b, kSubLoopPhaseSustain);
-            if (b->hostBuf) {
-                b->hostBuf->SetCurrentPosition(0);
-                b->hostBuf->Play(0, 0, DSBPLAY_LOOPING);
+
+    if (fxSendBinMask != 0u) {
+        for (size_t bi = 0u; bi < g_activeBuffers.size(); ++bi) {
+            XboxDSBufferObject* sb = g_activeBuffers[bi];
+            if (!sb || sb == targetBuf || sb->inputMixBin < 11u || sb->inputMixBin > 31u) continue;
+            uint32_t bit = 1u << (sb->inputMixBin - 11u);
+            if ((fxSendBinMask & bit) != 0u &&
+                sb->submixL.size() >= frameOffset + numFrames &&
+                sb->submixR.size() >= frameOffset + numFrames)
+            {
+                float* dstL = sb->submixL.data() + frameOffset;
+                float* dstR = sb->submixR.data() + frameOffset;
+                for (uint32_t i = 0u; i < numFrames; ++i) {
+                    dstL[i] += inL[i];
+                    dstR[i] += inR[i];
+                }
+                sb->submixHasAudio = true;
             }
         }
-    } else if (b->subLoopPhase == kSubLoopPhaseRelease) {
-        DWORD st = 0;
-        b->hostBuf->GetStatus(&st);
-        if ((st & DSBSTATUS_PLAYING) == 0) {
-            b->status = 0;
-            b->isReleasing = false;
-            b->subLoopPhase = kSubLoopPhaseNone;
-        }
-    } else if (b->isReleasing && b->egActive[0] && b->eg[0].dwRelease > 0u) {
-        if (b->lfoEgVolModMb <= -9500) {
-            b->hostBuf->Stop();
-            b->status = 0;
-            b->isLooping = false;
-            b->isReleasing = false;
-            b->subLoopPhase = kSubLoopPhaseNone;
+    }
+    return routed;
+}
+
+void PrepareXboxSubmixBuffers48kLocked(uint32_t numFrames) {
+    if (numFrames > kAudioMaxQuantumFrames) numFrames = kAudioMaxQuantumFrames;
+    for (size_t i = 0u; i < g_activeBuffers.size(); ++i) {
+        XboxDSBufferObject* b = g_activeBuffers[i];
+        if (b && !b->submixL.empty()) {
+            uint32_t clearCount = (numFrames <= b->submixL.size()) ? numFrames : static_cast<uint32_t>(b->submixL.size());
+            memset(b->submixL.data(), 0, static_cast<size_t>(clearCount) * sizeof(float));
+            memset(b->submixR.data(), 0, static_cast<size_t>(clearCount) * sizeof(float));
+            b->submixHasAudio = false;
         }
     }
 }
 
-void AdvanceActiveAudioBuffersSubLoop() {
-    for (size_t bi = 0; bi < g_activeBuffers.size(); ++bi) {
-        AdvanceBufferSubLoopIfNeeded(g_activeBuffers[bi]);
+void MixActiveXboxBuffers48kLocked(
+    float* ioMasterDryL, float* ioMasterDryR,
+    float* ioReverbSendL, float* ioReverbSendR, uint32_t numFrames)
+{
+    if (!ioMasterDryL || !ioMasterDryR || !ioReverbSendL || !ioReverbSendR || numFrames == 0u) return;
+    if (numFrames > kAudioMaxQuantumFrames) numFrames = kAudioMaxQuantumFrames;
+
+    float voiceScratchL[kAudioMixSubQuantumFrames];
+    float voiceScratchR[kAudioMixSubQuantumFrames];
+    float postDryL[kAudioMixSubQuantumFrames];
+    float postDryR[kAudioMixSubQuantumFrames];
+
+    for (size_t bi = 0u; bi < g_activeBuffers.size(); ++bi) {
+        XboxDSBufferObject* b = g_activeBuffers[bi];
+        if (!b || b->status == 0u || !b->rawBuf || b->rawSize == 0u) continue;
+
+        BufferRegionFrameGeometry geom = ComputeBufferFrameGeometry(b);
+        if (geom.totalFrames == 0u) {
+            b->status = 0u;
+            continue;
+        }
+
+        uint32_t offset = 0u;
+        while (offset < numFrames && b->status != 0u) {
+            uint32_t chunk = numFrames - offset;
+            if (chunk > kAudioMixSubQuantumFrames) chunk = kAudioMixSubQuantumFrames;
+
+            int32_t lfoEgVolModMb    = 0;
+            float   lfoEgPitchRatio  = 1.0f;
+            float   lfoEgCutoffRatio = 1.0f;
+            bool    ampRelDone       = false;
+            if (b->lfoActive[0] || b->lfoActive[1] || b->egActive[0] || b->egActive[1]) {
+                EvaluateXboxVoiceLfoAndEgSamples(
+                    b->lfo, b->lfoActive, b->eg, b->egActive,
+                    b->activeSamples48k, b->isReleasing, b->releaseSamples48k,
+                    &lfoEgVolModMb, &lfoEgPitchRatio, &lfoEgCutoffRatio, &ampRelDone);
+                if (b->isReleasing && ampRelDone && (b->releaseOnlyEnvelope || !b->isLooping)) {
+                    b->status              = 0u;
+                    b->isLooping           = false;
+                    b->isReleasing         = false;
+                    b->releaseOnlyEnvelope = false;
+                    break;
+                }
+            }
+
+            bool active3D = b->use3DVoiceData && b->voice3D.active3D;
+            DWORD effFreq = b->freq ? b->freq : kDefaultSampleRateHz;
+            if (active3D && b->voice3D.dopplerPitch != 0) {
+                effFreq = XboxPitchToFrequencyHz(b->lPitch + b->voice3D.dopplerPitch);
+            }
+            if (lfoEgPitchRatio > 0.01f && fabsf(lfoEgPitchRatio - 1.0f) > 0.0005f) {
+                double modHz = static_cast<double>(effFreq) * static_cast<double>(lfoEgPitchRatio);
+                if (modHz < static_cast<double>(kMinDirectSoundFreqHz)) modHz = static_cast<double>(kMinDirectSoundFreqHz);
+                if (modHz > static_cast<double>(kMaxXboxPitchFreqHz))   modHz = static_cast<double>(kMaxXboxPitchFreqHz);
+                effFreq = static_cast<DWORD>(modHz + 0.5);
+            }
+            if (effFreq < kMinDirectSoundFreqHz) effFreq = kMinDirectSoundFreqHz;
+            if (effFreq > kMaxXboxPitchFreqHz)   effFreq = kMaxXboxPitchFreqHz;
+
+            double step = static_cast<double>(effFreq) / static_cast<double>(kDefaultSampleRateHz);
+            double pos  = b->playFramePos;
+            uint32_t rendered = 0u;
+
+            for (; rendered < chunk; ++rendered) {
+                if (b->isLooping) {
+                    uint32_t loopStart = geom.loopStartFrame;
+                    uint32_t loopEnd   = geom.loopEndFrame;
+                    if (loopEnd > loopStart && pos >= static_cast<double>(loopEnd)) {
+                        double loopLen = static_cast<double>(loopEnd - loopStart);
+                        pos = static_cast<double>(loopStart) + fmod(pos - static_cast<double>(loopStart), loopLen);
+                    }
+                } else if (pos >= static_cast<double>(geom.totalFrames)) {
+                    b->status              = 0u;
+                    b->isReleasing         = false;
+                    b->releaseOnlyEnvelope = false;
+                    break;
+                }
+
+                uint32_t idx0 = static_cast<uint32_t>(pos);
+                float    frac = static_cast<float>(pos - static_cast<double>(idx0));
+                if (idx0 >= geom.totalFrames) idx0 = geom.totalFrames - 1u;
+
+                uint32_t idx1 = idx0 + 1u;
+                if (b->isLooping && geom.loopEndFrame > geom.loopStartFrame && idx1 >= geom.loopEndFrame) {
+                    idx1 = geom.loopStartFrame;
+                } else if (idx1 >= geom.totalFrames) {
+                    idx1 = b->isStreamingLockBuf ? 0u : idx0;
+                }
+
+                float l0 = 0.0f, r0 = 0.0f, l1 = 0.0f, r1 = 0.0f;
+                ReadBufferFrameStereoFloat(b, geom, idx0, &l0, &r0);
+                if (idx1 == idx0 || frac <= 1e-6f) {
+                    voiceScratchL[rendered] = l0;
+                    voiceScratchR[rendered] = r0;
+                } else {
+                    ReadBufferFrameStereoFloat(b, geom, idx1, &l1, &r1);
+                    voiceScratchL[rendered] = l0 + (l1 - l0) * frac;
+                    voiceScratchR[rendered] = r0 + (r1 - r0) * frac;
+                }
+
+                pos += step;
+            }
+
+            if (b->status != 0u && b->isLooping && geom.loopEndFrame > geom.loopStartFrame &&
+                pos >= static_cast<double>(geom.loopEndFrame))
+            {
+                double loopLen = static_cast<double>(geom.loopEndFrame - geom.loopStartFrame);
+                pos = static_cast<double>(geom.loopStartFrame) + fmod(pos - static_cast<double>(geom.loopStartFrame), loopLen);
+            } else if (b->status != 0u && !b->isLooping && pos >= static_cast<double>(geom.totalFrames)) {
+                b->status              = 0u;
+                b->isReleasing         = false;
+                b->releaseOnlyEnvelope = false;
+            }
+            b->playFramePos = pos;
+
+            if (rendered > 0u) {
+                b->activeSamples48k += rendered;
+                if (b->isReleasing) {
+                    b->releaseSamples48k += rendered;
+                }
+
+                ApplyVoiceSvfAndHrtfFloatStereo(
+                    voiceScratchL, voiceScratchR, rendered,
+                    &b->filterDesc, b->hasActiveFilter, lfoEgCutoffRatio,
+                    active3D, b->voice3D.hrtfFilterCoeff, b->voice3D.itdDelaySamples,
+                    &b->filterState);
+
+                float dryGainL = 0.0f, dryGainR = 0.0f, wetGainL = 0.0f, wetGainR = 0.0f;
+                LONG  effPanMb = active3D ? b->voice3D.pan : b->pan;
+                ComputeVoiceStereoAndWetGains(
+                    b->volume, b->headroomMb, lfoEgVolModMb,
+                    active3D, b->atten3D, b->voice3D,
+                    b->mixBinAttenMb, effPanMb,
+                    b->hasI3DL2Send, b->i3dl2SendMb,
+                    &dryGainL, &dryGainR, &wetGainL, &wetGainR);
+
+                for (uint32_t i = 0u; i < rendered; ++i) {
+                    postDryL[i] = voiceScratchL[i] * dryGainL;
+                    postDryR[i] = voiceScratchR[i] * dryGainR;
+                    if (wetGainL > 0.0f || wetGainR > 0.0f) {
+                        ioReverbSendL[offset + i] += voiceScratchL[i] * wetGainL;
+                        ioReverbSendR[offset + i] += voiceScratchR[i] * wetGainR;
+                    }
+                }
+
+                bool routedToOutputBuf = false;
+                if (b->outputBuffer || b->fxSendBinMask != 0u) {
+                    XboxDSBufferObject* outTarget = (b->outputBuffer != b) ? b->outputBuffer : nullptr;
+                    routedToOutputBuf = AccumulateToXboxSubmixBufferLocked(
+                        outTarget, b->fxSendBinMask, postDryL, postDryR, offset, rendered);
+                    if (b->fxSendBinMask != 0u && !b->hasI3DL2Send && !HasActiveFxSendTargetLocked(b->fxSendBinMask, b)) {
+                        for (uint32_t i = 0u; i < rendered; ++i) {
+                            ioReverbSendL[offset + i] += postDryL[i] * 0.35f;
+                            ioReverbSendR[offset + i] += postDryR[i] * 0.35f;
+                        }
+                    }
+                }
+                if (!routedToOutputBuf) {
+                    for (uint32_t i = 0u; i < rendered; ++i) {
+                        ioMasterDryL[offset + i] += postDryL[i];
+                        ioMasterDryR[offset + i] += postDryR[i];
+                    }
+                }
+            }
+
+            offset += chunk;
+        }
+    }
+}
+
+void FinalizeXboxSubmixBuffers48kLocked(
+    float* ioMasterDryL, float* ioMasterDryR,
+    float* ioReverbSendL, float* ioReverbSendR, uint32_t numFrames)
+{
+    if (!ioMasterDryL || !ioMasterDryR || !ioReverbSendL || !ioReverbSendR || numFrames == 0u) return;
+    if (numFrames > kAudioMaxQuantumFrames) numFrames = kAudioMaxQuantumFrames;
+
+    // Support up to 4 chained submix hops (Voice -> Submix A -> Submix B / FXIN -> Master) without cycles
+    for (uint32_t pass = 0u; pass < 4u; ++pass) {
+        bool anyProcessed = false;
+        for (size_t bi = 0u; bi < g_activeBuffers.size(); ++bi) {
+            XboxDSBufferObject* sb = g_activeBuffers[bi];
+            if (!sb || !sb->submixHasAudio || sb->submixL.size() < numFrames) continue;
+
+            // Defer this submix to the next hop if another un-flushed submix still feeds into it
+            // via either outputBuffer or fxSendBinMask -> inputMixBin
+            bool hasPendingChildSubmix = false;
+            if (pass < 3u) {
+                uint32_t sbFxBit = (sb->inputMixBin >= 11u && sb->inputMixBin <= 31u)
+                    ? (1u << (sb->inputMixBin - 11u))
+                    : 0u;
+                for (size_t ci = 0u; ci < g_activeBuffers.size(); ++ci) {
+                    XboxDSBufferObject* child = g_activeBuffers[ci];
+                    if (!child || child == sb || !child->submixHasAudio) continue;
+                    if (child->outputBuffer == sb || (sbFxBit != 0u && (child->fxSendBinMask & sbFxBit) != 0u)) {
+                        hasPendingChildSubmix = true;
+                        break;
+                    }
+                }
+            }
+            if (hasPendingChildSubmix) continue;
+
+            sb->submixHasAudio = false;
+            anyProcessed       = true;
+
+            int32_t lfoEgVolModMb    = 0;
+            float   lfoEgPitchRatio  = 1.0f;
+            float   lfoEgCutoffRatio = 1.0f;
+            if (sb->lfoActive[0] || sb->lfoActive[1] || sb->egActive[0] || sb->egActive[1]) {
+                EvaluateXboxVoiceLfoAndEgSamples(
+                    sb->lfo, sb->lfoActive, sb->eg, sb->egActive,
+                    sb->activeSamples48k, sb->isReleasing, sb->releaseSamples48k,
+                    &lfoEgVolModMb, &lfoEgPitchRatio, &lfoEgCutoffRatio, nullptr);
+                sb->activeSamples48k += numFrames;
+                if (sb->isReleasing) sb->releaseSamples48k += numFrames;
+            }
+
+            bool   active3D = sb->use3DVoiceData && sb->voice3D.active3D;
+            float* busL     = sb->submixL.data();
+            float* busR     = sb->submixR.data();
+
+            ApplyVoiceSvfAndHrtfFloatStereo(
+                busL, busR, numFrames,
+                &sb->filterDesc, sb->hasActiveFilter, lfoEgCutoffRatio,
+                active3D, sb->voice3D.hrtfFilterCoeff, sb->voice3D.itdDelaySamples,
+                &sb->filterState);
+
+            float dryGainL = 0.0f, dryGainR = 0.0f, wetGainL = 0.0f, wetGainR = 0.0f;
+            LONG  effPanMb = active3D ? sb->voice3D.pan : sb->pan;
+            ComputeVoiceStereoAndWetGains(
+                sb->volume, sb->headroomMb, lfoEgVolModMb,
+                active3D, sb->atten3D, sb->voice3D,
+                sb->mixBinAttenMb, effPanMb,
+                sb->hasI3DL2Send, sb->i3dl2SendMb,
+                &dryGainL, &dryGainR, &wetGainL, &wetGainR);
+
+            XboxDSBufferObject* parent = (sb->outputBuffer && sb->outputBuffer != sb && sb->outputBuffer->submixL.size() >= numFrames)
+                ? sb->outputBuffer
+                : nullptr;
+
+            bool fxClaimed = false;
+            if (sb->fxSendBinMask != 0u) {
+                for (size_t fi = 0u; fi < g_activeBuffers.size(); ++fi) {
+                    XboxDSBufferObject* fxDst = g_activeBuffers[fi];
+                    if (!fxDst || fxDst == sb || fxDst == parent || fxDst->inputMixBin < 11u || fxDst->inputMixBin > 31u) continue;
+                    if ((sb->fxSendBinMask & (1u << (fxDst->inputMixBin - 11u))) != 0u &&
+                        fxDst->submixL.size() >= numFrames && fxDst->submixR.size() >= numFrames)
+                    {
+                        float* fxL = fxDst->submixL.data();
+                        float* fxR = fxDst->submixR.data();
+                        for (uint32_t i = 0u; i < numFrames; ++i) {
+                            fxL[i] += busL[i] * dryGainL;
+                            fxR[i] += busR[i] * dryGainR;
+                        }
+                        fxDst->submixHasAudio = true;
+                        fxClaimed = true;
+                    }
+                }
+            }
+            const bool sendUnclaimedFxToReverb = (sb->fxSendBinMask != 0u && !fxClaimed && !sb->hasI3DL2Send);
+
+            if (parent) {
+                float* pL = parent->submixL.data();
+                float* pR = parent->submixR.data();
+                for (uint32_t i = 0u; i < numFrames; ++i) {
+                    float dL = busL[i] * dryGainL;
+                    float dR = busR[i] * dryGainR;
+                    pL[i] += dL;
+                    pR[i] += dR;
+                    if (wetGainL > 0.0f || wetGainR > 0.0f) {
+                        ioReverbSendL[i] += busL[i] * wetGainL;
+                        ioReverbSendR[i] += busR[i] * wetGainR;
+                    } else if (sendUnclaimedFxToReverb) {
+                        ioReverbSendL[i] += dL * 0.35f;
+                        ioReverbSendR[i] += dR * 0.35f;
+                    }
+                    busL[i] = 0.0f;
+                    busR[i] = 0.0f;
+                }
+                parent->submixHasAudio = true;
+            } else {
+                for (uint32_t i = 0u; i < numFrames; ++i) {
+                    float dL = busL[i] * dryGainL;
+                    float dR = busR[i] * dryGainR;
+                    ioMasterDryL[i] += dL;
+                    ioMasterDryR[i] += dR;
+                    if (wetGainL > 0.0f || wetGainR > 0.0f) {
+                        ioReverbSendL[i] += busL[i] * wetGainL;
+                        ioReverbSendR[i] += busR[i] * wetGainR;
+                    } else if (sendUnclaimedFxToReverb) {
+                        ioReverbSendL[i] += dL * 0.35f;
+                        ioReverbSendR[i] += dR * 0.35f;
+                    }
+                    busL[i] = 0.0f;
+                    busR[i] = 0.0f;
+                }
+            }
+        }
+        if (!anyProcessed) break;
     }
 }
 
@@ -739,122 +660,82 @@ void AdvanceActiveAudioBuffersSubLoop() {
 // ============================================================================
 
 static ULONG __stdcall Buffer_AddRef(XboxDSBufferObject* b) {
-    return b ? (ULONG)InterlockedIncrement(&b->refCount) : 1;
+    return b ? static_cast<ULONG>(InterlockedIncrement(&b->refCount)) : 1u;
 }
 
 static ULONG __stdcall Buffer_Release(XboxDSBufferObject* b) {
-    if (!b) return 0;
+    if (!b) return 0u;
     LONG r = InterlockedDecrement(&b->refCount);
     if (r <= 0) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        for (size_t i = 0; i < g_activeBuffers.size(); ++i) {
+        for (size_t i = 0u; i < g_activeBuffers.size(); ++i) {
             if (g_activeBuffers[i] == b) {
-                g_activeBuffers.erase(g_activeBuffers.begin() + i);
+                g_activeBuffers.erase(g_activeBuffers.begin() + static_cast<ptrdiff_t>(i));
                 break;
             }
         }
-        for (size_t i = 0; i < g_activeBuffers.size(); ++i) {
+        for (size_t i = 0u; i < g_activeBuffers.size(); ++i) {
             if (g_activeBuffers[i]->outputBuffer == b) {
                 g_activeBuffers[i]->outputBuffer = nullptr;
             }
         }
-        if (b->hostBuf) {
-            ReturnHostBufferToPool(b);
-        }
+        ClearStreamsReferencingOutputBufferLocked(b);
         if (b->ownsRawBuf && b->rawBuf) {
             free(b->rawBuf);
             b->rawBuf = nullptr;
         }
         LeaveCriticalSection(&g_audioCs);
         delete b;
-        return 0;
+        return 0u;
     }
-    return (ULONG)r;
+    return static_cast<ULONG>(r);
 }
 
 static HRESULT __stdcall Buffer_Play(XboxDSBufferObject* b, DWORD dwReserved1, DWORD dwReserved2, DWORD dwFlags) {
     (void)dwReserved1; (void)dwReserved2;
     if (!b) return S_OK;
+    EnsureXboxWasapiMixerStarted();
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    bool wasStopped = (b->status == 0);
-    b->status = 1; // DSBSTATUS_PLAYING
-    b->isReleasing = false;
-    if (wasStopped || b->playStartTickMs == 0) {
-        b->playStartTickMs = GetTickCount();
-    }
-    UpdateBufferLfoAndEg(b);
-    bool isLooping = (dwFlags & 1u) != 0;
-    b->isLooping   = isLooping;
-    if (b->isStreamingLockBuf) {
-        if (!b->hostBuf || b->isAdpcm || b->dirty || b->hostBufBytes != b->rawSize) {
-            SyncBufferToHost(b, kSubLoopPhaseNone);
-            if (b->hostBuf) {
-                b->hostBuf->SetCurrentPosition(0);
-                b->hostBuf->Play(0, 0, isLooping ? DSBPLAY_LOOPING : 0);
-            }
+
+    bool isLooping  = (dwFlags & 1u) != 0u;
+    bool wasStopped = (b->status == 0u);
+    b->status              = 1u;
+    b->isLooping           = isLooping;
+    b->isReleasing         = false;
+    b->releaseOnlyEnvelope = false;
+
+    if (wasStopped) {
+        b->activeSamples48k  = 0ULL;
+        b->releaseSamples48k = 0ULL;
+        if (b->isStreamingLockBuf && isLooping) {
+            // Preserve circular buffer play cursor across Stop/Play pause cycles (e.g. Bink audio)
+        } else if (b->hasExplicitStartPos) {
+            b->hasExplicitStartPos = false;
         } else {
-            // Streaming PCM circular buffer (e.g. Bink audio) already kept in sync via Buffer_Unlock:
-            // do NOT overwrite hostBuf or reset play cursor on looping buffers!
-            ApplyBufferVolumeAndPan(b);
-            if (!isLooping) {
-                b->hostBuf->SetCurrentPosition(0);
-            }
-            b->hostBuf->Play(0, 0, isLooping ? DSBPLAY_LOOPING : 0);
+            b->playFramePos = 0.0;
+            memset(&b->filterState, 0, sizeof(b->filterState));
         }
-    } else {
-        AdvanceBufferSubLoopIfNeeded(b);
-        BufferSubLoopGeometry g = GetBufferSubLoopGeometry(b);
-        if (isLooping && g.hasSubLoop) {
-            bool alreadyActiveSubLoop = (!b->dirty && b->hostBuf &&
-                (b->subLoopPhase == kSubLoopPhaseAttack || b->subLoopPhase == kSubLoopPhaseSustain));
-            if (alreadyActiveSubLoop) {
-                DWORD st = 0;
-                b->hostBuf->GetStatus(&st);
-                if ((st & DSBSTATUS_PLAYING) != 0) {
-                    ApplyBufferVolumeAndPan(b);
-                    LeaveCriticalSection(&g_audioCs);
-                    return S_OK;
-                }
-            }
-            uint8_t initialPhase = g.hasAttack ? kSubLoopPhaseAttack : kSubLoopPhaseSustain;
-            SyncBufferToHost(b, initialPhase);
-            if (b->hostBuf) {
-                b->hostBuf->SetCurrentPosition(0);
-                b->hostBuf->Play(0, 0, (initialPhase == kSubLoopPhaseSustain) ? DSBPLAY_LOOPING : 0);
-            }
-        } else {
-            bool wasDirty = (!b->hostBuf || b->dirty || b->subLoopPhase != kSubLoopPhaseNone);
-            if (wasDirty) {
-                SyncBufferToHost(b, kSubLoopPhaseNone);
-            } else {
-                RefreshBufferPitchAndFrequency(b);
-            }
-            if (b->hostBuf) {
-                bool alreadyPlayingLoop = false;
-                if (!wasDirty && isLooping) {
-                    DWORD st = 0;
-                    b->hostBuf->GetStatus(&st);
-                    alreadyPlayingLoop = ((st & DSBSTATUS_PLAYING) != 0);
-                }
-                if (!alreadyPlayingLoop) {
-                    b->hostBuf->SetCurrentPosition(0);
-                }
-                b->hostBuf->Play(0, 0, isLooping ? DSBPLAY_LOOPING : 0);
-            }
-        }
+    } else if (!isLooping && !b->isStreamingLockBuf) {
+        b->playFramePos        = 0.0;
+        b->hasExplicitStartPos = false;
+        b->activeSamples48k    = 0ULL;
+        b->releaseSamples48k   = 0ULL;
     }
+
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
 
 static HRESULT __stdcall Buffer_Stop(XboxDSBufferObject* b) {
     if (!b) return S_OK;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    b->status = 0;
-    b->isLooping = false;
-    b->isReleasing = false;
-    b->subLoopPhase = kSubLoopPhaseNone;
-    if (b->hostBuf) b->hostBuf->Stop();
+    b->status              = 0u;
+    b->isLooping           = false;
+    b->isReleasing         = false;
+    b->releaseOnlyEnvelope = false;
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
@@ -862,47 +743,27 @@ static HRESULT __stdcall Buffer_Stop(XboxDSBufferObject* b) {
 static HRESULT __stdcall Buffer_StopEx(XboxDSBufferObject* b, uint32_t rtLow, uint32_t rtHigh, DWORD dwFlags) {
     (void)rtLow; (void)rtHigh;
     if (!b) return S_OK;
-    // In Xbox CMcpxBuffer::Stop (0x006E8718) and CMcpxBuffer::StopEx (0x006E8981, called by XACT::CSoundSource::Stop at 0x00701D1D):
-    //   1. DSBSTOPEX_ENVELOPE (0x1): triggers the EG release stage while continuing waveform playback until the envelope decays.
-    //   2. DSBSTOPEX_RELEASEWAVEFORM (0x2): transitions to the release tail [loopStart + loopLength .. playLength) or clears looping.
-    if ((dwFlags & 3u) != 0) {
+    // Verified against CMcpxBuffer::Stop (0x006E8718) & CMcpxBuffer::StopEx (0x006E8981):
+    //   1. DSBSTOPEX_ENVELOPE (0x1): triggers amplitude EG release ramp while continuing playback until envelope decays.
+    //   2. DSBSTOPEX_RELEASEWAVEFORM (0x2): clears loop enable so playback exits sustain loop into release tail [loopEnd .. regionEnd).
+    if ((dwFlags & 3u) != 0u) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        AdvanceBufferSubLoopIfNeeded(b);
-        if ((dwFlags & 1u) != 0 && b->status == 1 && b->egActive[0] && b->eg[0].dwRelease > 0u) {
-            b->isReleasing = true;
-            b->releaseStartTickMs = GetTickCount();
-            if ((dwFlags & 2u) == 0) {
+        if (b->status != 0u) {
+            bool hasEnvRel  = ((dwFlags & 1u) != 0u) && b->egActive[1] && ((b->eg[1].dwRelease & 0xFFFu) > 0u);
+            bool hasWaveRel = ((dwFlags & 2u) != 0u) && b->isLooping;
+            if (hasEnvRel || hasWaveRel) {
+                if (hasEnvRel && !b->isReleasing) {
+                    b->isReleasing         = true;
+                    b->releaseSamples48k   = 0ULL;
+                    b->releaseOnlyEnvelope = !hasWaveRel;
+                }
+                if (hasWaveRel) {
+                    b->isLooping           = false;
+                    b->releaseOnlyEnvelope = false;
+                }
                 LeaveCriticalSection(&g_audioCs);
                 return S_OK;
-            }
-        }
-        if ((dwFlags & 2u) != 0) {
-            if (b->status == 1 && (b->subLoopPhase == kSubLoopPhaseAttack || b->subLoopPhase == kSubLoopPhaseSustain)) {
-                BufferSubLoopGeometry g = GetBufferSubLoopGeometry(b);
-                if (g.hasSubLoop && g.hasRelease) {
-                    b->isLooping = false;
-                    SyncBufferToHost(b, kSubLoopPhaseRelease);
-                    if (b->hostBuf) {
-                        b->hostBuf->SetCurrentPosition(0);
-                        b->hostBuf->Play(0, 0, 0);
-                        LeaveCriticalSection(&g_audioCs);
-                        return S_OK;
-                    }
-                }
-            } else if (b->status == 1 && b->subLoopPhase == kSubLoopPhaseRelease) {
-                LeaveCriticalSection(&g_audioCs);
-                return S_OK;
-            }
-            if (b->status == 1 && b->isLooping && b->hostBuf) {
-                DWORD st = 0;
-                b->hostBuf->GetStatus(&st);
-                if ((st & DSBSTATUS_PLAYING) != 0) {
-                    b->isLooping    = false;
-                    b->subLoopPhase = kSubLoopPhaseRelease;
-                    b->hostBuf->Play(0, 0, 0);
-                    LeaveCriticalSection(&g_audioCs);
-                    return S_OK;
-                }
             }
         }
         LeaveCriticalSection(&g_audioCs);
@@ -912,39 +773,87 @@ static HRESULT __stdcall Buffer_StopEx(XboxDSBufferObject* b, uint32_t rtLow, ui
 
 static HRESULT __stdcall Buffer_GetStatus(XboxDSBufferObject* b, DWORD* pdwStatus) {
     if (!pdwStatus) return E_INVALIDARG;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    if (b) {
-        AdvanceBufferSubLoopIfNeeded(b);
-    }
-    if (b && b->hostBuf) {
-        DWORD st = 0;
-        b->hostBuf->GetStatus(&st);
-        *pdwStatus = (st & DSBSTATUS_PLAYING) ? 1 : 0;
+    if (b && b->status != 0u) {
+        *pdwStatus = kXboxDsbStatusPlaying | (b->isLooping ? kXboxDsbStatusLooping : 0u);
     } else {
-        *pdwStatus = 0;
+        *pdwStatus = 0u;
     }
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
 
+static DWORD ConvertFrameToXboxRawOffsetLocked(const XboxDSBufferObject* b, const BufferRegionFrameGeometry& g, uint32_t frameIdx) {
+    if (!b || g.regionLengthBytes == 0u || g.totalFrames == 0u) return 0u;
+    if (frameIdx >= g.totalFrames) {
+        frameIdx %= g.totalFrames;
+    }
+    uint32_t rawBytes = b->isAdpcm
+        ? ((frameIdx >> 6u) * g.rawBlockAlign)
+        : (frameIdx * g.rawBlockAlign);
+    if (b->isStreamingLockBuf && b->rawSize > 0u) {
+        return rawBytes % b->rawSize;
+    }
+    if (rawBytes >= g.regionLengthBytes) {
+        rawBytes %= g.regionLengthBytes;
+    }
+    return rawBytes;
+}
+
+static double ConvertXboxRawOffsetToFrameLocked(const XboxDSBufferObject* b, const BufferRegionFrameGeometry& g, DWORD xboxByteOffset) {
+    if (!b || g.regionLengthBytes == 0u || g.totalFrames == 0u) return 0.0;
+    uint32_t clampedBytes = xboxByteOffset;
+    if (clampedBytes >= g.regionLengthBytes) {
+        clampedBytes %= g.regionLengthBytes;
+    }
+    uint32_t frame = b->isAdpcm
+        ? ((clampedBytes / g.rawBlockAlign) * 64u)
+        : (clampedBytes / g.rawBlockAlign);
+    if (frame >= g.totalFrames) frame = 0u;
+    return static_cast<double>(frame);
+}
+
 static HRESULT __stdcall Buffer_GetCurrentPosition(XboxDSBufferObject* b, DWORD* pdwPlay, DWORD* pdwWrite) {
-    HRESULT hr = S_OK;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    if (b && b->hostBuf) {
-        hr = b->hostBuf->GetCurrentPosition(pdwPlay, pdwWrite);
+    if (b && b->rawBuf && b->rawSize > 0u) {
+        BufferRegionFrameGeometry g = ComputeBufferFrameGeometry(b);
+        if (g.totalFrames > 0u) {
+            uint32_t playFrame = static_cast<uint32_t>(b->playFramePos >= 0.0 ? b->playFramePos : 0.0);
+            if (playFrame >= g.totalFrames) playFrame %= g.totalFrames;
+
+            DWORD effFreq = b->freq ? b->freq : kDefaultSampleRateHz;
+            uint32_t writeLeadFrames = (effFreq * 15u) / 1000u; // ~15 ms safe write-ahead margin
+            if (writeLeadFrames < 64u) writeLeadFrames = 64u;
+            uint32_t writeFrame = playFrame + writeLeadFrames;
+            if (b->isLooping || b->isStreamingLockBuf) {
+                writeFrame %= g.totalFrames;
+            } else if (writeFrame >= g.totalFrames) {
+                writeFrame = g.totalFrames - 1u;
+            }
+
+            if (pdwPlay)  *pdwPlay  = ConvertFrameToXboxRawOffsetLocked(b, g, playFrame);
+            if (pdwWrite) *pdwWrite = ConvertFrameToXboxRawOffsetLocked(b, g, writeFrame);
+        } else {
+            if (pdwPlay)  *pdwPlay  = 0u;
+            if (pdwWrite) *pdwWrite = 0u;
+        }
     } else {
-        if (pdwPlay)  *pdwPlay = 0;
-        if (pdwWrite) *pdwWrite = 0;
+        if (pdwPlay)  *pdwPlay  = 0u;
+        if (pdwWrite) *pdwWrite = 0u;
     }
     LeaveCriticalSection(&g_audioCs);
-    return hr;
+    return S_OK;
 }
 
 static HRESULT __stdcall Buffer_SetCurrentPosition(XboxDSBufferObject* b, DWORD dwNewPosition) {
+    if (!b) return S_OK;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    if (b && b->hostBuf) {
-        b->hostBuf->SetCurrentPosition(dwNewPosition);
-    }
+    BufferRegionFrameGeometry g = ComputeBufferFrameGeometry(b);
+    b->playFramePos        = ConvertXboxRawOffsetToFrameLocked(b, g, dwNewPosition);
+    b->hasExplicitStartPos = (b->status == 0u);
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
@@ -955,37 +864,52 @@ static HRESULT __stdcall Buffer_Lock(
     void** ppvAudioPtr2, DWORD* pdwAudioBytes2, DWORD dwFlags)
 {
     if (!b) return E_INVALIDARG;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    b->isStreamingLockBuf = true;
     if (!b->rawBuf) {
-        b->rawSize = dwBytes ? dwBytes : 65536;
-        b->rawBuf = (uint8_t*)calloc(1, b->rawSize);
+        b->rawSize    = dwBytes ? dwBytes : 65536u;
+        b->rawBuf     = static_cast<uint8_t*>(calloc(1, b->rawSize));
         b->ownsRawBuf = true;
     }
-    if (dwFlags & 1) { // DSBLOCK_FROMWRITECURSOR
-        if (b->hostBuf) {
-            DWORD writePos = 0;
-            b->hostBuf->GetCurrentPosition(nullptr, &writePos);
-            dwOffset = writePos;
+    ++b->lockCount;
+    b->cachedAdpcmBlockIdx = 0xFFFFFFFFu;
+
+    if (!b->isAdpcm &&
+        ((dwFlags & 1u) != 0u ||
+         b->status != 0u ||
+         (b->lockCount > 1u && (dwOffset > 0u || (dwBytes > 0u && dwBytes < b->rawSize && (dwFlags & 2u) == 0u)))))
+    {
+        b->isStreamingLockBuf = true;
+    }
+
+    if ((dwFlags & 1u) != 0u) { // DSBLOCK_FROMWRITECURSOR
+        BufferRegionFrameGeometry g = ComputeBufferFrameGeometry(b);
+        if (g.totalFrames > 0u) {
+            uint32_t playFrame = static_cast<uint32_t>(b->playFramePos >= 0.0 ? b->playFramePos : 0.0) % g.totalFrames;
+            DWORD effFreq = b->freq ? b->freq : kDefaultSampleRateHz;
+            uint32_t writeLeadFrames = (effFreq * 15u) / 1000u;
+            if (writeLeadFrames < 64u) writeLeadFrames = 64u;
+            uint32_t writeFrame = (playFrame + writeLeadFrames) % g.totalFrames;
+            dwOffset = ConvertFrameToXboxRawOffsetLocked(b, g, writeFrame);
         }
     }
-    if (dwFlags & 2) { // DSBLOCK_ENTIREBUFFER
+    if ((dwFlags & 2u) != 0u) { // DSBLOCK_ENTIREBUFFER
         dwBytes = b->rawSize;
     }
-    if (b->rawSize > 0) {
+    if (b->rawSize > 0u) {
         dwOffset %= b->rawSize;
         if (dwBytes > b->rawSize) dwBytes = b->rawSize;
     } else {
-        dwOffset = 0;
-        dwBytes = 0;
+        dwOffset = 0u;
+        dwBytes  = 0u;
     }
 
     DWORD bytes1 = (dwOffset + dwBytes <= b->rawSize) ? dwBytes : (b->rawSize - dwOffset);
-    DWORD bytes2 = (bytes1 < dwBytes) ? (dwBytes - bytes1) : 0;
+    DWORD bytes2 = (bytes1 < dwBytes) ? (dwBytes - bytes1) : 0u;
 
-    if (ppvAudioPtr1)   *ppvAudioPtr1 = b->rawBuf + dwOffset;
+    if (ppvAudioPtr1)   *ppvAudioPtr1   = b->rawBuf + dwOffset;
     if (pdwAudioBytes1) *pdwAudioBytes1 = bytes1;
-    if (ppvAudioPtr2)   *ppvAudioPtr2 = (bytes2 > 0) ? b->rawBuf : nullptr;
+    if (ppvAudioPtr2)   *ppvAudioPtr2   = (bytes2 > 0u) ? b->rawBuf : nullptr;
     if (pdwAudioBytes2) *pdwAudioBytes2 = bytes2;
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
@@ -994,58 +918,32 @@ static HRESULT __stdcall Buffer_Lock(
 static HRESULT __stdcall Buffer_Unlock(
     XboxDSBufferObject* b, void* pvAudioPtr1, DWORD dwAudioBytes1, void* pvAudioPtr2, DWORD dwAudioBytes2)
 {
+    (void)pvAudioPtr1; (void)dwAudioBytes1; (void)pvAudioPtr2; (void)dwAudioBytes2;
     if (!b) return S_OK;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    if (b->isStreamingLockBuf && !b->isAdpcm && b->rawBuf && b->rawSize > 0) {
-        if (!b->hostBuf || b->hostBufBytes != b->rawSize) {
-            SyncBufferToHost(b, kSubLoopPhaseNone);
-        } else {
-            if (pvAudioPtr1 && dwAudioBytes1 > 0 &&
-                (uintptr_t)pvAudioPtr1 >= (uintptr_t)b->rawBuf &&
-                (uintptr_t)pvAudioPtr1 < (uintptr_t)(b->rawBuf + b->rawSize))
-            {
-                DWORD offset1 = (DWORD)((uintptr_t)pvAudioPtr1 - (uintptr_t)b->rawBuf);
-                DWORD copy1 = (offset1 + dwAudioBytes1 <= b->rawSize) ? dwAudioBytes1 : (b->rawSize - offset1);
-                void* hPtr1 = nullptr; DWORD hBytes1 = 0;
-                void* hPtr2 = nullptr; DWORD hBytes2 = 0;
-                if (copy1 > 0 && SUCCEEDED(b->hostBuf->Lock(offset1, copy1, &hPtr1, &hBytes1, &hPtr2, &hBytes2, 0))) {
-                    if (hPtr1 && hBytes1 > 0) memcpy(hPtr1, pvAudioPtr1, hBytes1);
-                    if (hPtr2 && hBytes2 > 0) memcpy(hPtr2, (const uint8_t*)pvAudioPtr1 + hBytes1, hBytes2);
-                    b->hostBuf->Unlock(hPtr1, hBytes1, hPtr2, hBytes2);
-                }
-            }
-            if (pvAudioPtr2 && dwAudioBytes2 > 0 &&
-                (uintptr_t)pvAudioPtr2 >= (uintptr_t)b->rawBuf &&
-                (uintptr_t)pvAudioPtr2 < (uintptr_t)(b->rawBuf + b->rawSize))
-            {
-                DWORD offset2 = (DWORD)((uintptr_t)pvAudioPtr2 - (uintptr_t)b->rawBuf);
-                DWORD copy2 = (offset2 + dwAudioBytes2 <= b->rawSize) ? dwAudioBytes2 : (b->rawSize - offset2);
-                void* hPtr1 = nullptr; DWORD hBytes1 = 0;
-                void* hPtr2 = nullptr; DWORD hBytes2 = 0;
-                if (copy2 > 0 && SUCCEEDED(b->hostBuf->Lock(offset2, copy2, &hPtr1, &hBytes1, &hPtr2, &hBytes2, 0))) {
-                    if (hPtr1 && hBytes1 > 0) memcpy(hPtr1, pvAudioPtr2, hBytes1);
-                    if (hPtr2 && hBytes2 > 0) memcpy(hPtr2, (const uint8_t*)pvAudioPtr2 + hBytes1, hBytes2);
-                    b->hostBuf->Unlock(hPtr1, hBytes1, hPtr2, hBytes2);
-                }
-            }
-        }
-    }
+    b->cachedAdpcmBlockIdx = 0xFFFFFFFFu;
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
 
 static HRESULT __stdcall Buffer_SetBufferData(XboxDSBufferObject* b, void* pvBufferData, DWORD dwBufferBytes) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
         if (b->ownsRawBuf && b->rawBuf) free(b->rawBuf);
-        b->rawBuf = reinterpret_cast<uint8_t*>(pvBufferData);
-        b->rawSize = dwBufferBytes;
-        b->ownsRawBuf = false;
-        b->playStart = 0;
-        b->playLength = 0;
-        b->loopStart = 0;
-        b->loopLength = 0;
-        b->dirty = true;
+        b->rawBuf              = reinterpret_cast<uint8_t*>(pvBufferData);
+        b->rawSize             = dwBufferBytes;
+        b->ownsRawBuf          = false;
+        b->playStart           = 0u;
+        b->playLength          = 0u;
+        b->loopStart           = 0u;
+        b->loopLength          = 0u;
+        b->playFramePos        = 0.0;
+        b->hasExplicitStartPos = false;
+        b->lockCount           = 0u;
+        b->isStreamingLockBuf  = false;
+        b->cachedAdpcmBlockIdx = 0xFFFFFFFFu;
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1053,14 +951,15 @@ static HRESULT __stdcall Buffer_SetBufferData(XboxDSBufferObject* b, void* pvBuf
 
 static HRESULT __stdcall Buffer_SetFormat(XboxDSBufferObject* b, const WAVEFORMATEX* pwfx) {
     if (b && pwfx) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        b->wfx = *pwfx;
+        b->wfx     = *pwfx;
         b->isAdpcm = (pwfx->wFormatTag == XBOX_WAVE_FORMAT_XBOX_ADPCM);
         if (pwfx->nSamplesPerSec) {
             b->freq   = pwfx->nSamplesPerSec;
             b->lPitch = FrequencyHzToXboxPitch(b->freq);
         }
-        b->dirty = true;
+        b->cachedAdpcmBlockIdx = 0xFFFFFFFFu;
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1068,9 +967,9 @@ static HRESULT __stdcall Buffer_SetFormat(XboxDSBufferObject* b, const WAVEFORMA
 
 static HRESULT __stdcall Buffer_SetVolume(XboxDSBufferObject* b, LONG lVolume) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
         b->volume = lVolume;
-        ApplyBufferVolumeAndPan(b);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1078,9 +977,9 @@ static HRESULT __stdcall Buffer_SetVolume(XboxDSBufferObject* b, LONG lVolume) {
 
 static HRESULT __stdcall Buffer_SetHeadroom(XboxDSBufferObject* b, DWORD dwHeadroom) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
         b->headroomMb = (dwHeadroom <= 10000u) ? static_cast<LONG>(dwHeadroom) : 10000;
-        ApplyBufferVolumeAndPan(b);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1088,10 +987,10 @@ static HRESULT __stdcall Buffer_SetHeadroom(XboxDSBufferObject* b, DWORD dwHeadr
 
 static HRESULT __stdcall Buffer_SetPitch(XboxDSBufferObject* b, LONG lPitch) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
         b->lPitch = lPitch;
         b->freq   = XboxPitchToFrequencyHz(lPitch);
-        RefreshBufferPitchAndFrequency(b);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1099,12 +998,12 @@ static HRESULT __stdcall Buffer_SetPitch(XboxDSBufferObject* b, LONG lPitch) {
 
 static HRESULT __stdcall Buffer_SetFrequency(XboxDSBufferObject* b, DWORD dwFrequency) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
         if (dwFrequency < kMinDirectSoundFreqHz) dwFrequency = kMinDirectSoundFreqHz;
         if (dwFrequency > kMaxXboxPitchFreqHz)   dwFrequency = kMaxXboxPitchFreqHz;
         b->freq   = dwFrequency;
         b->lPitch = FrequencyHzToXboxPitch(dwFrequency);
-        RefreshBufferPitchAndFrequency(b);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1112,8 +1011,9 @@ static HRESULT __stdcall Buffer_SetFrequency(XboxDSBufferObject* b, DWORD dwFreq
 
 static HRESULT __stdcall Buffer_SetLFO(XboxDSBufferObject* b, const XBOX_DSLFODESC* pLFODesc) {
     if (!b) return E_INVALIDARG;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    if (pLFODesc && reinterpret_cast<uintptr_t>(pLFODesc) >= 0x00010000u) {
+    if (pLFODesc && reinterpret_cast<uintptr_t>(pLFODesc) >= kMinValidHostAddress) {
         uint32_t idx = (pLFODesc->dwLFO == 1u) ? 1u : 0u;
         b->lfo[idx] = *pLFODesc;
         b->lfoActive[idx] = (pLFODesc->dwDelta > 0u) &&
@@ -1124,16 +1024,15 @@ static HRESULT __stdcall Buffer_SetLFO(XboxDSBufferObject* b, const XBOX_DSLFODE
         b->lfoActive[0] = false;
         b->lfoActive[1] = false;
     }
-    UpdateBufferLfoAndEg(b);
-    RefreshBufferPitchAndFrequency(b);
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
 
 static HRESULT __stdcall Buffer_SetEG(XboxDSBufferObject* b, const XBOX_DSENVELOPEDESC* pEnvelopeDesc) {
     if (!b) return E_INVALIDARG;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    if (pEnvelopeDesc && reinterpret_cast<uintptr_t>(pEnvelopeDesc) >= 0x00010000u) {
+    if (pEnvelopeDesc && reinterpret_cast<uintptr_t>(pEnvelopeDesc) >= kMinValidHostAddress) {
         uint32_t idx = (pEnvelopeDesc->dwEG == 1u) ? 1u : 0u;
         b->eg[idx] = *pEnvelopeDesc;
         b->egActive[idx] = (pEnvelopeDesc->dwMode != 0u);
@@ -1141,40 +1040,37 @@ static HRESULT __stdcall Buffer_SetEG(XboxDSBufferObject* b, const XBOX_DSENVELO
         b->egActive[0] = false;
         b->egActive[1] = false;
     }
-    UpdateBufferLfoAndEg(b);
-    RefreshBufferPitchAndFrequency(b);
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
 
 static HRESULT __stdcall Buffer_SetOutputBuffer(XboxDSBufferObject* b, XboxDSBufferObject* pOutputBuffer) {
     if (!b) return E_INVALIDARG;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
-    uint32_t oldI3dl2Hash = GetQuantizedI3DL2StateHash(b);
-    b->outputBuffer = (pOutputBuffer != b) ? pOutputBuffer : nullptr;
-    uint32_t newI3dl2Hash = GetQuantizedI3DL2StateHash(b);
-    if (newI3dl2Hash != oldI3dl2Hash) {
-        RebakeBufferOnParameterChange(b);
+    XboxDSBufferObject* target = (pOutputBuffer != b) ? pOutputBuffer : nullptr;
+    b->outputBuffer = target;
+    if (target) {
+        EnsureSubmixBusAllocatedLocked(target);
     }
-    ApplyBufferVolumeAndPan(b);
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
 }
 
 static HRESULT __stdcall Buffer_SetFilter(XboxDSBufferObject* b, const XBOX_DSFILTERDESC* pFilterDesc) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        uint32_t oldHash = GetQuantizedFilterStateHash(b);
-        if (pFilterDesc && reinterpret_cast<uintptr_t>(pFilterDesc) >= 0x00010000u && (pFilterDesc->dwMode & 3u) != 0u) {
+        if (pFilterDesc && reinterpret_cast<uintptr_t>(pFilterDesc) >= kMinValidHostAddress && (pFilterDesc->dwMode & 3u) != 0u) {
             b->filterDesc      = *pFilterDesc;
             b->hasActiveFilter = true;
         } else {
             memset(&b->filterDesc, 0, sizeof(b->filterDesc));
             b->hasActiveFilter = false;
-        }
-        uint32_t newHash = GetQuantizedFilterStateHash(b);
-        if (newHash != oldHash) {
-            RebakeBufferOnParameterChange(b);
+            b->filterState.low[0] = b->filterState.low[1] = 0.0f;
+            b->filterState.band[0] = b->filterState.band[1] = 0.0f;
+            b->filterState.low2[0] = b->filterState.low2[1] = 0.0f;
+            b->filterState.band2[0] = b->filterState.band2[1] = 0.0f;
         }
         LeaveCriticalSection(&g_audioCs);
     }
@@ -1183,36 +1079,41 @@ static HRESULT __stdcall Buffer_SetFilter(XboxDSBufferObject* b, const XBOX_DSFI
 
 static HRESULT __stdcall Buffer_Set3DVoiceData(XboxDSBufferObject* b, const void* pVoiceData) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        uint32_t oldFilterHash = GetQuantizedFilterStateHash(b);
-        b->hasI3DL2Send = true;
-        Compute3DAudioPanAndAtten(pVoiceData, &b->pan, &b->atten3D, &b->voice3D);
-        uint32_t newFilterHash = GetQuantizedFilterStateHash(b);
-        if (newFilterHash != oldFilterHash) {
-            RebakeBufferOnParameterChange(b);
+        LONG pan3D = 0;
+        Compute3DAudioPanAndAtten(pVoiceData, &pan3D, &b->atten3D, &b->voice3D);
+        if (b->voice3D.active3D && !b->hasI3DL2Send) {
+            b->hasI3DL2Send = true;
+            if (b->i3dl2SendMb <= kMinDirectSoundVolumeMb) {
+                b->i3dl2SendMb = 0;
+            }
         }
-        RefreshBufferPitchAndFrequency(b);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
 }
 
-static HRESULT __stdcall Buffer_Use3DVoiceData(XboxDSBufferObject* b, const void* pVoiceData) {
-    return Buffer_Set3DVoiceData(b, pVoiceData);
+// Verified against CDirectSoundVoice::Use3DVoiceData (0x006E059E): 2nd parameter is BOOL fUse3DVoiceData
+static HRESULT __stdcall Buffer_Use3DVoiceData(XboxDSBufferObject* b, DWORD dwUse3DVoiceData) {
+    if (b) {
+        EnsureAudioLockInitialized();
+        EnterCriticalSection(&g_audioCs);
+        b->use3DVoiceData = (dwUse3DVoiceData != 0u);
+        LeaveCriticalSection(&g_audioCs);
+    }
+    return S_OK;
 }
 
 static HRESULT __stdcall Buffer_SetMixBins(XboxDSBufferObject* b, const XBOX_DSMIXBINS* pMixBins) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        uint32_t oldI3dl2Hash = GetQuantizedI3DL2StateHash(b);
         AssignVoiceMixBins(pMixBins, b->mixBinPairs, &b->mixBinCount);
-        ComputeMixBinPairsPan(b->mixBinPairs, b->mixBinCount, &b->pan);
-        ExtractMixBinPairsI3DL2Send(b->mixBinPairs, b->mixBinCount, &b->hasI3DL2Send, &b->i3dl2SendMb);
-        uint32_t newI3dl2Hash = GetQuantizedI3DL2StateHash(b);
-        if (newI3dl2Hash != oldI3dl2Hash) {
-            RebakeBufferOnParameterChange(b);
-        }
-        ApplyBufferVolumeAndPan(b);
+        ComputeMixBinPairsPan(b->mixBinPairs, b->mixBinCount, &b->pan, &b->mixBinAttenMb);
+        ExtractXboxMixBinI3DL2Send(b->mixBinPairs, b->mixBinCount, &b->hasI3DL2Send, &b->i3dl2SendMb);
+        b->fxSendBinMask = ExtractFxSendBinMask(b->mixBinPairs, b->mixBinCount);
+        EnsureXboxFxSendTargetsAllocatedLocked(b->fxSendBinMask);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1220,16 +1121,13 @@ static HRESULT __stdcall Buffer_SetMixBins(XboxDSBufferObject* b, const XBOX_DSM
 
 static HRESULT __stdcall Buffer_SetMixBinVolumes(XboxDSBufferObject* b, const XBOX_DSMIXBINS* pMixBins) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        uint32_t oldI3dl2Hash = GetQuantizedI3DL2StateHash(b);
         UpdateVoiceMixBinVolumes(pMixBins, b->mixBinPairs, &b->mixBinCount);
-        ComputeMixBinPairsPan(b->mixBinPairs, b->mixBinCount, &b->pan);
-        ExtractMixBinPairsI3DL2Send(b->mixBinPairs, b->mixBinCount, &b->hasI3DL2Send, &b->i3dl2SendMb);
-        uint32_t newI3dl2Hash = GetQuantizedI3DL2StateHash(b);
-        if (newI3dl2Hash != oldI3dl2Hash) {
-            RebakeBufferOnParameterChange(b);
-        }
-        ApplyBufferVolumeAndPan(b);
+        ComputeMixBinPairsPan(b->mixBinPairs, b->mixBinCount, &b->pan, &b->mixBinAttenMb);
+        ExtractXboxMixBinI3DL2Send(b->mixBinPairs, b->mixBinCount, &b->hasI3DL2Send, &b->i3dl2SendMb);
+        b->fxSendBinMask = ExtractFxSendBinMask(b->mixBinPairs, b->mixBinCount);
+        EnsureXboxFxSendTargetsAllocatedLocked(b->fxSendBinMask);
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1237,11 +1135,14 @@ static HRESULT __stdcall Buffer_SetMixBinVolumes(XboxDSBufferObject* b, const XB
 
 static HRESULT __stdcall Buffer_SetPlayRegion(XboxDSBufferObject* b, DWORD dwPlayStart, DWORD dwPlayLength) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        b->playStart = dwPlayStart;
-        b->playLength = dwPlayLength;
-        b->isStreamingLockBuf = false;
-        b->dirty = true;
+        b->playStart           = dwPlayStart;
+        b->playLength          = dwPlayLength;
+        b->playFramePos        = 0.0;
+        b->hasExplicitStartPos = false;
+        b->isStreamingLockBuf  = false;
+        b->cachedAdpcmBlockIdx = 0xFFFFFFFFu;
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1249,12 +1150,10 @@ static HRESULT __stdcall Buffer_SetPlayRegion(XboxDSBufferObject* b, DWORD dwPla
 
 static HRESULT __stdcall Buffer_SetLoopRegion(XboxDSBufferObject* b, DWORD dwLoopStart, DWORD dwLoopLength) {
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        if (b->loopStart != dwLoopStart || b->loopLength != dwLoopLength) {
-            b->loopStart = dwLoopStart;
-            b->loopLength = dwLoopLength;
-            b->dirty = true;
-        }
+        b->loopStart  = dwLoopStart;
+        b->loopLength = dwLoopLength;
         LeaveCriticalSection(&g_audioCs);
     }
     return S_OK;
@@ -1264,12 +1163,8 @@ static HRESULT __stdcall Buffer_GetVoiceProperties(XboxDSBufferObject* b, XBOX_D
     if (!pProps) return E_INVALIDARG;
     memset(pProps, 0, sizeof(*pProps));
     if (b) {
+        EnsureAudioLockInitialized();
         EnterCriticalSection(&g_audioCs);
-        // Populates all 92 bytes (0x5C) of XBOX_DSVOICEPROPS matching CMcpxVoiceClient::GetVoiceProperties (0x006E71C6):
-        //   +0x00: dwMixBinCount
-        //   +0x04..+0x43: MixBinVolumePairs[0..7] (unused slots filled with {0xFFFFFFFF, -10000})
-        //   +0x44: lPitch
-        //   +0x48..+0x58: 3D voice attenuation & Doppler pitch fields
         FillVoicePropsMixBins(b->mixBinPairs, b->mixBinCount, pProps);
         pProps->lPitch             = b->lPitch;
         pProps->l3DDistanceVolume  = b->voice3D.distanceVol;
@@ -1282,9 +1177,10 @@ static HRESULT __stdcall Buffer_GetVoiceProperties(XboxDSBufferObject* b, XBOX_D
     return S_OK;
 }
 
+// Xbox DirectSound COM interfaces omit QueryInterface: slot [0] = AddRef, slot [1] = Release
 static void* g_bufferVtable[4] = {
-    reinterpret_cast<void*>(&Buffer_Release),
     reinterpret_cast<void*>(&Buffer_AddRef),
+    reinterpret_cast<void*>(&Buffer_Release),
     reinterpret_cast<void*>(&Buffer_Release),
     reinterpret_cast<void*>(&Buffer_Release),
 };
@@ -1293,30 +1189,46 @@ static void* g_bufferVtable[4] = {
 // IDirectSound Device Creation & Methods
 // ============================================================================
 
-static XboxDSObject g_singletonDS = { nullptr, 1 };
+static XboxDSObject g_singletonDS = { nullptr, 0 };
 
 static ULONG __stdcall DS_AddRef(XboxDSObject* ds) {
-    return ds ? (ULONG)InterlockedIncrement(&ds->refCount) : 1;
+    return ds ? static_cast<ULONG>(InterlockedIncrement(&ds->refCount)) : 1u;
 }
 
 static ULONG __stdcall DS_Release(XboxDSObject* ds) {
-    (void)ds;
-    return 1;
+    if (!ds) return 0u;
+    LONG cur = ds->refCount;
+    while (cur > 0) {
+        LONG prev = InterlockedCompareExchange(&ds->refCount, cur - 1, cur);
+        if (prev == cur) {
+            return static_cast<ULONG>(cur - 1);
+        }
+        cur = prev;
+    }
+    return 0u;
 }
 
 static void* g_dsVtable[4] = {
-    reinterpret_cast<void*>(&DS_Release),
     reinterpret_cast<void*>(&DS_AddRef),
+    reinterpret_cast<void*>(&DS_Release),
     reinterpret_cast<void*>(&DS_Release),
     reinterpret_cast<void*>(&DS_Release),
 };
 
 static HRESULT __stdcall Bridge_DirectSoundCreate(const GUID* pguid, XboxDSObject** ppDS, void* pUnkOuter) {
     (void)pguid; (void)pUnkOuter;
-    EnsureHostDirectSound();
+    EnsureAudioLockInitialized();
+    EnsureXboxWasapiMixerStarted();
     g_singletonDS.vtable = g_dsVtable;
+    InterlockedIncrement(&g_singletonDS.refCount);
     if (ppDS) *ppDS = &g_singletonDS;
-    *reinterpret_cast<XboxDSObject**>(ADDR_DSOUND_SINGLETON_PTR) = &g_singletonDS; // m_pDirectSound
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(ADDR_DSOUND_SINGLETON_PTR), &mbi, sizeof(mbi)) != 0 &&
+        mbi.State == MEM_COMMIT &&
+        (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0u)
+    {
+        *reinterpret_cast<XboxDSObject**>(ADDR_DSOUND_SINGLETON_PTR) = &g_singletonDS; // m_pDirectSound
+    }
     return S_OK;
 }
 
@@ -1325,47 +1237,104 @@ static HRESULT __stdcall Bridge_IDirectSound_CreateSoundBuffer(
 {
     (void)pDS; (void)pUnkOuter;
     if (!ppBuffer) return E_INVALIDARG;
+    EnsureAudioLockInitialized();
+    EnsureXboxWasapiMixerStarted();
 
     XboxDSBufferObject* b = new XboxDSBufferObject();
-    memset(b, 0, sizeof(*b));
-    b->vtable = g_bufferVtable;
-    b->refCount = 1;
-    b->freq = kDefaultSampleRateHz;
-    b->lPitch = 0;
-    b->i3dl2SendMb = kMinDirectSoundVolumeMb;
-    b->lfoEgPitchRatio  = 1.0f;
-    b->lfoEgCutoffRatio = 1.0f;
+    b->vtable              = g_bufferVtable;
+    b->refCount            = 1;
+    memset(&b->wfx, 0, sizeof(b->wfx));
+    b->isAdpcm             = false;
+    b->rawBuf              = nullptr;
+    b->rawSize             = 0u;
+    b->ownsRawBuf          = false;
+    b->playStart           = 0u;
+    b->playLength          = 0u;
+    b->loopStart           = 0u;
+    b->loopLength          = 0u;
+    b->playFramePos        = 0.0;
+    b->hasExplicitStartPos = false;
+    b->volume              = 0;
+    b->headroomMb          = 0;
+    b->pan                 = 0;
+    b->mixBinAttenMb       = 0;
+    b->atten3D             = 0;
+    b->lPitch              = 0;
+    b->freq                = kDefaultSampleRateHz;
+    b->status              = 0u;
+    b->lockCount           = 0u;
+    b->isStreamingLockBuf  = false;
+    b->isLooping           = false;
+    b->isReleasing         = false;
+    b->releaseOnlyEnvelope = false;
+    b->use3DVoiceData      = true;
+    b->hasI3DL2Send        = false;
+    b->i3dl2SendMb         = kMinDirectSoundVolumeMb;
+    b->fxSendBinMask       = 0u;
+    b->inputMixBin         = 0xFFFFFFFFu;
+    memset(b->mixBinPairs, 0, sizeof(b->mixBinPairs));
+    b->mixBinCount         = 0u;
+    memset(&b->voice3D, 0, sizeof(b->voice3D));
+    b->voice3D.hrtfFilterCoeff = 1.0f;
+    memset(&b->filterDesc, 0, sizeof(b->filterDesc));
+    b->hasActiveFilter     = false;
+    memset(&b->filterState, 0, sizeof(b->filterState));
+    memset(b->lfo, 0, sizeof(b->lfo));
+    b->lfoActive[0]        = b->lfoActive[1] = false;
+    memset(b->eg, 0, sizeof(b->eg));
+    b->egActive[0]         = b->egActive[1] = false;
+    b->outputBuffer        = nullptr;
+    b->activeSamples48k    = 0ULL;
+    b->releaseSamples48k   = 0ULL;
+    b->cachedAdpcmBlockIdx = 0xFFFFFFFFu;
+    memset(b->cachedAdpcmL, 0, sizeof(b->cachedAdpcmL));
+    memset(b->cachedAdpcmR, 0, sizeof(b->cachedAdpcmR));
+    b->submixHasAudio      = false;
+
     InitVoiceDefaultMixBins(pDesc ? pDesc->dwFlags : 0u, b->mixBinPairs, &b->mixBinCount);
+    ComputeMixBinPairsPan(b->mixBinPairs, b->mixBinCount, &b->pan, &b->mixBinAttenMb);
+    ExtractXboxMixBinI3DL2Send(b->mixBinPairs, b->mixBinCount, &b->hasI3DL2Send, &b->i3dl2SendMb);
+    b->fxSendBinMask = ExtractFxSendBinMask(b->mixBinPairs, b->mixBinCount);
+
     if (pDesc) {
         if (pDesc->lpwfxFormat) {
-            b->wfx = *pDesc->lpwfxFormat;
+            b->wfx     = *pDesc->lpwfxFormat;
             b->isAdpcm = (b->wfx.wFormatTag == XBOX_WAVE_FORMAT_XBOX_ADPCM);
             if (b->wfx.nSamplesPerSec) {
                 b->freq   = b->wfx.nSamplesPerSec;
                 b->lPitch = FrequencyHzToXboxPitch(b->freq);
             }
         } else {
-            b->wfx.wFormatTag = WAVE_FORMAT_PCM;
-            b->wfx.nChannels = 2;
-            b->wfx.nSamplesPerSec = kDefaultSampleRateHz;
-            b->wfx.wBitsPerSample = 16;
-            b->wfx.nBlockAlign = 4;
+            b->wfx.wFormatTag      = WAVE_FORMAT_PCM;
+            b->wfx.nChannels       = 2u;
+            b->wfx.nSamplesPerSec  = kDefaultSampleRateHz;
+            b->wfx.wBitsPerSample  = 16u;
+            b->wfx.nBlockAlign     = 4u;
             b->wfx.nAvgBytesPerSec = kDefaultStreamBytesPerSec;
         }
-        if (pDesc->dwBufferBytes > 0) {
-            b->rawSize = pDesc->dwBufferBytes;
-            b->rawBuf = (uint8_t*)calloc(1, b->rawSize);
+        if (pDesc->dwBufferBytes > 0u) {
+            b->rawSize    = pDesc->dwBufferBytes;
+            b->rawBuf     = static_cast<uint8_t*>(calloc(1, b->rawSize));
             b->ownsRawBuf = true;
         }
         if (pDesc->lpMixBins) {
             const XBOX_DSMIXBINS* pMixBins = reinterpret_cast<const XBOX_DSMIXBINS*>(pDesc->lpMixBins);
             AssignVoiceMixBins(pMixBins, b->mixBinPairs, &b->mixBinCount);
-            ComputeMixBinPairsPan(b->mixBinPairs, b->mixBinCount, &b->pan);
-            ExtractMixBinPairsI3DL2Send(b->mixBinPairs, b->mixBinCount, &b->hasI3DL2Send, &b->i3dl2SendMb);
+            ComputeMixBinPairsPan(b->mixBinPairs, b->mixBinCount, &b->pan, &b->mixBinAttenMb);
+            ExtractXboxMixBinI3DL2Send(b->mixBinPairs, b->mixBinCount, &b->hasI3DL2Send, &b->i3dl2SendMb);
+            b->fxSendBinMask = ExtractFxSendBinMask(b->mixBinPairs, b->mixBinCount);
+        }
+        if (((pDesc->dwFlags & 0x00040080u) != 0u || pDesc->dwBufferBytes == 0u) &&
+            pDesc->dwInputMixBin >= 11u && pDesc->dwInputMixBin <= 31u)
+        {
+            b->inputMixBin = pDesc->dwInputMixBin;
+            EnsureSubmixBusAllocatedLocked(b);
         }
     }
+
     EnterCriticalSection(&g_audioCs);
     g_activeBuffers.push_back(b);
+    EnsureXboxFxSendTargetsAllocatedLocked(b->fxSendBinMask);
     LeaveCriticalSection(&g_audioCs);
     *ppBuffer = b;
     return S_OK;
@@ -1378,18 +1347,15 @@ static HRESULT __stdcall Bridge_IDirectSound_DownloadEffectsImage(
     XboxDSObject* pDS, const void* pvImageBuffer, DWORD dwImageSize, const void* pImageLoc, void** ppImageDesc)
 {
     (void)pDS; (void)pImageLoc;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
 
-    // Parse the Xbox MCPX GP DSP effects image (e.g. dsstdfx.bin / nsidsp.bin) using the exact binary layout
-    // verified against CMcpxGPDspManager::ParseEffectImageInfo (0x006E3D30):
-    //   +0x804: total DSP code words (24-bit words stored in 32-bit DWORDs)
-    //   +0x80C: total DSP state words
-    //   +0x818: start of concatenated code + state blocks
-    //   +0x818 + (codeWords + stateWords) * 4: XBOX_DSEFFECTIMAGEDESC { dwEffectCount, dwTotalScratchSize, aEffectMaps[...] }
+    // Parse the Xbox MCPX GP DSP effects image (e.g. dsstdfx.bin / nsidsp.bin) verified against
+    // CMcpxGPDspManager::ParseEffectImageInfo (0x006E3D30).
     const uint8_t* img = static_cast<const uint8_t*>(pvImageBuffer);
-    if (img && dwImageSize > 0x820u && reinterpret_cast<uintptr_t>(img) >= 0x00010000u) {
-        uint32_t codeWords  = *reinterpret_cast<const uint32_t*>(img + 0x804);
-        uint32_t stateWords = *reinterpret_cast<const uint32_t*>(img + 0x80C);
+    if (img && dwImageSize > 0x820u && reinterpret_cast<uintptr_t>(img) >= kMinValidHostAddress) {
+        uint32_t codeWords  = *reinterpret_cast<const uint32_t*>(img + 0x804u);
+        uint32_t stateWords = *reinterpret_cast<const uint32_t*>(img + 0x80Cu);
         uint64_t descOff64  = 0x818ULL + static_cast<uint64_t>(codeWords + stateWords) * 4ULL;
         if (descOff64 + 8ULL <= dwImageSize) {
             const XBOX_DSEFFECTIMAGEDESC* srcDesc = reinterpret_cast<const XBOX_DSEFFECTIMAGEDESC*>(img + descOff64);
@@ -1403,28 +1369,36 @@ static HRESULT __stdcall Bridge_IDirectSound_DownloadEffectsImage(
                 g_activeDspImageDesc = static_cast<XBOX_DSEFFECTIMAGEDESC*>(calloc(1, allocBytes));
                 memcpy(g_activeDspImageDesc, srcDesc, allocBytes);
 
-                uint32_t scratchSize = (srcDesc->dwTotalScratchSize > 0x4000u) ? srcDesc->dwTotalScratchSize : 0x10000u;
-                g_dspScratchMemory.assign(scratchSize + 0x8000u, 0);
-                uint8_t* stateBase = g_dspScratchMemory.data();
-                uint8_t* scratchBase = stateBase + 0x8000u;
+                static constexpr uint32_t kDspStateArenaSize = 0x84000u;
+                uint32_t minScratch = (srcDesc->dwTotalScratchSize > 0x10000u) ? srcDesc->dwTotalScratchSize : 0x40000u;
+                uint32_t scratchCap = 0x40000u;
+                while (scratchCap < minScratch && scratchCap < 0x1000000u) {
+                    scratchCap <<= 1u;
+                }
+                g_dspScratchMemory.assign(kDspStateArenaSize + scratchCap + 0x4000u, 0u);
+                uint8_t* stateBase   = g_dspScratchMemory.data();
+                uint8_t* scratchBase = stateBase + kDspStateArenaSize;
 
-                // Copy initial DSP effect state words from the image into our host state buffer
                 uint64_t stateImgOff = 0x818ULL + static_cast<uint64_t>(codeWords) * 4ULL;
                 uint64_t stateBytes  = static_cast<uint64_t>(stateWords) * 4ULL;
-                if (stateImgOff + stateBytes <= dwImageSize && stateBytes <= 0x8000u) {
+                if (stateImgOff + stateBytes <= dwImageSize && stateBytes <= kDspStateArenaSize) {
                     memcpy(stateBase, img + stateImgOff, static_cast<size_t>(stateBytes));
                 }
 
-                // Populate valid host pointers for each effect's state/scratch segments
-                for (uint32_t i = 0; i < fxCount; ++i) {
+                for (uint32_t i = 0u; i < fxCount; ++i) {
                     XBOX_DSEFFECTMAP& m = g_activeDspImageDesc->aEffectMaps[i];
                     uint32_t stOff = reinterpret_cast<uintptr_t>(m.lpvStateSegment) & 0x7FFFCu;
-                    uint32_t scOff = reinterpret_cast<uintptr_t>(m.lpvScratchSegment) & (scratchSize - 1u);
+                    if (m.dwStateSize <= kDspStateArenaSize && stOff + m.dwStateSize > kDspStateArenaSize) {
+                        stOff = 0u;
+                    }
+                    uint32_t scOff = reinterpret_cast<uintptr_t>(m.lpvScratchSegment) & (scratchCap - 1u);
+                    if (m.dwScratchSize <= scratchCap && scOff + m.dwScratchSize > scratchCap) {
+                        scOff = 0u;
+                    }
                     m.lpvStateSegment   = stateBase + stOff;
                     m.lpvScratchSegment = scratchBase + scOff;
                 }
 
-                // If the DSP image contains an I3DL2 Reverb state block, sync initial reverb parameters
                 if (ppImageDesc) {
                     *ppImageDesc = g_activeDspImageDesc;
                 }
@@ -1435,7 +1409,7 @@ static HRESULT __stdcall Bridge_IDirectSound_DownloadEffectsImage(
     }
 
     if (!g_activeDspImageDesc) {
-        g_activeDspImageDesc = static_cast<XBOX_DSEFFECTIMAGEDESC*>(calloc(1, 256));
+        g_activeDspImageDesc = static_cast<XBOX_DSEFFECTIMAGEDESC*>(calloc(1, 256u));
     }
     if (ppImageDesc) *ppImageDesc = g_activeDspImageDesc;
     LeaveCriticalSection(&g_audioCs);
@@ -1448,10 +1422,11 @@ static HRESULT __stdcall Bridge_IDirectSound_SetI3DL2Listener(
     XboxDSObject* pDS, const void* pI3DL2, DWORD dwFlags)
 {
     (void)pDS;
-    if (!pI3DL2 || reinterpret_cast<uintptr_t>(pI3DL2) < 0x00010000u) return S_OK;
+    if (!pI3DL2 || reinterpret_cast<uintptr_t>(pI3DL2) < kMinValidHostAddress) return S_OK;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
     const XBOX_DSI3DL2LISTENER* src = reinterpret_cast<const XBOX_DSI3DL2LISTENER*>(pI3DL2);
-    if ((dwFlags & 1u) != 0) { // DS3D_DEFERRED
+    if ((dwFlags & 1u) != 0u) { // DS3D_DEFERRED
         g_i3dl2ListenerDeferred = *src;
         g_hasDeferredI3DL2      = true;
     } else {
@@ -1465,6 +1440,7 @@ static HRESULT __stdcall Bridge_IDirectSound_SetI3DL2Listener(
 
 static HRESULT __stdcall Bridge_IDirectSound_CommitDeferredSettings(XboxDSObject* pDS) {
     (void)pDS;
+    EnsureAudioLockInitialized();
     EnterCriticalSection(&g_audioCs);
     if (g_hasDeferredI3DL2) {
         g_i3dl2Listener    = g_i3dl2ListenerDeferred;
@@ -1472,6 +1448,21 @@ static HRESULT __stdcall Bridge_IDirectSound_CommitDeferredSettings(XboxDSObject
     }
     LeaveCriticalSection(&g_audioCs);
     return S_OK;
+}
+
+void ShutdownXboxAudioBuffersLocked() {
+    for (size_t i = 0u; i < g_activeBuffers.size(); ++i) {
+        XboxDSBufferObject* b = g_activeBuffers[i];
+        if (b) {
+            b->status = 0u;
+        }
+    }
+    if (g_activeDspImageDesc) {
+        free(g_activeDspImageDesc);
+        g_activeDspImageDesc = nullptr;
+    }
+    g_dspScratchMemory.clear();
+    g_dspScratchMemory.shrink_to_fit();
 }
 
 void InitXboxAudioBuffers() {
