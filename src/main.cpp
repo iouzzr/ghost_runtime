@@ -1,5 +1,6 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
+#include "profiler.h"
 #include <vector>
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='x86' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -188,6 +189,7 @@ static LRESULT CALLBACK GhostWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_ACTIVATEAPP:
             if (!wParam) {
                 StopAllControllerVibration();
+                NotifyProfilerWindowFocusLost();
             }
             break;
         case WM_DEVICECHANGE:
@@ -216,12 +218,18 @@ static LRESULT CALLBACK GhostWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             if (msg == WM_SYSKEYDOWN && (wParam == VK_F4 || wParam == VK_SPACE)) {
                 break; // Preserve Alt+F4 and Alt+Space system menu shortcuts
             }
+            if (HandleProfilerWindowKeyMessage(hWnd, msg, wParam, lParam)) {
+                return 0;
+            }
             int vk = ResolveDistinguishedVk(wParam, lParam);
             PushDebugKeystroke(static_cast<uint16_t>(vk), 0, false);
             return 0;
         }
         case WM_KEYUP:
         case WM_SYSKEYUP: {
+            if (HandleProfilerWindowKeyMessage(hWnd, msg, wParam, lParam)) {
+                return 0;
+            }
             int vk = ResolveDistinguishedVk(wParam, lParam);
             PushDebugKeystroke(static_cast<uint16_t>(vk), 0, true);
             return 0;
@@ -535,6 +543,17 @@ static DWORD WINAPI XboxGameThreadProc(LPVOID) {
         callSite[0] = 0xE8; // CALL rel32
         *reinterpret_cast<uint32_t*>(callSite + 1) = rel;
         FlushInstructionCache(GetCurrentProcess(), callSite, 5u);
+    }
+
+    // Hook cProfiler::EndFrame call at the end of tSequence::MainLoop (0x0043C830 -> 0x0043C870)
+    // to snapshot all 46 native Ghost.exe profiler timers/counters right before EndFrame resets them.
+    {
+        uint8_t* profCallSite = reinterpret_cast<uint8_t*>(ADDR_MAINLOOP_ENDFRAME_CALL);
+        if (profCallSite[0] == 0xE8u) {
+            uint32_t rel = reinterpret_cast<uintptr_t>(&Bridge_ProfilerEndFrame) - (ADDR_MAINLOOP_ENDFRAME_CALL + 5u);
+            *reinterpret_cast<uint32_t*>(profCallSite + 1) = rel;
+            FlushInstructionCache(GetCurrentProcess(), profCallSite, 5u);
+        }
     }
 
     // Run native Xbox CRT initializers (__rtinit, _cinit) and native _main (0x00435460)

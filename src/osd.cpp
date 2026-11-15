@@ -1,4 +1,5 @@
 #include "ghost_runtime.h"
+#include "profiler.h"
 #include "xbox_d3d8_types.h"
 #include <d3d11.h>
 #include <vector>
@@ -11,18 +12,61 @@ volatile bool  g_osdShowFps    = false;
 volatile float g_osdCurrentFps = 0.0f;
 
 enum : UINT_PTR {
-    IDM_SYS_VIEW_FPS = 0x1020,
-    IDT_OSD_FPS_TICK = 1,
+    IDM_SYS_VIEW_FPS   = 0x1020,
+    IDM_SYS_PERF_PANEL = 0x1030,
+    IDM_SYS_PROF_DUMP  = 0x1040,
+    IDT_OSD_FPS_TICK   = 1,
 };
 
-static ID3D11Texture2D*          g_osdTex           = nullptr;
-static ID3D11ShaderResourceView* g_osdSRV           = nullptr;
-static ID3D11Buffer*             g_osdVB            = nullptr;
-static ID3D11Buffer*             g_osdCB            = nullptr;
-static uint32_t                  g_osdTexW          = 0;
-static uint32_t                  g_osdTexH          = 0;
-static wchar_t                   g_lastOsdText[256] = { 0 };
-static HFONT                     g_hOsdFont         = nullptr;
+static ID3D11Device*             g_osdBoundDevice        = nullptr;
+static ID3D11Texture2D*          g_osdTex                = nullptr;
+static ID3D11ShaderResourceView* g_osdSRV                = nullptr;
+static ID3D11Buffer*             g_osdVB                 = nullptr;
+static ID3D11Buffer*             g_osdCB                 = nullptr;
+static uint32_t                  g_osdTexW               = 0;
+static uint32_t                  g_osdTexH               = 0;
+static wchar_t                   g_lastOsdText[256]      = { 0 };
+static HFONT                     g_hOsdFont              = nullptr;
+
+static ID3D11Texture2D*          g_perfTex               = nullptr;
+static ID3D11ShaderResourceView* g_perfSRV               = nullptr;
+static uint32_t                  g_perfTexW              = 0;
+static uint32_t                  g_perfTexH              = 0;
+static HFONT                     g_hPerfFont             = nullptr;
+static DWORD                     g_lastPerfRefreshTick   = 0;
+static bool                      g_lastPerfWasFullPanel  = false;
+static wchar_t                   g_lastPerfToastText[192]= { 0 };
+static wchar_t                   g_lastPerfPanelText[2560]= { 0 };
+
+static void EnsureOsdDeviceMatch() {
+    if (g_osdBoundDevice == g_d3dDevice) return;
+    if (g_osdSRV)  { g_osdSRV->Release();  g_osdSRV  = nullptr; }
+    if (g_osdTex)  { g_osdTex->Release();  g_osdTex  = nullptr; }
+    if (g_perfSRV) { g_perfSRV->Release(); g_perfSRV = nullptr; }
+    if (g_perfTex) { g_perfTex->Release(); g_perfTex = nullptr; }
+    if (g_osdVB)   { g_osdVB->Release();   g_osdVB   = nullptr; }
+    if (g_osdCB)   { g_osdCB->Release();   g_osdCB   = nullptr; }
+    g_osdTexW              = 0;
+    g_osdTexH              = 0;
+    g_perfTexW             = 0;
+    g_perfTexH             = 0;
+    g_lastOsdText[0]       = L'\0';
+    g_lastPerfPanelText[0] = L'\0';
+    g_lastPerfToastText[0] = L'\0';
+    g_osdBoundDevice       = g_d3dDevice;
+}
+
+void SyncOsdSystemMenuCheckmarks(HWND hWnd) {
+    if (!hWnd) return;
+    HMENU hSysMenu = GetSystemMenu(hWnd, FALSE);
+    if (!hSysMenu) return;
+    CheckMenuItem(
+        hSysMenu, IDM_SYS_VIEW_FPS,
+        MF_BYCOMMAND | (g_osdShowFps ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(
+        hSysMenu, IDM_SYS_PERF_PANEL,
+        MF_BYCOMMAND | (g_osdShowPerfPanel ? MF_CHECKED : MF_UNCHECKED));
+}
 
 void InitOsdWindowHooks(HWND hWnd) {
     if (!hWnd) return;
@@ -32,20 +76,32 @@ void InitOsdWindowHooks(HWND hWnd) {
             hSysMenu, SC_CLOSE,
             MF_BYCOMMAND | MF_STRING | (g_osdShowFps ? MF_CHECKED : MF_UNCHECKED),
             IDM_SYS_VIEW_FPS, L"&FPS");
+        InsertMenuW(
+            hSysMenu, SC_CLOSE,
+            MF_BYCOMMAND | MF_STRING | (g_osdShowPerfPanel ? MF_CHECKED : MF_UNCHECKED),
+            IDM_SYS_PERF_PANEL, L"&Performance Panel\tF3");
+        InsertMenuW(
+            hSysMenu, SC_CLOSE,
+            MF_BYCOMMAND | MF_STRING,
+            IDM_SYS_PROF_DUMP, L"Save Profile &Snapshot\tF10");
         InsertMenuW(hSysMenu, SC_CLOSE, MF_BYCOMMAND | MF_SEPARATOR, 0, nullptr);
     }
     SetTimer(hWnd, IDT_OSD_FPS_TICK, 500, nullptr);
 }
 
 bool HandleOsdSysCommand(HWND hWnd, WPARAM wParam) {
-    if ((wParam & 0xFFF0) == IDM_SYS_VIEW_FPS) {
+    UINT_PTR cmd = (wParam & 0xFFF0u);
+    if (cmd == IDM_SYS_VIEW_FPS) {
         g_osdShowFps = !g_osdShowFps;
-        HMENU hSysMenu = GetSystemMenu(hWnd, FALSE);
-        if (hSysMenu) {
-            CheckMenuItem(
-                hSysMenu, IDM_SYS_VIEW_FPS,
-                MF_BYCOMMAND | (g_osdShowFps ? MF_CHECKED : MF_UNCHECKED));
-        }
+        SyncOsdSystemMenuCheckmarks(hWnd);
+        return true;
+    }
+    if (cmd == IDM_SYS_PERF_PANEL) {
+        TogglePerfPanel(hWnd);
+        return true;
+    }
+    if (cmd == IDM_SYS_PROF_DUMP) {
+        TriggerProfileSnapshotDump();
         return true;
     }
     return false;
@@ -209,19 +265,228 @@ static void UpdateOsdTexture(const wchar_t* text) {
     DeleteDC(hdc);
 }
 
+static void UpdatePerfPanelTexture(const wchar_t* text, bool isToastOnly) {
+    if (!g_d3dDevice || !g_d3dCtx || !text || !text[0]) return;
+    if (!g_hPerfFont) {
+        g_hPerfFont = CreateFontW(
+            -11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+            FIXED_PITCH | FF_MODERN, L"Consolas");
+        if (!g_hPerfFont) {
+            g_hPerfFont = CreateFontW(
+                -11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                FIXED_PITCH | FF_MODERN, L"Courier New");
+        }
+    }
+
+    HDC hdcScreen = GetDC(nullptr);
+    HDC hdc = CreateCompatibleDC(hdcScreen);
+    ReleaseDC(nullptr, hdcScreen);
+    if (!hdc) return;
+
+    HGDIOBJ oldFont = SelectObject(hdc, g_hPerfFont);
+    RECT rcCalc = { 0, 0, 620, 460 };
+    DrawTextW(hdc, text, -1, &rcCalc, DT_CALCRECT | DT_LEFT | DT_TOP | DT_NOPREFIX);
+
+    uint32_t w = static_cast<uint32_t>((rcCalc.right - rcCalc.left) + 16);
+    uint32_t h = static_cast<uint32_t>((rcCalc.bottom - rcCalc.top) + 10);
+    if (w < 32u)  w = 32u;
+    if (w > 626u) w = 626u;
+    if (h < 18u)  h = 18u;
+    if (h > 466u) h = 466u;
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = static_cast<LONG>(w);
+    bmi.bmiHeader.biHeight      = -static_cast<LONG>(h); // top-down DIB
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* dibBits = nullptr;
+    HBITMAP hbm = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
+    if (hbm && dibBits) {
+        HGDIOBJ oldBm = SelectObject(hdc, hbm);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(255, 255, 255));
+
+        uint32_t numPx = w * h;
+        std::vector<uint8_t> shadowMask(numPx, 0);
+        std::vector<uint8_t> glyphMask(numPx, 0);
+
+        // 1. Render 1px drop-shadow mask at (+9, +6)
+        memset(dibBits, 0, numPx * 4);
+        RECT rcShadow = { 9, 6, static_cast<LONG>(w), static_cast<LONG>(h) };
+        DrawTextW(hdc, text, -1, &rcShadow, DT_LEFT | DT_TOP | DT_NOPREFIX);
+        GdiFlush();
+        const uint32_t* px = reinterpret_cast<const uint32_t*>(dibBits);
+        for (uint32_t i = 0; i < numPx; ++i) {
+            uint8_t r = static_cast<uint8_t>((px[i] >> 16) & 0xFF);
+            uint8_t g = static_cast<uint8_t>((px[i] >> 8)  & 0xFF);
+            uint8_t b = static_cast<uint8_t>(px[i] & 0xFF);
+            uint8_t m = r > g ? r : g;
+            shadowMask[i] = m > b ? m : b;
+        }
+
+        // 2. Render crisp foreground glyph mask at (+8, +5)
+        memset(dibBits, 0, numPx * 4);
+        RECT rcGlyph = { 8, 5, static_cast<LONG>(w) - 1, static_cast<LONG>(h) - 1 };
+        DrawTextW(hdc, text, -1, &rcGlyph, DT_LEFT | DT_TOP | DT_NOPREFIX);
+        GdiFlush();
+        for (uint32_t i = 0; i < numPx; ++i) {
+            uint8_t r = static_cast<uint8_t>((px[i] >> 16) & 0xFF);
+            uint8_t g = static_cast<uint8_t>((px[i] >> 8)  & 0xFF);
+            uint8_t b = static_cast<uint8_t>(px[i] & 0xFF);
+            uint8_t m = r > g ? r : g;
+            glyphMask[i] = m > b ? m : b;
+        }
+
+        bool isSavedToast = (wcsncmp(text, L"[F10] Saved", 11) == 0);
+        TEXTMETRICW tm = {};
+        GetTextMetricsW(hdc, &tm);
+        const uint32_t headerEndY = static_cast<uint32_t>(5 + ((tm.tmHeight > 0) ? tm.tmHeight : 13));
+
+        // 3. Composite high-contrast dark slate panel + subtle border + shadow + bright glyphs
+        std::vector<uint32_t> outBgra(numPx, 0);
+        for (uint32_t y = 0; y < h; ++y) {
+            bool isHeaderRow = (!isToastOnly && y < headerEndY);
+            float fgR = 236.0f, fgG = 243.0f, fgB = 252.0f;
+            if (isToastOnly) {
+                if (isSavedToast) {
+                    fgR = 140.0f; fgG = 250.0f; fgB = 180.0f;
+                } else {
+                    fgR = 255.0f; fgG = 195.0f; fgB = 135.0f;
+                }
+            } else if (isHeaderRow) {
+                fgR = 135.0f; fgG = 225.0f; fgB = 255.0f;
+            }
+
+            for (uint32_t x = 0; x < w; ++x) {
+                uint32_t dx = (x < 3u) ? (2u - x) : ((x >= w - 3u) ? (x - (w - 3u)) : 0u);
+                uint32_t dy = (y < 3u) ? (2u - y) : ((y >= h - 3u) ? (y - (h - 3u)) : 0u);
+                bool insidePill = (dx + dy <= 2u);
+                bool isBorder = insidePill && (dx + dy == 2u || x == 0u || x == w - 1u || y == 0u || y == h - 1u);
+
+                uint32_t idx = y * w + x;
+                float baseR = isBorder ? 58.0f : 10.0f;
+                float baseG = isBorder ? 82.0f : 14.0f;
+                float baseB = isBorder ? 114.0f : 20.0f;
+                float bgA   = insidePill ? (isBorder ? (225.0f / 255.0f) : (206.0f / 255.0f)) : 0.0f;
+                float shA   = shadowMask[idx] * (1.0f / 255.0f);
+                float fgA   = glyphMask[idx]  * (1.0f / 255.0f);
+
+                float r = baseR * (1.0f - shA);
+                float g = baseG * (1.0f - shA);
+                float b = baseB * (1.0f - shA);
+                float a = bgA + shA * (1.0f - bgA);
+
+                r = r * (1.0f - fgA) + fgR * fgA;
+                g = g * (1.0f - fgA) + fgG * fgA;
+                b = b * (1.0f - fgA) + fgB * fgA;
+                a = a + fgA * (1.0f - a);
+
+                uint32_t outR = static_cast<uint32_t>(r + 0.5f); if (outR > 255u) outR = 255u;
+                uint32_t outG = static_cast<uint32_t>(g + 0.5f); if (outG > 255u) outG = 255u;
+                uint32_t outB = static_cast<uint32_t>(b + 0.5f); if (outB > 255u) outB = 255u;
+                uint32_t outA = static_cast<uint32_t>(a * 255.0f + 0.5f); if (outA > 255u) outA = 255u;
+
+                outBgra[idx] = (outA << 24) | (outR << 16) | (outG << 8) | outB;
+            }
+        }
+
+        if (!g_perfTex || g_perfTexW != w || g_perfTexH != h) {
+            if (g_perfSRV) { g_perfSRV->Release(); g_perfSRV = nullptr; }
+            if (g_perfTex) { g_perfTex->Release(); g_perfTex = nullptr; }
+            g_perfTexW = w;
+            g_perfTexH = h;
+
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width            = w;
+            td.Height           = h;
+            td.MipLevels        = 1;
+            td.ArraySize        = 1;
+            td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage            = D3D11_USAGE_DEFAULT;
+            td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+            D3D11_SUBRESOURCE_DATA initData = {};
+            initData.pSysMem     = outBgra.data();
+            initData.SysMemPitch = w * 4;
+            if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &initData, &g_perfTex))) {
+                g_d3dDevice->CreateShaderResourceView(g_perfTex, nullptr, &g_perfSRV);
+            }
+        } else {
+            g_d3dCtx->UpdateSubresource(g_perfTex, 0, nullptr, outBgra.data(), w * 4, 0);
+        }
+
+        SelectObject(hdc, oldBm);
+        DeleteObject(hbm);
+    }
+
+    SelectObject(hdc, oldFont);
+    DeleteDC(hdc);
+}
+
 void DrawOsdOverlayOnTarget(ID3D11RenderTargetView* targetRtv, float targetW, float targetH, bool backupState) {
-    if (!g_osdShowFps || !targetRtv || targetW <= 0.0f || targetH <= 0.0f) return;
+    if (!targetRtv || targetW <= 0.0f || targetH <= 0.0f) return;
+
+    wchar_t toastText[192] = {};
+    const bool showFullPerf = g_osdShowPerfPanel;
+    const bool hasToast     = GetActivePerfToastTextW(toastText, 192u);
+    const bool showPerfBox  = showFullPerf || hasToast;
+    const bool showFpsBadge = g_osdShowFps;
+
+    if (!hasToast && g_lastPerfToastText[0] != L'\0') {
+        g_lastPerfToastText[0] = L'\0';
+    }
+
+    if (!showPerfBox && !showFpsBadge) return;
+
     ID3D11PixelShader* osdPS = GetPixelShaderPermutation(0u);
     if (!g_d3dDevice || !g_d3dCtx || !g_vs || !osdPS || !g_inputLayout) return;
 
-    wchar_t curText[64];
-    swprintf(curText, 64, L"%.1f FPS", g_osdCurrentFps);
+    EnsureOsdDeviceMatch();
 
-    if (wcscmp(curText, g_lastOsdText) != 0 || !g_osdSRV) {
-        wcscpy_s(g_lastOsdText, curText);
-        UpdateOsdTexture(curText);
+    if (showFpsBadge) {
+        wchar_t curText[64];
+        swprintf(curText, 64, L"%.1f FPS", g_osdCurrentFps);
+        if (wcscmp(curText, g_lastOsdText) != 0 || !g_osdSRV) {
+            wcscpy_s(g_lastOsdText, curText);
+            UpdateOsdTexture(curText);
+        }
     }
-    if (!g_osdSRV || g_osdTexW == 0 || g_osdTexH == 0) return;
+
+    if (showPerfBox) {
+        DWORD nowTick     = GetTickCount();
+        bool modeChanged  = (showFullPerf != g_lastPerfWasFullPanel);
+        bool toastChanged = (wcscmp(toastText, g_lastPerfToastText) != 0);
+        bool dueRefresh   = !g_perfSRV || modeChanged || toastChanged ||
+                            (showFullPerf && (nowTick - g_lastPerfRefreshTick) >= 250u);
+
+        if (dueRefresh) {
+            g_lastPerfWasFullPanel = showFullPerf;
+            wcscpy_s(g_lastPerfToastText, toastText);
+            g_lastPerfRefreshTick = nowTick;
+
+            wchar_t panelBuf[2560] = {};
+            if (showFullPerf) {
+                FormatPerfPanelTextW(panelBuf, 2560u);
+            } else {
+                wcscpy_s(panelBuf, toastText);
+            }
+
+            if (panelBuf[0] != L'\0' && (modeChanged || wcscmp(panelBuf, g_lastPerfPanelText) != 0 || !g_perfSRV)) {
+                wcscpy_s(g_lastPerfPanelText, panelBuf);
+                UpdatePerfPanelTexture(panelBuf, !showFullPerf);
+            }
+        }
+    }
+
+    const bool canDrawPerf = showPerfBox && g_perfSRV && g_perfTexW > 0 && g_perfTexH > 0;
+    const bool canDrawFps  = showFpsBadge && g_osdSRV && g_osdTexW > 0 && g_osdTexH > 0;
+    if (!canDrawPerf && !canDrawFps) return;
 
     if (!g_osdVB) {
         D3D11_BUFFER_DESC bd = {};
@@ -246,23 +511,6 @@ void DrawOsdOverlayOnTarget(ID3D11RenderTargetView* targetRtv, float targetW, fl
         stateBackup.Capture(g_d3dCtx);
     } else {
         InvalidateD3D11ShadowState();
-    }
-
-    float x0 = targetW - static_cast<float>(g_osdTexW) - 8.0f;
-    float y0 = 8.0f;
-    float x1 = x0 + static_cast<float>(g_osdTexW);
-    float y1 = y0 + static_cast<float>(g_osdTexH);
-
-    UnifiedVertex quad[4] = {};
-    quad[0] = { x0, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 0.0f, 0,0, 0,0, 0,0 };
-    quad[1] = { x1, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 0.0f, 0,0, 0,0, 0,0 };
-    quad[2] = { x0, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 1.0f, 0,0, 0,0, 0,0 };
-    quad[3] = { x1, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 1.0f, 0,0, 0,0, 0,0 };
-
-    D3D11_MAPPED_SUBRESOURCE mappedVB = {};
-    if (SUCCEEDED(g_d3dCtx->Map(g_osdVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
-        memcpy(mappedVB.pData, quad, sizeof(quad));
-        g_d3dCtx->Unmap(g_osdVB, 0);
     }
 
     PerDrawCBData cb = {};
@@ -316,12 +564,34 @@ void DrawOsdOverlayOnTarget(ID3D11RenderTargetView* targetRtv, float targetW, fl
     g_d3dCtx->PSSetShader(osdPS, nullptr, 0);
     g_d3dCtx->PSSetConstantBuffers(0, 1, &g_osdCB);
 
-    ID3D11ShaderResourceView* srvs[4] = { g_osdSRV, nullptr, nullptr, nullptr };
-    ID3D11SamplerState*       smps[4] = { smp, smp, smp, smp };
-    g_d3dCtx->PSSetShaderResources(0, 4, srvs);
+    ID3D11SamplerState* smps[4] = { smp, smp, smp, smp };
     g_d3dCtx->PSSetSamplers(0, 4, smps);
 
-    g_d3dCtx->Draw(4, 0);
+    auto drawQuad = [&](ID3D11ShaderResourceView* srv, float x0, float y0, uint32_t tw, uint32_t th) {
+        float x1 = x0 + static_cast<float>(tw);
+        float y1 = y0 + static_cast<float>(th);
+        UnifiedVertex quad[4] = {};
+        quad[0] = { x0, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 0.0f, 0,0, 0,0, 0,0 };
+        quad[1] = { x1, y0, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 0.0f, 0,0, 0,0, 0,0 };
+        quad[2] = { x0, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 0.0f, 1.0f, 0,0, 0,0, 0,0 };
+        quad[3] = { x1, y1, 0.0f, 1.0f, 0,0,1, 1,1,1,1, 1.0f, 1.0f, 0,0, 0,0, 0,0 };
+
+        D3D11_MAPPED_SUBRESOURCE mappedVB = {};
+        if (SUCCEEDED(g_d3dCtx->Map(g_osdVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB))) {
+            memcpy(mappedVB.pData, quad, sizeof(quad));
+            g_d3dCtx->Unmap(g_osdVB, 0);
+            ID3D11ShaderResourceView* srvs[4] = { srv, nullptr, nullptr, nullptr };
+            g_d3dCtx->PSSetShaderResources(0, 4, srvs);
+            g_d3dCtx->Draw(4, 0);
+        }
+    };
+
+    if (canDrawPerf) {
+        drawQuad(g_perfSRV, 6.0f, 6.0f, g_perfTexW, g_perfTexH);
+    }
+    if (canDrawFps) {
+        drawQuad(g_osdSRV, targetW - static_cast<float>(g_osdTexW) - 8.0f, 8.0f, g_osdTexW, g_osdTexH);
+    }
 
     ID3D11ShaderResourceView* nullSrv = nullptr;
     g_d3dCtx->PSSetShaderResources(0, 1, &nullSrv);

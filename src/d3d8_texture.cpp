@@ -1,6 +1,7 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
+#include "profiler.h"
 #include <d3d11.h>
 #include <algorithm>
 #include <atomic>
@@ -1214,6 +1215,16 @@ static void UploadXboxTextureToD3D11(CachedTexture& entry, const XboxPixelContai
         : ((size_t)(linearPitch ? linearPitch : (w * bpp)) * h);
     if (baseSliceBytes > maxReadable) return;
 
+    struct TexUploadPerfScope {
+        int64_t  t0;
+        uint32_t bytes;
+        ~TexUploadPerfScope() {
+            g_perfAccum.texUploadTicks += (PerfQpcNow() - t0);
+            ++g_perfAccum.texUploadCount;
+            g_perfAccum.texUploadBytes += bytes;
+        }
+    } uploadPerfScope = { PerfQpcNow(), entry.exactByteSize };
+
     uint32_t baseLogW = (pTex->Format >> 20) & 0x0Fu;
     uint32_t baseLogH = (pTex->Format >> 24) & 0x0Fu;
     uint32_t baseLogD = isVolume ? ((pTex->Format >> 28) & 0x0Fu) : 0u;
@@ -1919,6 +1930,13 @@ ID3D11ShaderResourceView* GetOrCreateD3D11SRV(
     if (outIsVolume) *outIsVolume = false;
     if (outIsDepth)  *outIsDepth  = false;
     if (!pTex || !pTex->Data || static_cast<uintptr_t>(pTex->Data) < kMinValidHostAddress) return nullptr;
+    struct SrvResolvePerfScope {
+        int64_t t0;
+        ~SrvResolvePerfScope() {
+            g_perfAccum.srvResolveTicks += (PerfQpcNow() - t0);
+            ++g_perfAccum.srvResolveCalls;
+        }
+    } srvPerfScope = { PerfQpcNow() };
     if (g_d3dDevice && g_texRenderThreadId == 0u) g_texRenderThreadId = GetCurrentThreadId();
     DrainPendingTextureEvictions();
 
@@ -2413,6 +2431,7 @@ static void FlushRemainingGpuDirtySubresourcesToUma(CachedTexture& c, uint32_t d
             if (subIdx < 64u && ((c.gpuDirtySubresMask & (1ULL << subIdx)) != 0ULL)) {
                 ID3D11Texture2D* staging = GetOrCreateReadbackStagingTex(mipW, mipH);
                 if (staging) {
+                    const int64_t tRbk0 = PerfQpcNow();
                     g_d3dCtx->CopySubresourceRegion(staging, 0u, 0u, 0u, 0u, c.tex2D, subIdx, nullptr);
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
                     if (SUCCEEDED(g_d3dCtx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
@@ -2425,6 +2444,7 @@ static void FlushRemainingGpuDirtySubresourcesToUma(CachedTexture& c, uint32_t d
                         g_d3dCtx->Unmap(staging, 0u);
                         c.gpuDirtySubresMask &= ~(1ULL << subIdx);
                     }
+                    g_perfAccum.gpuReadbackTicks += (PerfQpcNow() - tRbk0);
                 }
             }
             mipOff += cIsSwizzled
@@ -2560,6 +2580,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
         if (!g_backBufferCpuDirty || !g_backBufferTex || level != 0u) return;
         ID3D11Texture2D* staging = GetOrCreateReadbackStagingTex(640u, 480u);
         if (!staging) return;
+        const int64_t tRbk0 = PerfQpcNow();
         g_d3dCtx->CopySubresourceRegion(staging, 0u, 0u, 0u, 0u, g_backBufferTex, 0u, nullptr);
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         if (SUCCEEDED(g_d3dCtx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
@@ -2571,6 +2592,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
             g_d3dCtx->Unmap(staging, 0u);
             g_backBufferCpuDirty = false;
         }
+        g_perfAccum.gpuReadbackTicks += (PerfQpcNow() - tRbk0);
         return;
     }
 
@@ -2581,6 +2603,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
         if (ds.dataPtr == pSurf->Data && ds.width == w && ds.height == h) {
             ID3D11Texture2D* staging = GetOrCreateDepthStagingTex(ds.width, ds.height);
             if (!staging) return;
+            const int64_t tRbk0 = PerfQpcNow();
             g_d3dCtx->CopySubresourceRegion(staging, 0u, 0u, 0u, 0u, ds.tex, 0u, nullptr);
             D3D11_MAPPED_SUBRESOURCE mapped = {};
             if (SUCCEEDED(g_d3dCtx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
@@ -2592,6 +2615,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
                 g_d3dCtx->Unmap(staging, 0u);
                 ds.gpuDirty = false;
             }
+            g_perfAccum.gpuReadbackTicks += (PerfQpcNow() - tRbk0);
             return;
         }
     }
@@ -2601,6 +2625,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
         if (!g_mainDepthCpuDirty || !g_depthTex || level != 0u) return;
         ID3D11Texture2D* staging = GetOrCreateDepthStagingTex(640u, 480u);
         if (!staging) return;
+        const int64_t tRbk0 = PerfQpcNow();
         g_d3dCtx->CopySubresourceRegion(staging, 0u, 0u, 0u, 0u, g_depthTex, 0u, nullptr);
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         if (SUCCEEDED(g_d3dCtx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
@@ -2614,6 +2639,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
             g_d3dCtx->Unmap(staging, 0u);
             g_mainDepthCpuDirty = false;
         }
+        g_perfAccum.gpuReadbackTicks += (PerfQpcNow() - tRbk0);
         return;
     }
 
@@ -2679,6 +2705,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
 
         ID3D11Texture2D* staging = GetOrCreateReadbackStagingTex(mipW, mipH);
         if (!staging) return;
+        const int64_t tRbk0 = PerfQpcNow();
         g_d3dCtx->CopySubresourceRegion(staging, 0u, 0u, 0u, 0u, c.tex2D, subIdx, nullptr);
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         if (SUCCEEDED(g_d3dCtx->Map(staging, 0u, D3D11_MAP_READ, 0u, &mapped))) {
@@ -2696,6 +2723,7 @@ void SyncSurfaceFromGpuIfNeeded(XboxPixelContainer* pSurf, uint32_t level) {
             c.contentHash = ComputeFastSampleHash(
                 reinterpret_cast<const void*>(c.dataPtr), c.exactByteSize, c.maxReadableBytes);
         }
+        g_perfAccum.gpuReadbackTicks += (PerfQpcNow() - tRbk0);
     }
 }
 
@@ -2713,6 +2741,7 @@ static void __stdcall Bridge_D3DDevice_SetTexture(DWORD Stage, XboxPixelContaine
 static void ApplyRenderTargetInternal(
     XboxPixelContainer* pRenderTarget, XboxPixelContainer* pZStencil, bool resetViewport)
 {
+    ++g_perfAccum.rtSwitchCount;
     typedef void     (__stdcall *PFN_InternalAddRefSurface)(XboxPixelContainer*);
     typedef void     (__stdcall *PFN_InternalReleaseSurface)(XboxPixelContainer*);
     typedef uint32_t (__stdcall *PFN_GetPitch)(XboxPixelContainer*);

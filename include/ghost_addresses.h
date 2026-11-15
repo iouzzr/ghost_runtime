@@ -52,6 +52,12 @@ static constexpr uint32_t  ADDR_ACTIVE_CAMERA_PTR              = 0x0088CD6Cu; //
 static constexpr uint32_t  ADDR_CUR_MODEL_INST_PTR             = 0x008ACC30u; // Current cModelInstance*
 static constexpr uint32_t  ADDR_CUR_BONE_MATS_PTR              = 0x008ACC34u; // Current bone matrix palette pointer
 
+// --- StarCraft: Ghost Built-in Timing & cProfiler (stdProfiler.cpp / Sequence.cpp) ---
+static constexpr uint32_t  ADDR_STD_TIME                       = 0x008803C0u; // ?stdTime@@3VtStdTime@@A (+0x0C = int ms delta, +0x14 = QPC->ms float)
+static constexpr uint32_t  ADDR_STD_PROFILER_PTR               = 0x00880438u; // ?stdProfiler_pProfile@@3PAVcProfiler@@A
+static constexpr uint32_t  ADDR_MAINLOOP_ENDFRAME_CALL         = 0x0043C830u; // CALL ?EndFrame@cProfiler@@QAEXXZ inside tSequence::MainLoop
+static constexpr uint32_t  ADDR_PROFILER_ENDFRAME_FN           = 0x0043C870u; // ?EndFrame@cProfiler@@QAEXXZ
+
 // --- cDivxVideo (.vid Movie Player in VIDPlayerXB.obj) ---
 static constexpr uint32_t  kAddrDivxVideoFrameMove             = 0x0043DE80u; // ?FrameMove@cDivxVideo@@QAEJXZ
 static constexpr uint32_t  kAddrDivxVideoRender                = 0x0043DEE0u; // ?Render@cDivxVideo@@QAEJXZ

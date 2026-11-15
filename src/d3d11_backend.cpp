@@ -1,6 +1,7 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
+#include "profiler.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
@@ -972,6 +973,7 @@ static void RecycleVisibilityQueryObject(ID3D11Query* q) {
 
 static HRESULT __stdcall Bridge_D3DDevice_BeginVisibilityTest() {
     if (!g_d3dDevice || !g_d3dCtx) return S_OK;
+    ++g_perfAccum.visBeginCount;
     if (g_activeVisQuery) {
         g_d3dCtx->End(g_activeVisQuery);
         RecycleVisibilityQueryObject(g_activeVisQuery);
@@ -1007,30 +1009,39 @@ static HRESULT __stdcall Bridge_D3DDevice_GetVisibilityTestResult(
     DWORD Index, UINT* pResult, uint64_t* pTime)
 {
     static constexpr HRESULT kXboxD3DErrTestIncomplete = static_cast<HRESULT>(0x8876086Au);
+    ++g_perfAccum.visGetResultCount;
     uint32_t slotIdx = Index % kMaxXboxVisibilityQueries;
     XboxVisibilityQuerySlot& slot = g_visQuerySlots[slotIdx];
 
     if (!slot.query || !g_d3dCtx) {
+        ++g_perfAccum.visIncompleteCount;
         return kXboxD3DErrTestIncomplete;
     }
 
     uintptr_t flagsOrTimePtr = reinterpret_cast<uintptr_t>(pTime);
     bool waitForResult = (flagsOrTimePtr == 1u); // D3DVISIBILITY_WAIT
+    if (waitForResult) {
+        ++g_perfAccum.visWaitCallCount;
+    }
 
     if (slot.pending) {
+        int64_t tVis0 = PerfQpcNow();
         uint64_t passed = 0;
         UINT getDataFlags = waitForResult ? 0u : D3D11_ASYNC_GETDATA_DONOTFLUSH;
         HRESULT hr = g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), getDataFlags);
         if (hr == S_FALSE && waitForResult) {
             for (int spin = 0; spin < 5000 && hr == S_FALSE; ++spin) {
+                ++g_perfAccum.visSpinCount;
                 SwitchToThread();
                 hr = g_d3dCtx->GetData(slot.query, &passed, sizeof(passed), 0);
             }
         }
+        g_perfAccum.visWaitTicks += (PerfQpcNow() - tVis0);
         if (hr == S_OK) {
             slot.lastPixelsPassed = (passed > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : static_cast<UINT>(passed);
             slot.pending = false;
         } else if (hr == S_FALSE && !waitForResult) {
+            ++g_perfAccum.visIncompleteCount;
             return kXboxD3DErrTestIncomplete;
         } else {
             slot.pending = false;
@@ -1330,6 +1341,7 @@ static void __stdcall Bridge_D3DDevice_Clear(
     bool isPartialChannel = (targetMask != 0u && targetMask != 0x000000F0u);
 
     if (isFullRect && !isPartialChannel) {
+        ++g_perfAccum.clearFastCount;
         if (targetMask && rtv) {
             float rgba[4];
             UnpackD3DColor(Color, &rgba[0], &rgba[1], &rgba[2], &rgba[3]);
@@ -1349,6 +1361,7 @@ static void __stdcall Bridge_D3DDevice_Clear(
     // Sub-rectangle, sub-viewport, scissored, or partial-channel clear via screen-space quad draw
     ID3D11PixelShader* clearPS = GetPixelShaderPermutation(0u);
     if (!g_vs || !clearPS || !g_inputLayout) return;
+    ++g_perfAccum.clearQuadCount;
 
     if (Count == 0 || !rects) {
         rects = &vpDefaultRect;
@@ -1576,12 +1589,22 @@ static DWORD __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
     DrainPendingTextureEvictions();
     DrainPendingGpuBufferEvictions();
 
+    float    gpuFrameMs       = 0.0f;
+    bool     gpuQueryValid    = false;
+    uint32_t gpuDisjointCount = 0u;
+
     if (g_d3dCtx) {
         D3D11StateBackup stateBackup(g_d3dCtx);
+        int64_t tComp0 = PerfQpcNow();
         CompositePresentToSwapChain();
         // [P2-2] Pass backupState = false to avoid a redundant nested D3D11StateBackup
         DrawOsdOverlayOnTarget(g_swapChainRTV ? g_swapChainRTV : g_rtv, 640.0f, 480.0f, false);
+        g_perfAccum.compositeOsdTicks += (PerfQpcNow() - tComp0);
+
+        EndAndPollGpuFrameTimestamp(&gpuFrameMs, &gpuQueryValid, &gpuDisjointCount);
+
         if (g_swapChain) {
+            int64_t tPres0 = PerfQpcNow();
             BOOL isFullscreen = FALSE;
             if (g_swapChainFlipModel && g_swapChainAllowTearing) {
                 g_swapChain->GetFullscreenState(&isFullscreen, nullptr);
@@ -1589,6 +1612,7 @@ static DWORD __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
             UINT presentFlags = (g_swapChainFlipModel && g_swapChainAllowTearing && !isFullscreen)
                                 ? DXGI_PRESENT_ALLOW_TEARING : 0u;
             g_swapChain->Present(0u, presentFlags);
+            g_perfAccum.presentTicks += (PerfQpcNow() - tPres0);
         }
         if (g_rtv && g_dsv) {
             if (stateBackup.rtv) { stateBackup.rtv->Release(); stateBackup.rtv = nullptr; }
@@ -1598,7 +1622,9 @@ static DWORD __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
         }
         stateBackup.Restore();
         InvalidateD3D11ShadowState();
+        BeginGpuFrameTimestampIfReady();
     } else if (g_swapChain) {
+        int64_t tPres0 = PerfQpcNow();
         BOOL isFullscreen = FALSE;
         if (g_swapChainFlipModel && g_swapChainAllowTearing) {
             g_swapChain->GetFullscreenState(&isFullscreen, nullptr);
@@ -1606,9 +1632,15 @@ static DWORD __stdcall Bridge_D3DDevice_Swap(DWORD Flags) {
         UINT presentFlags = (g_swapChainFlipModel && g_swapChainAllowTearing && !isFullscreen)
                             ? DXGI_PRESENT_ALLOW_TEARING : 0u;
         g_swapChain->Present(0u, presentFlags);
+        g_perfAccum.presentTicks += (PerfQpcNow() - tPres0);
     }
 
+    int64_t tPace0 = PerfQpcNow();
     PaceSwapToXbox60Hz();
+    g_perfAccum.paceWaitTicks += (PerfQpcNow() - tPace0);
+
+    EndHostProfileFrameAndLatch(gpuFrameMs, gpuQueryValid, gpuDisjointCount);
+
     Bridge_D3DDevice_MakeSpace();
     UpdateXboxKernelTick();
     UpdateXboxInputTick();
@@ -1789,6 +1821,9 @@ bool InitD3D11HostDevice() {
         if (SUCCEEDED(pDxgiDevice->GetAdapter(&pDxgiAdapter)) && pDxgiAdapter) {
             DXGI_ADAPTER_DESC ad = {};
             if (SUCCEEDED(pDxgiAdapter->GetDesc(&ad))) {
+                if (g_selectedAdapterName[0] == L'\0') {
+                    wcsncpy_s(g_selectedAdapterName, ad.Description, _TRUNCATE);
+                }
                 if (ad.VendorId == 0x1414u && ad.DeviceId == 0x008Cu) {
                     isSoftwareAdapter = true;
                 }
@@ -2004,6 +2039,7 @@ bool InitD3D11HostDevice() {
     bpcbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_d3dDevice->CreateBuffer(&bpcbd, nullptr, &g_cbBonePalette);
 
+    BeginGpuFrameTimestampIfReady();
     return true;
 }
 

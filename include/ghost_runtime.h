@@ -135,6 +135,7 @@ extern bool g_enableHavokDebugServer;
 extern volatile bool g_osdShowFps;
 extern volatile float g_osdCurrentFps;
 void InitOsdWindowHooks(HWND hWnd);
+void SyncOsdSystemMenuCheckmarks(HWND hWnd);
 bool HandleOsdSysCommand(HWND hWnd, WPARAM wParam);
 bool HandleOsdTimer(HWND hWnd, WPARAM wParam);
 void DrawOsdOverlayOnBackbuffer();

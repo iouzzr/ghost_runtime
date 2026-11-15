@@ -1,6 +1,7 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
+#include "profiler.h"
 #include <d3d11.h>
 #include <algorithm>
 #include <atomic>
@@ -753,6 +754,118 @@ static uint32_t          g_drawBoneCount       = 0;
 static bool              g_drawSkinIgnoreWorld = false;
 static BonePaletteCBData g_drawBonePalette     = {};
 
+struct LastUnifiedDecodeMeta {
+    int64_t  decodeTicks;
+    uint32_t origVerts;
+    uint32_t effectiveFvf;
+    uint32_t stride;
+    int32_t  vsType;
+    bool     cpuLit;
+    bool     cpuSkinned;
+};
+static LastUnifiedDecodeMeta g_lastUnifiedMeta = {};
+
+static bool IsReadableCameraMemorySpan(const void* ptr, size_t byteLen) {
+    if (!ptr || byteLen == 0u) return false;
+    uintptr_t cur = reinterpret_cast<uintptr_t>(ptr);
+    if (cur < kMinValidHostAddress) return false;
+    if (UINTPTR_MAX - cur < byteLen) return false;
+    uintptr_t end = cur + byteLen;
+
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT) {
+            return false;
+        }
+        const DWORD prot = mbi.Protect;
+        if ((prot & (PAGE_NOACCESS | PAGE_GUARD)) != 0u) {
+            return false;
+        }
+        const DWORD readableMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((prot & readableMask) == 0u) {
+            return false;
+        }
+        uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        if (UINTPTR_MAX - regionBase < mbi.RegionSize) {
+            cur = end;
+        } else {
+            uintptr_t regionEnd = regionBase + mbi.RegionSize;
+            if (regionEnd <= cur) return false;
+            cur = regionEnd;
+        }
+    }
+    return true;
+}
+
+void GetActiveSceneCameraSnapshot(float outCamPos[3], float outCamFwd[3]) {
+    if (outCamPos) {
+        outCamPos[0] = 0.0f;
+        outCamPos[1] = 0.0f;
+        outCamPos[2] = 0.0f;
+    }
+    if (outCamFwd) {
+        outCamFwd[0] = 0.0f;
+        outCamFwd[1] = 0.0f;
+        outCamFwd[2] = 0.0f;
+    }
+    if (!outCamPos && !outCamFwd) return;
+
+    bool resolvedCamFwd = false;
+    const uint8_t* pCam = nullptr;
+    if (IsReadableCameraMemorySpan(reinterpret_cast<const void*>(ADDR_ACTIVE_CAMERA_PTR), sizeof(uint32_t))) {
+        pCam = *reinterpret_cast<const uint8_t* const*>(ADDR_ACTIVE_CAMERA_PTR);
+    }
+
+    // tRenderCamera (*0x0088CD6C) stores its 4x4 camera-to-world matrix at +0x00..+0x3F:
+    //   +0x10 (3 floats): 3D world Forward vector (immune to post-scene 2D HUD g_matView resets)
+    //   +0x30 (3 floats): 3D world Position
+    if (pCam && IsReadableCameraMemorySpan(pCam, 0x40u)) {
+        if (outCamPos) {
+            const float* cp = reinterpret_cast<const float*>(pCam + 0x30u);
+            outCamPos[0] = isfinite(cp[0]) ? cp[0] : 0.0f;
+            outCamPos[1] = isfinite(cp[1]) ? cp[1] : 0.0f;
+            outCamPos[2] = isfinite(cp[2]) ? cp[2] : 0.0f;
+        }
+        if (outCamFwd) {
+            const float* cf = reinterpret_cast<const float*>(pCam + 0x10u);
+            if (isfinite(cf[0]) && isfinite(cf[1]) && isfinite(cf[2])) {
+                float fx = cf[0], fy = cf[1], fz = cf[2];
+                float len = sqrtf(fx * fx + fy * fy + fz * fz);
+                if (len > 0.0001f) {
+                    outCamFwd[0] = fx / len;
+                    outCamFwd[1] = fy / len;
+                    outCamFwd[2] = fz / len;
+                    resolvedCamFwd = true;
+                }
+            }
+        }
+    } else if (outCamPos && IsReadableCameraMemorySpan(reinterpret_cast<const void*>(0x008ACC38u), 3u * sizeof(float))) {
+        const float* cp = reinterpret_cast<const float*>(0x008ACC38u);
+        outCamPos[0] = isfinite(cp[0]) ? cp[0] : 0.0f;
+        outCamPos[1] = isfinite(cp[1]) ? cp[1] : 0.0f;
+        outCamPos[2] = isfinite(cp[2]) ? cp[2] : 0.0f;
+    }
+
+    if (outCamFwd && !resolvedCamFwd) {
+        float fx = isfinite(g_matView.m[0][2]) ? g_matView.m[0][2] : 0.0f;
+        float fy = isfinite(g_matView.m[1][2]) ? g_matView.m[1][2] : 0.0f;
+        float fz = isfinite(g_matView.m[2][2]) ? g_matView.m[2][2] : 0.0f;
+        float len = sqrtf(fx * fx + fy * fy + fz * fz);
+        if (len > 0.0001f) {
+            fx /= len;
+            fy /= len;
+            fz /= len;
+        }
+        outCamFwd[0] = fx;
+        outCamFwd[1] = fy;
+        outCamFwd[2] = fz;
+    }
+}
+
 static const Mat44 kIdentityMat44 = {
     { { 1.0f, 0.0f, 0.0f, 0.0f },
       { 0.0f, 1.0f, 0.0f, 0.0f },
@@ -765,6 +878,8 @@ static void DecodeVerticesToUnified(
     const uint16_t* optIndices, uint32_t baseVertexIndex,
     std::vector<UnifiedVertex>& outVerts, bool* outIsRhw)
 {
+    const int64_t tDec0   = PerfQpcNow();
+    bool          didCpuLight = false;
     g_lastProjMask        = 0;
     g_gpuLightMode        = 0;
     g_drawSkinWeightCount = 0;
@@ -773,6 +888,7 @@ static void DecodeVerticesToUnified(
     XboxShaderDeclInfo decl = {};
     decl.vsType = -1;
     GetXboxVertexShaderDecl(g_currentVsHandle, &decl);
+    uint32_t effectiveFvf = ((g_currentVsHandle & 1u) == 0u) ? g_currentVsHandle : 0u;
 
     if (!decl.hasPos) {
         // Decode as FVF (or infer from stride if programmable handle with no decl)
@@ -788,6 +904,7 @@ static void DecodeVerticesToUnified(
             else if (stride == 12) fvf = 0x002u;
             else                   fvf = 0x112u;
         }
+        effectiveFvf = fvf;
         uint16_t off = 0;
         uint32_t posMask = fvf & 0x0Eu;
         if (posMask == 0x04u) {
@@ -1161,6 +1278,7 @@ static void DecodeVerticesToUnified(
                                      float& totR, float& totG, float& totB,
                                      float& specOutR, float& specOutG, float& specOutB)
         {
+            if (numActiveLights > 0) didCpuLight = true;
             float vx = nonLocalVx, vy = nonLocalVy, vz = nonLocalVz;
             if (specularEnabled && localViewer) {
                 vx = camPosWorld[0] - wpx;
@@ -1504,6 +1622,19 @@ static void DecodeVerticesToUnified(
         dst.u2 = finalU[2]; dst.v2 = finalV[2]; dst.w2 = finalW[2]; dst.q2 = finalQ[2];
         dst.u3 = finalU[3]; dst.v3 = finalV[3]; dst.w3 = finalW[3]; dst.q3 = finalQ[3];
     }
+
+    const int64_t decTicks = PerfQpcNow() - tDec0;
+    g_perfAccum.decodeUnifiedTicks += decTicks;
+    if (g_perfAccum.pushBufferDepth > 0u) {
+        g_perfAccum.runPushBufferNestedTicks += decTicks;
+    }
+    g_lastUnifiedMeta.decodeTicks  = decTicks;
+    g_lastUnifiedMeta.origVerts    = vertexCount;
+    g_lastUnifiedMeta.effectiveFvf = effectiveFvf;
+    g_lastUnifiedMeta.stride       = stride;
+    g_lastUnifiedMeta.vsType       = decl.vsType;
+    g_lastUnifiedMeta.cpuLit       = didCpuLight;
+    g_lastUnifiedMeta.cpuSkinned   = (skinTotalWeights > 0u && cpuSkinFallback);
 }
 
 static ID3D11PixelShader* PopulateCommonPerDrawCB(
@@ -2053,7 +2184,33 @@ static bool ConvertXboxPrimIndices(
 }
 
 static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVertex>& verts, bool isRhw) {
-    if (!g_d3dDevice || !g_d3dCtx || !g_vs || verts.empty()) return;
+    if (!g_d3dDevice || !g_d3dCtx || !g_vs || verts.empty()) {
+        g_lastUnifiedMeta = {};
+        return;
+    }
+
+    const int64_t tSub0 = PerfQpcNow();
+    bool     didSubmitDraw        = false;
+    bool     expandedPointSprites = false;
+    uint32_t finalDrawCount       = 0u;
+    struct UnifiedSubmitPerfScope {
+        int64_t   t0;
+        bool*     pSubmitted;
+        uint32_t* pDrawCount;
+        ~UnifiedSubmitPerfScope() {
+            const int64_t dt = PerfQpcNow() - t0;
+            g_perfAccum.submitUnifiedTicks += dt;
+            if (g_perfAccum.pushBufferDepth > 0u) {
+                g_perfAccum.runPushBufferNestedTicks += dt;
+            }
+            if (*pSubmitted) {
+                RecordPerfVsDraw(
+                    g_currentVsHandle, g_lastUnifiedMeta.stride, g_lastUnifiedMeta.vsType,
+                    false, *pDrawCount, false, g_lastUnifiedMeta.decodeTicks + dt);
+            }
+            g_lastUnifiedMeta = {};
+        }
+    } submitScope = { tSub0, &didSubmitDraw, &finalDrawCount };
 
     const uint32_t* xboxRS = reinterpret_cast<const uint32_t*>(ADDR_D3D_RENDERSTATE);
     const Mat44& effWorld  = g_drawSkinIgnoreWorld ? kIdentityMat44 : g_matWorld;
@@ -2141,6 +2298,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
                 }
                 drawPtr = expanded.data();
                 drawCount = (uint32_t)expanded.size();
+                expandedPointSprites = true;
                 topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
             } else {
                 topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
@@ -2225,6 +2383,7 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
     if (s_dynVBOffset == 0 || (s_dynVBOffset + drawCount) > g_dynVBCapacity) {
         mapMode = D3D11_MAP_WRITE_DISCARD;
         s_dynVBOffset = 0;
+        ++g_perfAccum.dynVbDiscardCount;
     }
     uint32_t startVertex = s_dynVBOffset;
     D3D11_MAPPED_SUBRESOURCE mappedVB = {};
@@ -2425,6 +2584,39 @@ static void SubmitUnifiedVerticesD3D11(uint32_t xboxPrim, std::vector<UnifiedVer
         srvs, smps);
 
     g_d3dCtx->Draw(drawCount, startVertex);
+    didSubmitDraw  = true;
+    finalDrawCount = drawCount;
+
+    ++g_perfAccum.unifiedDraws;
+    g_perfAccum.unifiedVerts += drawCount;
+    if (isRhw) {
+        ++g_perfAccum.unifiedRhwDraws;
+        g_perfAccum.unifiedRhwVerts += drawCount;
+    } else if (g_currentVsHandle == 0x152u || g_lastUnifiedMeta.effectiveFvf == 0x152u) {
+        ++g_perfAccum.unifiedFvf0x152Draws;
+        g_perfAccum.unifiedFvf0x152Verts += drawCount;
+    } else if (g_currentVsHandle == 0x112u || g_lastUnifiedMeta.effectiveFvf == 0x112u) {
+        ++g_perfAccum.unifiedFvf0x112Draws;
+        g_perfAccum.unifiedFvf0x112Verts += drawCount;
+    } else {
+        ++g_perfAccum.unifiedOtherDraws;
+        g_perfAccum.unifiedOtherVerts += drawCount;
+    }
+    if (g_gpuLightMode != 0u && !isRhw) {
+        ++g_perfAccum.unifiedGpuLitDraws;
+    } else if (g_lastUnifiedMeta.cpuLit) {
+        ++g_perfAccum.unifiedCpuLitDraws;
+    }
+    if (g_drawSkinWeightCount > 0u && !isRhw) {
+        ++g_perfAccum.unifiedGpuSkinDraws;
+    } else if (g_lastUnifiedMeta.cpuSkinned) {
+        ++g_perfAccum.unifiedCpuSkinDraws;
+    }
+    if (expandedPointSprites) {
+        ++g_perfAccum.unifiedPointSpriteDraws;
+        g_perfAccum.unifiedPointSpriteVerts += drawCount;
+    }
+
     MarkActiveRenderTargetGpuDirty();
     if (g_curActiveDSV != nullptr &&
         ((xboxRS[XBOX_D3DRS_ZENABLE] != 0u && xboxRS[XBOX_D3DRS_ZWRITEENABLE] != 0u) ||
@@ -2442,6 +2634,33 @@ static void SubmitXvuDrawD3D11(
 {
     if (!g_d3dDevice || !g_d3dCtx || !decl.gpuVS || !g_cbVSConstants || vertexCount == 0) return;
     if (decl.gpuInputLayout != nullptr && decl.usesStream[0] && !stream0Data) return;
+
+    const int64_t tXvu0         = PerfQpcNow();
+    bool          didSubmitXvu  = false;
+    bool          usedStaticVBs = false;
+    uint32_t      submittedVtx  = 0u;
+    const uint32_t effStride0   = stream0Stride ? stream0Stride : decl.streamStrides[0];
+    const int32_t  declVsType   = decl.vsType;
+    struct XvuSubmitPerfScope {
+        int64_t   t0;
+        bool*     pSubmitted;
+        bool*     pUsedStatic;
+        uint32_t* pVerts;
+        uint32_t  stride;
+        int32_t   vsType;
+        ~XvuSubmitPerfScope() {
+            const int64_t dt = PerfQpcNow() - t0;
+            g_perfAccum.submitXvuTicks += dt;
+            if (g_perfAccum.pushBufferDepth > 0u) {
+                g_perfAccum.runPushBufferNestedTicks += dt;
+            }
+            if (*pSubmitted) {
+                RecordPerfVsDraw(
+                    g_currentVsHandle, stride, vsType,
+                    true, *pVerts, *pUsedStatic, dt);
+            }
+        }
+    } xvuPerfScope = { tXvu0, &didSubmitXvu, &usedStaticVBs, &submittedVtx, effStride0, declVsType };
 
     DrainPendingGpuBufferEvictions();
 
@@ -2472,6 +2691,7 @@ static void SubmitXvuDrawD3D11(
         if (s_dynIBOff == 0u || (s_dynIBOff + idxCount) > s_dynIBCap) {
             ibMapMode  = D3D11_MAP_WRITE_DISCARD;
             s_dynIBOff = 0u;
+            ++g_perfAccum.dynIbDiscardCount;
         }
         D3D11_MAPPED_SUBRESOURCE mappedIB = {};
         if (FAILED(g_d3dCtx->Map(s_dynIB, 0, ibMapMode, 0, &mappedIB))) return false;
@@ -2655,6 +2875,7 @@ static void SubmitXvuDrawD3D11(
             if (s_dynStreamOff[slot] == 0u || (s_dynStreamOff[slot] + alignedBytes) > s_dynStreamCap[slot]) {
                 mapMode              = D3D11_MAP_WRITE_DISCARD;
                 s_dynStreamOff[slot] = 0u;
+                ++g_perfAccum.dynStreamVbDiscardCount;
             }
             D3D11_MAPPED_SUBRESOURCE mapped = {};
             if (FAILED(g_d3dCtx->Map(s_dynStreamVB[slot], 0, mapMode, 0, &mapped))) return false;
@@ -2801,8 +3022,19 @@ static void SubmitXvuDrawD3D11(
 
     if (useIB) {
         g_d3dCtx->DrawIndexed(drawIdxCount, startIndex, hwBaseVertLoc);
+        submittedVtx = drawIdxCount;
     } else {
         g_d3dCtx->Draw(vertexCount, hwStartVertLoc);
+        submittedVtx = vertexCount;
+    }
+    didSubmitXvu  = true;
+    usedStaticVBs = useStaticVBs;
+    ++g_perfAccum.xvuDraws;
+    g_perfAccum.xvuVerts += submittedVtx;
+    if (useStaticVBs) {
+        ++g_perfAccum.xvuStaticVbDraws;
+    } else {
+        ++g_perfAccum.xvuDynamicSliceDraws;
     }
 
     MarkActiveRenderTargetGpuDirty();
@@ -2905,12 +3137,35 @@ static void __stdcall Bridge_D3DDevice_DrawIndexedVertices(
 static void __stdcall Bridge_D3DDevice_RunPushBuffer(XboxPushBuffer* pPushBuffer, void* pFixup) {
     if (!pPushBuffer || !pPushBuffer->Data || pPushBuffer->Size < 8) return;
 
+    struct PushBufferPerfScope {
+        int64_t t0;
+        explicit PushBufferPerfScope(int64_t start) : t0(start) {
+            ++g_perfAccum.pushBufferDepth;
+        }
+        ~PushBufferPerfScope() {
+            if (g_perfAccum.pushBufferDepth > 0u) {
+                --g_perfAccum.pushBufferDepth;
+            }
+            if (g_perfAccum.pushBufferDepth == 0u) {
+                g_perfAccum.runPushBufferTotalTicks += (PerfQpcNow() - t0);
+            }
+        }
+    } pbPerfScope(PerfQpcNow());
+
     DrainPendingGpuBufferEvictions();
 
     const uint8_t* pbBytes      = reinterpret_cast<const uint8_t*>(pPushBuffer->Data);
     uint32_t       pbSize       = pPushBuffer->Size;
     const bool     canCachePbIb = (pFixup == nullptr) && !IsEngineDynamicRingAddress(pPushBuffer->Data);
     const uint32_t pbAllocSpan  = pPushBuffer->AllocationSize ? pPushBuffer->AllocationSize : pbSize;
+
+    ++g_perfAccum.pushBufferCalls;
+    g_perfAccum.pushBufferBytesParsed += pbSize;
+    if (pFixup != nullptr) {
+        ++g_perfAccum.pushBufferFixupCalls;
+    } else if (!canCachePbIb) {
+        ++g_perfAccum.pushBufferDynRingCalls;
+    }
 
     // Apply XboxPushBufferFixup patches (_D3DPushBuffer_Fixup@12 at 0x006BAC30)
     static std::vector<uint8_t> patchedPb;
@@ -3338,6 +3593,7 @@ static void __stdcall Bridge_D3DDevice_SetVertexDataColor(int Register, DWORD Co
 
 static void __stdcall Bridge_D3DDevice_End() {
     if (g_immVerts.empty()) return;
+    const int64_t tImm0   = PerfQpcNow();
     g_lastProjMask        = 0;
     g_gpuLightMode        = 0;
     g_drawSkinWeightCount = 0;
@@ -3401,6 +3657,19 @@ static void __stdcall Bridge_D3DDevice_End() {
         v.u2 = finalU[2]; v.v2 = finalV[2]; v.w2 = finalW[2]; v.q2 = finalQ[2];
         v.u3 = finalU[3]; v.v3 = finalV[3]; v.w3 = finalW[3]; v.q3 = finalQ[3];
     }
+
+    const int64_t immTicks = PerfQpcNow() - tImm0;
+    g_perfAccum.decodeUnifiedTicks += immTicks;
+    if (g_perfAccum.pushBufferDepth > 0u) {
+        g_perfAccum.runPushBufferNestedTicks += immTicks;
+    }
+    g_lastUnifiedMeta.decodeTicks  = immTicks;
+    g_lastUnifiedMeta.origVerts    = static_cast<uint32_t>(g_immVerts.size());
+    g_lastUnifiedMeta.effectiveFvf = ((g_currentVsHandle & 1u) == 0u) ? g_currentVsHandle : 0u;
+    g_lastUnifiedMeta.stride       = 0u;
+    g_lastUnifiedMeta.vsType       = -1;
+    g_lastUnifiedMeta.cpuLit       = false;
+    g_lastUnifiedMeta.cpuSkinned   = false;
 
     SubmitUnifiedVerticesD3D11(g_immPrimType, g_immVerts, isRhw);
     g_immVerts.clear();

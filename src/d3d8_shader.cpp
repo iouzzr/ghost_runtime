@@ -1,6 +1,7 @@
 #include "ghost_runtime.h"
 #include "ghost_addresses.h"
 #include "xbox_d3d8_types.h"
+#include "profiler.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <math.h>
@@ -2321,8 +2322,11 @@ static ID3D11PixelShader* GetOrCreateCompiledXboxPS(const XboxPixelShaderDef& de
     void*  csoData = nullptr;
     size_t csoSize = 0;
     if (!LoadShaderCsoFromDisk(baseName, &csoData, &csoSize)) {
+        const int64_t tShd0 = PerfQpcNow();
         std::string hlsl = CompileXboxPixelShaderDefToHLSL(def, baseName);
         CompileHlslAndPersistToDisk(baseName, hlsl, true, &csoData, &csoSize);
+        g_perfAccum.shaderCompileTicks += (PerfQpcNow() - tShd0);
+        ++g_perfAccum.shaderRuntimeCompiles;
     }
 
     ID3D11PixelShader* createdPs = nullptr;
@@ -2498,10 +2502,13 @@ static bool GetOrCreateCompiledXboxVS(
         void*  csoData = nullptr;
         size_t csoSize = 0;
         if (!LoadShaderCsoFromDisk(baseName, &csoData, &csoSize)) {
+            const int64_t tShd0 = PerfQpcNow();
             std::string hlsl = DecompileXvuToHLSL(
                 elems, numElems, pFunction,
                 (debugLabel && debugLabel[0]) ? debugLabel : baseName, declVa);
             CompileHlslAndPersistToDisk(baseName, hlsl, false, &csoData, &csoSize);
+            g_perfAccum.shaderCompileTicks += (PerfQpcNow() - tShd0);
+            ++g_perfAccum.shaderRuntimeCompiles;
         }
 
         if (csoData && csoSize > 0) {
@@ -3208,6 +3215,16 @@ static uint32_t __fastcall Bridge_MeshGroup_RenderSetupBlendWeightedSkin(
     if (!pBlendState) {
         return 0;
     }
+
+    struct SkinSetupPerfScope {
+        int64_t  t0;
+        uint32_t verts;
+        ~SkinSetupPerfScope() {
+            g_perfAccum.skinSetupTicks += (PerfQpcNow() - t0);
+            ++g_perfAccum.skinSetupCalls;
+            g_perfAccum.skinSetupVerts += verts;
+        }
+    } skinPerfScope = { PerfQpcNow(), numVerts };
 
     // sBlendState layout (0x006073FA..0x0060754E): +0x00 = uint8_t numTargets (max 3),
     // +0x01..+0x03 = uint8_t targetIdx[3], +0x04..+0x0F = float targetWeights[3].

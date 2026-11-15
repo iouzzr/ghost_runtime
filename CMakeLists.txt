@@ -37,6 +37,7 @@ add_executable(GhostXR WIN32
     src/config.cpp
     src/launcher.cpp
     src/osd.cpp
+    src/profiler.cpp
     src/patch.cpp
     src/xbox_kernel.cpp
     src/xbox_xapi.cpp
@@ -52,6 +53,7 @@ add_executable(GhostXR WIN32
     include/ghost_runtime.h
     include/ghost_addresses.h
     include/xbox_d3d8_types.h
+    include/profiler.h
 )
 
 target_include_directories(GhostXR PRIVATE
